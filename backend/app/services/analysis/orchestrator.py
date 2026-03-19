@@ -1,12 +1,15 @@
 """
 Multi-pass agentic deobfuscation orchestrator.
 
-Loop stages:
-1. Planner - inspect current state, determine what needs doing
+Loop stages (8-stage pipeline):
+1. Planner         - inspect current state, determine what needs doing
 2. Action Selector - choose best next action from action space
-3. Executor - run the chosen transform/action
-4. Verifier/Scorer - measure if the step improved deobfuscation
-5. Stop Decision - continue, retry, backtrack, or stop
+3. Pre-flight      - validate preconditions (language, size, attempts, conflicts)
+4. Executor        - run the chosen transform/action
+5. Post-processor  - normalise output (whitespace, encoding, artefact cleanup)
+6. Verifier/Scorer - measure if the step improved deobfuscation
+7. State Reconciler- merge results into state (strings, IOCs, techniques, metadata)
+8. Stop Decision   - continue, retry, backtrack, or stop
 
 The harness uses: current state, prior actions, prior outputs,
 confidence scores, and improvement metrics to make decisions.
@@ -1568,6 +1571,362 @@ class Executor:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Pre-flight Validator  (Stage 3)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@dataclass
+class PreflightResult:
+    """Outcome of a pre-flight validation check."""
+    approved: bool
+    skip_reason: str = ""
+
+
+class PreflightValidator:
+    """Validate preconditions before executing a transform.
+
+    Checks:
+    - Action exists in the action space.
+    - Language compatibility (language-specific transforms aren't run on
+      the wrong language).
+    - Input isn't empty or below a minimum size.
+    - Action hasn't already exceeded its retry cap.
+    - Conflicting transforms aren't running back-to-back.
+    """
+
+    # Map of actions to the languages they apply to.
+    # If an action isn't listed here, it's considered language-agnostic.
+    _LANGUAGE_AFFINITY: Dict[str, Set[str]] = {
+        "powershell_decode": {"powershell", "ps1", "ps"},
+        "python_decode": {"python", "py"},
+        "identify_string_resolver": {"javascript", "js", "typescript", "ts"},
+    }
+
+    # Actions that shouldn't run back-to-back (no point re-running immediately).
+    _CONFLICT_PAIRS: List[Tuple[str, str]] = [
+        ("decode_base64", "decode_base64"),
+        ("decode_hex", "decode_hex"),
+        ("constant_fold", "constant_fold"),
+        ("simplify_junk_code", "simplify_junk_code"),
+    ]
+
+    def validate(
+        self,
+        action_name: str,
+        code: str,
+        language: str,
+        action_space: Dict[str, BaseTransform],
+        action_queue: ActionQueue,
+        state_manager: StateManager,
+    ) -> PreflightResult:
+        """Run all pre-flight checks.  Returns approved=True if the
+        action should proceed, or approved=False with a skip reason."""
+
+        # 1. Action must exist.
+        if action_name not in action_space:
+            return PreflightResult(
+                approved=False,
+                skip_reason=f"Action '{action_name}' not in action space.",
+            )
+
+        # 2. Input must have content.
+        if not code or len(code.strip()) < 2:
+            return PreflightResult(
+                approved=False,
+                skip_reason="Input code is empty or too short to analyse.",
+            )
+
+        # 3. Language compatibility.
+        affinity = self._LANGUAGE_AFFINITY.get(action_name)
+        if affinity and language.lower() not in affinity:
+            return PreflightResult(
+                approved=False,
+                skip_reason=(
+                    f"Action '{action_name}' requires language "
+                    f"{affinity} but got '{language}'."
+                ),
+            )
+
+        # 4. Retry cap — if the queue already capped this action, skip.
+        if action_queue.is_capped(action_name):
+            return PreflightResult(
+                approved=False,
+                skip_reason=f"Action '{action_name}' has hit its retry cap.",
+            )
+
+        # 5. Conflict pairs — check the most recent successful transform.
+        history = state_manager.state.transform_history
+        if history:
+            last_action = history[-1].action
+            for a, b in self._CONFLICT_PAIRS:
+                if (last_action == a and action_name == b) or (
+                    last_action == b and action_name == a
+                ):
+                    return PreflightResult(
+                        approved=False,
+                        skip_reason=(
+                            f"Action '{action_name}' conflicts with the "
+                            f"previous action '{last_action}'."
+                        ),
+                    )
+
+        logger.debug("Pre-flight approved: %s", action_name)
+        return PreflightResult(approved=True)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Post-processor  (Stage 5)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class PostProcessor:
+    """Clean up transform output before it enters verification.
+
+    Applies lightweight normalisation that no individual transform should
+    need to handle:
+    - Strip trailing whitespace on every line.
+    - Normalise line endings to ``\\n``.
+    - Collapse runs of 3+ blank lines into 2.
+    - Remove null bytes and other non-printable control chars (except
+      tab and newline).
+    - Strip a leading UTF-8 BOM if present.
+    - Ensure file ends with a single newline.
+    """
+
+    # Non-printable chars except \t (\x09) and \n (\x0a).
+    _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+    _MULTI_BLANK_RE = re.compile(r"\n{4,}")
+    _BOM = "\ufeff"
+
+    def process(self, code: str, original: str) -> str:
+        """Return cleaned-up code.  If the transform produced empty or
+        identical output, returns the original unchanged."""
+        if not code or not code.strip():
+            return original
+
+        # Strip BOM.
+        if code.startswith(self._BOM):
+            code = code[len(self._BOM):]
+
+        # Remove dangerous control chars.
+        code = self._CONTROL_RE.sub("", code)
+
+        # Normalise line endings.
+        code = code.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Strip trailing whitespace per line.
+        lines = code.split("\n")
+        lines = [line.rstrip() for line in lines]
+        code = "\n".join(lines)
+
+        # Collapse excessive blank lines.
+        code = self._MULTI_BLANK_RE.sub("\n\n\n", code)
+
+        # Ensure trailing newline.
+        if not code.endswith("\n"):
+            code += "\n"
+
+        return code
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  State Reconciler  (Stage 7)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class StateReconciler:
+    """Merge transform results into the canonical analysis state.
+
+    Centralises the logic that was previously inline in the orchestrator
+    loop.  Responsible for:
+    - Extracting strings, IOCs, techniques, APIs, and literals from
+      TransformResult details.
+    - De-duplicating before adding to the state manager.
+    - Recording the transform entry and updating code if successful.
+    - Tracking queue feedback (succeeded / skipped / failed).
+    - Updating stall counter.
+    """
+
+    def reconcile(
+        self,
+        action_name: str,
+        selected: QueuedAction,
+        result: TransformResult,
+        improvement: float,
+        code_before: str,
+        iteration: int,
+        state_manager: StateManager,
+        action_queue: ActionQueue,
+        stop_decision: StopDecision,
+        all_iocs: List[IOC],
+        confidence_fn: Any,
+    ) -> TransformRecord:
+        """Merge a single transform's output into the global state.
+
+        Returns the TransformRecord that was persisted.
+        """
+        sm = state_manager
+
+        # ── Apply structured details to state ──────────────────────
+        self._apply_details(action_name, result, sm, all_iocs)
+
+        # ── Confidence and readability ─────────────────────────────
+        conf_before = sm.overall_confidence
+        new_confidence = confidence_fn(conf_before, result, improvement)
+        sm.update_confidence(overall=new_confidence)
+        readability = sm.update_readability(result.output)
+
+        # ── Create transform record ───────────────────────────────
+        record = TransformRecord(
+            iteration=iteration,
+            action=action_name,
+            reason=selected.reason,
+            inputs={"code_length": len(code_before)},
+            outputs={
+                "code_length": len(result.output),
+                "description": result.description,
+            },
+            confidence_before=conf_before,
+            confidence_after=new_confidence,
+            readability_before=(
+                sm.readability_history[-2]
+                if len(sm.readability_history) > 1
+                else 0.0
+            ),
+            readability_after=readability,
+            success=result.success,
+            retry_revert=False,
+        )
+        sm.record_transform(
+            record,
+            new_code=result.output if result.success else None,
+        )
+
+        # ── Queue feedback ─────────────────────────────────────────
+        is_skipped = (
+            not result.success
+            and result.details.get("skipped")
+            or (not result.success and "error" not in result.details)
+        )
+        if result.success:
+            action_queue.mark_succeeded(action_name)
+            stop_decision.record_success()
+        elif is_skipped:
+            action_queue.mark_skipped(action_name)
+        else:
+            action_queue.mark_failed(action_name)
+            stop_decision.record_failure()
+
+        # ── Stall tracking ─────────────────────────────────────────
+        if improvement > 0.01:
+            sm.reset_stall()
+        else:
+            sm.increment_stall()
+
+        return record
+
+    # ── Detail extraction helpers ──────────────────────────────────
+
+    @staticmethod
+    def _apply_details(
+        action_name: str,
+        result: TransformResult,
+        sm: StateManager,
+        all_iocs: List[IOC],
+    ) -> None:
+        """Extract structured data from result.details into state."""
+        details = result.details
+
+        # Language detection.
+        if action_name == "detect_language" and result.success:
+            detected = details.get("detected_language")
+            if detected:
+                sm.set_language(detected)
+
+        # Obfuscation techniques.
+        techniques = details.get("detected_techniques", [])
+        if techniques:
+            sm.add_detected_techniques(techniques)
+
+        # Strings.
+        raw_strings = details.get("strings", [])
+        if raw_strings:
+            entries = []
+            for s in raw_strings:
+                if isinstance(s, dict):
+                    entries.append(StringEntry(
+                        value=s.get("value", ""),
+                        encoding=s.get("encoding", "utf-8"),
+                        context=s.get("context"),
+                    ))
+                elif isinstance(s, StringEntry):
+                    entries.append(s)
+            sm.add_strings(entries)
+
+        # Decoded strings (from base64, hex, etc.).
+        decoded = details.get("decoded_strings", [])
+        if decoded:
+            entries = []
+            for d in decoded:
+                if isinstance(d, dict):
+                    entries.append(StringEntry(
+                        value=d.get("decoded", ""),
+                        encoding="decoded",
+                        context=d.get("encoded", "")[:80],
+                    ))
+            sm.add_strings(entries)
+
+        # Recovered XOR blobs.
+        recovered = details.get("recovered", [])
+        if recovered:
+            for r in recovered:
+                if isinstance(r, dict):
+                    sm.add_recovered_literals([r.get("decoded", "")])
+
+        # Decoded PowerShell / Python payloads.
+        decoded_payloads = details.get("decoded_payloads", [])
+        if decoded_payloads:
+            sm.add_recovered_literals(decoded_payloads)
+
+        # IOCs.
+        raw_iocs = details.get("iocs", [])
+        for ioc_data in raw_iocs:
+            if isinstance(ioc_data, dict):
+                try:
+                    ioc_type = IOCType(ioc_data.get("type", "other"))
+                except ValueError:
+                    ioc_type = IOCType.OTHER
+                ioc = IOC(
+                    type=ioc_type,
+                    value=ioc_data.get("value", ""),
+                    context=ioc_data.get("context"),
+                    confidence=float(ioc_data.get("confidence", 0.5)),
+                )
+                all_iocs.append(ioc)
+
+        # Suspicious patterns from eval/exec detector.
+        patterns = details.get("patterns", {})
+        if patterns:
+            sm.add_suspicious_apis(list(patterns.keys()))
+            if "eval_exec" not in [
+                t.lower() for t in sm.state.detected_techniques
+            ]:
+                sm.add_detected_techniques(["eval_exec"])
+
+        # Rename suggestions (informational).
+        suggestions = details.get("suggestions", {})
+        if suggestions and isinstance(suggestions, dict):
+            sm.state.llm_suggestions.extend(
+                f"Rename '{old}' -> '{new}'"
+                for old, new in list(suggestions.items())[:10]
+            )
+        elif suggestions and isinstance(suggestions, list):
+            sm.state.llm_suggestions.extend(
+                str(s)[:80] for s in suggestions[:10]
+            )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Orchestrator
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1667,8 +2026,11 @@ class Orchestrator:
         self._action_queue: Optional[ActionQueue] = None
         self._planner: Optional[Planner] = None
         self._selector: Optional[ActionSelector] = None
+        self._preflight: Optional[PreflightValidator] = None
         self._executor: Optional[Executor] = None
+        self._post_processor: Optional[PostProcessor] = None
         self._verifier: Optional[Verifier] = None
+        self._reconciler: Optional[StateReconciler] = None
         self._stop_decision: Optional[StopDecision] = None
         self._findings_gen: Optional[FindingsGenerator] = None
 
@@ -1705,7 +2067,7 @@ class Orchestrator:
         """
         start_time = time.monotonic()
 
-        # Initialise sub-components.
+        # Initialise sub-components (8 stages + findings).
         self._state_manager = StateManager(
             sample_id=self.sample_id,
             original_code=self.original_code,
@@ -1717,8 +2079,11 @@ class Orchestrator:
         )
         self._planner = Planner()
         self._selector = ActionSelector()
+        self._preflight = PreflightValidator()
         self._executor = Executor(self.action_space)
+        self._post_processor = PostProcessor()
         self._verifier = Verifier()
+        self._reconciler = StateReconciler()
         self._stop_decision = StopDecision(
             max_iterations=max_iterations,
             stall_limit=stall_limit,
@@ -1797,7 +2162,25 @@ class Orchestrator:
                     selected.reason,
                 )
 
-                # ── Stage 3: Execute ─────────────────────────────────
+                # ── Stage 3: Pre-flight ──────────────────────────────
+                preflight = self._preflight.validate(
+                    action_name,
+                    code_before,
+                    language,
+                    self.action_space,
+                    self._action_queue,
+                    self._state_manager,
+                )
+                if not preflight.approved:
+                    logger.info(
+                        "Pre-flight rejected '%s': %s",
+                        action_name,
+                        preflight.skip_reason,
+                    )
+                    self._action_queue.mark_skipped(action_name)
+                    continue
+
+                # ── Stage 4: Execute ─────────────────────────────────
                 state_dict = self._state_manager.state.model_dump()
                 result = await self._executor.execute(
                     action_name,
@@ -1806,7 +2189,27 @@ class Orchestrator:
                     state_dict,
                 )
 
-                # ── Stage 4: Verify / Score ──────────────────────────
+                # ── Stage 5: Post-process ────────────────────────────
+                if result.success and result.output != code_before:
+                    cleaned = self._post_processor.process(
+                        result.output, code_before,
+                    )
+                    if cleaned != result.output:
+                        logger.debug(
+                            "Post-processor normalised output "
+                            "(%d -> %d chars)",
+                            len(result.output),
+                            len(cleaned),
+                        )
+                        result = TransformResult(
+                            success=result.success,
+                            output=cleaned,
+                            confidence=result.confidence,
+                            description=result.description,
+                            details=result.details,
+                        )
+
+                # ── Stage 6: Verify / Score ──────────────────────────
                 improvement = self._verifier.verify(
                     code_before,
                     result.output,
@@ -1814,71 +2217,34 @@ class Orchestrator:
                     self._state_manager,
                 )
 
-                # Update state based on results.
-                self._apply_result_to_state(
-                    action_name, result, all_iocs,
-                )
-
-                # Record the transform.
-                conf_before = self._state_manager.overall_confidence
-                new_confidence = self._compute_new_confidence(
-                    conf_before, result, improvement,
-                )
-                self._state_manager.update_confidence(overall=new_confidence)
-                readability = self._state_manager.update_readability(result.output)
-
-                record = TransformRecord(
+                # ── Stage 7: State Reconciler ────────────────────────
+                # Merge results into state, record transform, update
+                # queue feedback, stall tracking, confidence.
+                self._reconciler.reconcile(
+                    action_name=action_name,
+                    selected=selected,
+                    result=result,
+                    improvement=improvement,
+                    code_before=code_before,
                     iteration=iteration,
-                    action=action_name,
-                    reason=selected.reason,
-                    inputs={"code_length": len(code_before)},
-                    outputs={
-                        "code_length": len(result.output),
-                        "description": result.description,
-                    },
-                    confidence_before=conf_before,
-                    confidence_after=new_confidence,
-                    readability_before=self._state_manager.readability_history[-2]
-                    if len(self._state_manager.readability_history) > 1
-                    else 0.0,
-                    readability_after=readability,
-                    success=result.success,
-                    retry_revert=False,
-                )
-                self._state_manager.record_transform(
-                    record,
-                    new_code=result.output if result.success else None,
+                    state_manager=self._state_manager,
+                    action_queue=self._action_queue,
+                    stop_decision=self._stop_decision,
+                    all_iocs=all_iocs,
+                    confidence_fn=self._compute_new_confidence,
                 )
 
-                # Queue feedback.
-                # Distinguish between real failures (errors) and transforms
-                # that simply found nothing to do (skipped / not applicable).
-                is_skipped = (
-                    not result.success
-                    and result.details.get("skipped")
-                    or (not result.success and "error" not in result.details)
-                )
-                if result.success:
-                    self._action_queue.mark_succeeded(action_name)
-                    self._stop_decision.record_success()
-                elif is_skipped:
-                    self._action_queue.mark_skipped(action_name)
-                    # Skips don't count as failures for stop-decision purposes.
-                else:
-                    self._action_queue.mark_failed(action_name)
-                    self._stop_decision.record_failure()
-
-                # Stall tracking.
-                if improvement > 0.01:
-                    self._state_manager.reset_stall()
-                else:
-                    self._state_manager.increment_stall()
+                # Update orchestrator-level language if detect succeeded.
+                if action_name == "detect_language" and result.success:
+                    detected = result.details.get("detected_language")
+                    if detected:
+                        self.language = detected
 
                 # Take snapshot.
                 self._state_manager.take_snapshot()
                 await self._state_manager.persist_snapshot()
 
-                # ── Stage 5: Stop Decision ───────────────────────────
+                # ── Stage 8: Stop Decision ───────────────────────────
                 verdict = self._stop_decision.evaluate(
                     self._state_manager,
                     self._action_queue,
@@ -1956,107 +2322,6 @@ class Orchestrator:
     # ------------------------------------------------------------------
     #  Internal helpers
     # ------------------------------------------------------------------
-
-    def _apply_result_to_state(
-        self,
-        action_name: str,
-        result: TransformResult,
-        all_iocs: List[IOC],
-    ) -> None:
-        """Apply transform result details to the state manager."""
-        sm = self._state_manager
-        assert sm is not None
-
-        details = result.details
-
-        # Language detection.
-        if action_name == "detect_language" and result.success:
-            detected = details.get("detected_language")
-            if detected:
-                sm.set_language(detected)
-                self.language = detected
-
-        # Obfuscation techniques.
-        techniques = details.get("detected_techniques", [])
-        if techniques:
-            sm.add_detected_techniques(techniques)
-
-        # Strings.
-        raw_strings = details.get("strings", [])
-        if raw_strings:
-            entries = []
-            for s in raw_strings:
-                if isinstance(s, dict):
-                    entries.append(StringEntry(
-                        value=s.get("value", ""),
-                        encoding=s.get("encoding", "utf-8"),
-                        context=s.get("context"),
-                    ))
-                elif isinstance(s, StringEntry):
-                    entries.append(s)
-            sm.add_strings(entries)
-
-        # Decoded strings (from base64, hex, etc.).
-        decoded = details.get("decoded_strings", [])
-        if decoded:
-            entries = []
-            for d in decoded:
-                if isinstance(d, dict):
-                    entries.append(StringEntry(
-                        value=d.get("decoded", ""),
-                        encoding="decoded",
-                        context=d.get("encoded", "")[:80],
-                    ))
-            sm.add_strings(entries)
-
-        # Recovered XOR blobs.
-        recovered = details.get("recovered", [])
-        if recovered:
-            for r in recovered:
-                if isinstance(r, dict):
-                    sm.add_recovered_literals([r.get("decoded", "")])
-
-        # Decoded PowerShell / Python payloads.
-        decoded_payloads = details.get("decoded_payloads", [])
-        if decoded_payloads:
-            sm.add_recovered_literals(decoded_payloads)
-
-        # IOCs.
-        raw_iocs = details.get("iocs", [])
-        for ioc_data in raw_iocs:
-            if isinstance(ioc_data, dict):
-                try:
-                    ioc_type = IOCType(ioc_data.get("type", "other"))
-                except ValueError:
-                    ioc_type = IOCType.OTHER
-                ioc = IOC(
-                    type=ioc_type,
-                    value=ioc_data.get("value", ""),
-                    context=ioc_data.get("context"),
-                    confidence=float(ioc_data.get("confidence", 0.5)),
-                )
-                all_iocs.append(ioc)
-
-        # Suspicious patterns from eval/exec detector.
-        patterns = details.get("patterns", {})
-        if patterns:
-            sm.add_suspicious_apis(list(patterns.keys()))
-            if "eval_exec" not in [
-                t.lower() for t in sm.state.detected_techniques
-            ]:
-                sm.add_detected_techniques(["eval_exec"])
-
-        # Rename suggestions (informational).
-        suggestions = details.get("suggestions", {})
-        if suggestions and isinstance(suggestions, dict):
-            sm.state.llm_suggestions.extend(
-                f"Rename '{old}' -> '{new}'"
-                for old, new in list(suggestions.items())[:10]
-            )
-        elif suggestions and isinstance(suggestions, list):
-            sm.state.llm_suggestions.extend(
-                str(s)[:80] for s in suggestions[:10]
-            )
 
     def _compute_new_confidence(
         self,

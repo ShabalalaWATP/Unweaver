@@ -116,6 +116,14 @@ class ActionQueue:
     def has_been_tried(self, action_name: str) -> bool:
         return action_name in self._ledger
 
+    def is_capped(self, action_name: str) -> bool:
+        """Return True if the action has hit its global attempt or failure cap."""
+        if self.total_attempts(action_name) >= self._max_global_attempts:
+            return True
+        if self.failure_count(action_name) >= 2:  # default max_attempts
+            return True
+        return False
+
     # ------------------------------------------------------------------
     # Enqueue / dequeue
     # ------------------------------------------------------------------

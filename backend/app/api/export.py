@@ -8,7 +8,7 @@ analysis results.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -134,6 +134,39 @@ async def _gather_report_data(
         "findings": findings,
         "iteration_states": iteration_states,
     }
+
+
+# ── GET /api/samples/{id}/export/deobfuscated ───────────────────────
+@router.get("/samples/{sample_id}/export/deobfuscated")
+async def export_deobfuscated(
+    sample_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Download the deobfuscated / recovered code as a standalone file."""
+    sample = await db.get(Sample, sample_id)
+    if sample is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Sample {sample_id} not found",
+        )
+    recovered = sample.recovered_text
+    if not recovered:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No deobfuscated output available — run analysis first.",
+        )
+
+    # Build a filename: prefix "deobfuscated_" to the original filename.
+    original_name = sample.filename or "sample.txt"
+    download_name = f"deobfuscated_{original_name}"
+
+    return Response(
+        content=recovered,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_name}"',
+        },
+    )
 
 
 # ── GET /api/samples/{id}/export/markdown ───────────────────────────

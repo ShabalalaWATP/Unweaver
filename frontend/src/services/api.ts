@@ -271,4 +271,8 @@ export async function exportJSON(sampleId: string): Promise<unknown> {
   return request<unknown>(`/samples/${sampleId}/export/json`);
 }
 
+export async function exportDeobfuscated(sampleId: string): Promise<string> {
+  return request<string>(`/samples/${sampleId}/export/deobfuscated`);
+}
+
 export { ApiError };

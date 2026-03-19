@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { Play, Square, RefreshCw, Download, FileText } from 'lucide-react';
+import { Play, Square, RefreshCw, Download, FileText, FileCode } from 'lucide-react';
 import type { SampleDetail, AnalysisStatus } from '@/types';
 import StatusBadge from '@/components/common/StatusBadge';
 import * as api from '@/services/api';
@@ -161,6 +161,25 @@ export default function TopBar({
     }
   }, [sample]);
 
+  const handleDownloadDeobfuscated = useCallback(async () => {
+    if (!sample) return;
+    setExporting(true);
+    try {
+      const code = await api.exportDeobfuscated(sample.id);
+      const blob = new Blob([code], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `deobfuscated_${sample.filename}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Download failed:', err);
+    } finally {
+      setExporting(false);
+    }
+  }, [sample]);
+
   if (!sample) {
     return (
       <div style={s.root}>
@@ -238,10 +257,28 @@ export default function TopBar({
         <RefreshCw size={14} />
       </button>
 
+      {sample.status === 'completed' && (
+        <button
+          style={{
+            ...s.btn,
+            background: 'var(--success-muted, #1a3a2a)',
+            color: 'var(--success, #4ade80)',
+            border: '1px solid var(--success, #4ade80)',
+            opacity: exporting ? 0.5 : 1,
+          }}
+          onClick={handleDownloadDeobfuscated}
+          title="Download deobfuscated file"
+          disabled={exporting}
+        >
+          <FileCode size={12} />
+          Download Deobfuscated
+        </button>
+      )}
+
       <button
         style={{ ...s.iconBtn, opacity: exporting ? 0.5 : 1 }}
         onClick={handleExportMd}
-        title="Export Markdown"
+        title="Export Markdown report"
         disabled={exporting}
         onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
         onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
@@ -251,7 +288,7 @@ export default function TopBar({
       <button
         style={{ ...s.iconBtn, opacity: exporting ? 0.5 : 1 }}
         onClick={handleExportJson}
-        title="Export JSON"
+        title="Export JSON report"
         disabled={exporting}
         onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
         onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}

@@ -52,13 +52,16 @@ Built for malware analysts and security researchers who need to understand what 
 └──────────────────────────────────────────────┘
 ```
 
-The analysis engine runs a **5-stage loop** on every iteration:
+The analysis engine runs an **8-stage loop** on every iteration:
 
 1. **Planner** — surveys the code, detects the language and obfuscation techniques, recommends prioritised actions
 2. **Action Selector** — feeds recommendations into a priority queue, pops the best action (deterministic transforms get a priority bonus)
-3. **Executor** — runs the selected transform in a thread executor (non-blocking)
-4. **Verifier / Scorer** — measures improvement via readability heuristics, string recovery count, IOC extraction, and confidence delta
-5. **Stop Decision** — checks 7 termination conditions (budget exhausted, stall, confidence regression, consecutive failures, queue empty, sufficiency, manual stop)
+3. **Pre-flight Validator** — checks preconditions before executing: language compatibility, input size, retry cap, conflict detection (prevents redundant back-to-back transforms)
+4. **Executor** — runs the selected transform in a thread executor (non-blocking)
+5. **Post-processor** — normalises output: strips BOM, removes control characters, normalises line endings, collapses excessive blank lines, trims trailing whitespace
+6. **Verifier / Scorer** — measures improvement via readability heuristics, string recovery count, IOC extraction, and confidence delta
+7. **State Reconciler** — merges extracted strings, IOCs, techniques, and APIs into the canonical state; updates confidence, readability, and transform history; records queue feedback and stall tracking
+8. **Stop Decision** — checks 7 termination conditions (budget exhausted, stall, confidence regression, consecutive failures, queue empty, sufficiency, manual stop)
 
 High-confidence deterministic transforms are auto-approved; uncertain or LLM-dependent actions are queued as suggestions with human-in-the-loop approval.
 
@@ -74,7 +77,7 @@ High-confidence deterministic transforms are auto-approved; uncertain or LLM-dep
 | **Analysis engine** | Priority queue with auto-approve, per-iteration state snapshots with rollback, confidence tracking, stall detection, readability scoring |
 | **LLM integration** | OpenAI-compatible (OpenAI, Azure, vLLM, Ollama, LM Studio), custom CA cert bundles, 128k/200k max-token presets, connection testing |
 | **UI** | Dark-mode-only, Monaco editor, side-by-side diff viewer, 8 workspace tabs, confidence gauge, transform timeline, analyst notes |
-| **Export** | Markdown and JSON reports with full findings, IOCs, transforms, and strings |
+| **Export** | Download deobfuscated code as a standalone file, Markdown and JSON reports with full findings, IOCs, transforms, and strings |
 
 ---
 
@@ -316,6 +319,7 @@ All endpoints are under `/api`. Interactive documentation is available at `/docs
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/api/samples/{id}/export/deobfuscated` | Download deobfuscated code as a file |
 | `GET` | `/api/samples/{id}/export/markdown` | Download Markdown report |
 | `GET` | `/api/samples/{id}/export/json` | Download JSON report |
 

@@ -115,8 +115,12 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
     sample.status = SampleStatus.RUNNING.value
     await _safe_commit(db, "mark sample as running")
 
-    # The orchestrator works fully deterministically without an LLM.
     from app.services.analysis.orchestrator import Orchestrator
+
+    tracker["current_action"] = "loading LLM provider"
+
+    # Try to load the active LLM provider for intelligent analysis.
+    llm_client = await _load_llm_client(db)
 
     tracker["current_action"] = "starting orchestrator"
 
@@ -125,6 +129,7 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         original_code=sample.original_text,
         language=sample.language,
         db_session=db,
+        llm_client=llm_client,
     )
 
     # Run the full multi-pass analysis loop.
@@ -234,6 +239,58 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
 
     tracker["status"] = "completed"
     tracker["current_action"] = "analysis complete"
+
+
+async def _load_llm_client(db: AsyncSession):
+    """Try to load the active LLM provider and return an LLMClient.
+
+    Returns None if no provider is configured or loading fails.
+    Never raises.
+    """
+    try:
+        from sqlalchemy import select
+        from app.models.db_models import ProviderConfig
+        from app.services.llm.client import LLMClient, _MAX_TOKENS_MAP
+
+        result = await db.execute(
+            select(ProviderConfig)
+            .where(ProviderConfig.is_active == True)  # noqa: E712
+            .order_by(ProviderConfig.created_at.desc())
+            .limit(1)
+        )
+        provider = result.scalar_one_or_none()
+
+        if provider is None:
+            # No active provider — fall back to any provider.
+            result = await db.execute(
+                select(ProviderConfig)
+                .order_by(ProviderConfig.created_at.desc())
+                .limit(1)
+            )
+            provider = result.scalar_one_or_none()
+
+        if provider is None:
+            logger.info("No LLM provider configured; running in deterministic mode")
+            return None
+
+        max_tokens = _MAX_TOKENS_MAP.get(provider.max_tokens_preset, 4096)
+        client = LLMClient(
+            base_url=provider.base_url,
+            api_key=provider.api_key_encrypted,
+            model=provider.model_name,
+            max_tokens=max_tokens,
+            cert_bundle=provider.cert_bundle_path,
+            use_system_trust=provider.use_system_trust,
+        )
+        logger.info(
+            "Loaded LLM provider '%s' (model=%s) for analysis",
+            provider.name,
+            provider.model_name,
+        )
+        return client
+    except Exception:
+        logger.exception("Failed to load LLM provider; continuing without LLM")
+        return None
 
 
 async def _safe_commit(db: AsyncSession, context: str) -> bool:

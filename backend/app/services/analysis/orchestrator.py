@@ -1316,8 +1316,13 @@ class PlannedAction:
 class Planner:
     """Inspect current state and recommend next actions.
 
-    The planner runs purely deterministic heuristics.
+    The planner runs purely deterministic heuristics.  When LLM transforms
+    are available in the action space, it schedules them at appropriate
+    phases alongside the deterministic transforms.
     """
+
+    def __init__(self, available_actions: Optional[Set[str]] = None) -> None:
+        self._available_actions: Set[str] = available_actions or set()
 
     # Ordered plan templates by analysis phase.
     _PHASE_INITIAL: List[str] = [
@@ -1476,6 +1481,53 @@ class Planner:
                     priority=18.0,
                 ))
 
+        # ── LLM-powered actions (when provider is available) ─────────
+        has_llm = "llm_deobfuscate" in self._available_actions
+        if has_llm:
+            # LLM deep deobfuscation — schedule after initial recon and
+            # deterministic decoding have had a chance to run (iteration >= 2).
+            if iteration >= 2 and not action_queue.success_count("llm_deobfuscate"):
+                recommendations.append(PlannedAction(
+                    action_name="llm_deobfuscate",
+                    confidence=0.8,
+                    reason="LLM-assisted deep deobfuscation.",
+                    priority=13.0,
+                ))
+
+            # LLM multi-layer unwrapper — if we detected multiple encoding
+            # techniques or deterministic decoders made limited progress.
+            multi_technique = len(techniques) >= 2
+            limited_progress = (
+                iteration >= 3
+                and not action_queue.success_count("llm_multilayer_unwrap")
+            )
+            if multi_technique or limited_progress:
+                if not action_queue.success_count("llm_multilayer_unwrap"):
+                    recommendations.append(PlannedAction(
+                        action_name="llm_multilayer_unwrap",
+                        confidence=0.75,
+                        reason="Multiple encoding layers detected; LLM multi-layer unwrap.",
+                        priority=13.5,
+                    ))
+
+            # LLM renaming — schedule after some deobfuscation has happened.
+            if iteration >= 3 and not action_queue.success_count("llm_rename"):
+                recommendations.append(PlannedAction(
+                    action_name="llm_rename",
+                    confidence=0.7,
+                    reason="LLM-assisted semantic identifier renaming.",
+                    priority=19.0,
+                ))
+
+            # LLM summariser — schedule in the final phase alongside findings.
+            if iteration >= 3 and not action_queue.success_count("llm_summarize"):
+                recommendations.append(PlannedAction(
+                    action_name="llm_summarize",
+                    confidence=0.85,
+                    reason="LLM-assisted behaviour analysis and threat assessment.",
+                    priority=21.0,
+                ))
+
         # Sort by priority.
         recommendations.sort(key=lambda r: r.priority)
         return recommendations
@@ -1560,16 +1612,19 @@ class Executor:
                     details={"skipped": True},
                 )
 
-            # Run the transform.  Since BaseTransform.apply is synchronous,
-            # we run it in the default executor to avoid blocking the loop.
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None,
-                transform.apply,
-                code,
-                language,
-                state,
-            )
+            # LLM transforms provide an async path; deterministic transforms
+            # are synchronous and need to run in a thread executor.
+            if getattr(transform, "is_llm", False) and hasattr(transform, "apply_async"):
+                result = await transform.apply_async(code, language, state)
+            else:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    transform.apply,
+                    code,
+                    language,
+                    state,
+                )
             return result
 
         except Exception as exc:
@@ -1621,6 +1676,10 @@ class PreflightValidator:
         ("decode_hex", "decode_hex"),
         ("constant_fold", "constant_fold"),
         ("simplify_junk_code", "simplify_junk_code"),
+        ("llm_deobfuscate", "llm_deobfuscate"),
+        ("llm_rename", "llm_rename"),
+        ("llm_summarize", "llm_summarize"),
+        ("llm_multilayer_unwrap", "llm_multilayer_unwrap"),
     ]
 
     def validate(
@@ -1938,17 +1997,74 @@ class StateReconciler:
                 str(s)[:80] for s in suggestions[:10]
             )
 
+        # ── LLM-specific detail extraction ────────────────────────
+
+        # IOCs from LLM summarizer (uses "iocs_found" key).
+        llm_iocs = details.get("iocs_found", [])
+        for ioc_data in llm_iocs:
+            if isinstance(ioc_data, dict):
+                try:
+                    ioc_type = IOCType(ioc_data.get("type", "other"))
+                except ValueError:
+                    ioc_type = IOCType.OTHER
+                ioc = IOC(
+                    type=ioc_type,
+                    value=ioc_data.get("value", ""),
+                    context=ioc_data.get("context"),
+                    confidence=float(ioc_data.get("confidence", 0.7)),
+                )
+                all_iocs.append(ioc)
+
+        # Hidden payloads from multi-layer unwrapper.
+        hidden_payloads = details.get("hidden_payloads", [])
+        if hidden_payloads:
+            payload_strings = [
+                str(p)[:500] for p in hidden_payloads[:10]
+                if isinstance(p, str)
+            ]
+            if payload_strings:
+                sm.add_recovered_literals(payload_strings)
+
+        # LLM analysis metadata (capabilities, risk factors, etc.).
+        capabilities = details.get("capabilities", [])
+        if capabilities:
+            sm.add_detected_techniques(
+                [f"capability:{c}" for c in capabilities[:20]]
+            )
+        risk_factors = details.get("risk_factors", [])
+        if risk_factors:
+            sm.state.llm_suggestions.extend(
+                f"Risk: {r}" for r in risk_factors[:10]
+            )
+        recommended_actions = details.get("recommended_actions", [])
+        if recommended_actions:
+            sm.state.llm_suggestions.extend(
+                f"Action: {a}" for a in recommended_actions[:10]
+            )
+
+        # LLM layers info (from multi-layer unwrapper).
+        layers = details.get("layers", [])
+        if layers:
+            layer_types = [
+                l.get("type", "unknown")
+                for l in layers
+                if isinstance(l, dict)
+            ]
+            if layer_types:
+                sm.add_detected_techniques(layer_types)
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Orchestrator
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _build_action_space() -> Dict[str, BaseTransform]:
+def _build_action_space(llm_client: Optional[Any] = None) -> Dict[str, BaseTransform]:
     """Build the action-name -> transform-instance mapping.
 
     Tries to import from ``app.services.transforms`` first.  Falls back
-    to the inline implementations bundled in this module.
+    to the inline implementations bundled in this module.  When an
+    ``llm_client`` is provided, LLM-powered transforms are added.
     """
     # Mapping of action name -> (module_path, class_name).
     _EXTERNAL_MAP: Dict[str, Tuple[str, str]] = {
@@ -2008,6 +2124,25 @@ def _build_action_space() -> Dict[str, BaseTransform]:
         if action_name not in space:
             space[action_name] = cls()
 
+    # ── LLM-powered transforms (only when a client is available) ──
+    if llm_client is not None:
+        try:
+            from app.services.transforms.llm_deobfuscator import LLMDeobfuscator
+            from app.services.transforms.llm_renamer import LLMRenamer
+            from app.services.transforms.llm_summarizer import LLMSummarizer
+            from app.services.transforms.llm_multilayer import LLMMultiLayerUnwrapper
+
+            space["llm_deobfuscate"] = LLMDeobfuscator(llm_client)
+            space["llm_rename"] = LLMRenamer(llm_client)
+            space["llm_summarize"] = LLMSummarizer(llm_client)
+            space["llm_multilayer_unwrap"] = LLMMultiLayerUnwrapper(llm_client)
+            logger.info(
+                "Registered %d LLM-powered transforms",
+                sum(1 for k in space if k.startswith("llm_")),
+            )
+        except Exception:
+            logger.exception("Failed to load LLM transforms; continuing without them")
+
     return space
 
 
@@ -2027,12 +2162,14 @@ class Orchestrator:
         language: Optional[str] = None,
         settings: Optional[Any] = None,
         db_session: Optional[Any] = None,
+        llm_client: Optional[Any] = None,
     ) -> None:
         self.sample_id = sample_id
         self.original_code = original_code
         self.language = language
         self.settings = settings
         self.db_session = db_session
+        self.llm_client = llm_client
 
         # Sub-components initialised in run().
         self._state_manager: Optional[StateManager] = None
@@ -2047,8 +2184,8 @@ class Orchestrator:
         self._stop_decision: Optional[StopDecision] = None
         self._findings_gen: Optional[FindingsGenerator] = None
 
-        # Action space registry.
-        self.action_space: Dict[str, BaseTransform] = _build_action_space()
+        # Action space registry (includes LLM transforms when client available).
+        self.action_space: Dict[str, BaseTransform] = _build_action_space(llm_client)
 
     # ------------------------------------------------------------------
     #  Main entry point
@@ -2090,7 +2227,7 @@ class Orchestrator:
         self._action_queue = ActionQueue(
             auto_approve_threshold=auto_approve_threshold,
         )
-        self._planner = Planner()
+        self._planner = Planner(available_actions=set(self.action_space.keys()))
         self._selector = ActionSelector()
         self._preflight = PreflightValidator()
         self._executor = Executor(self.action_space)

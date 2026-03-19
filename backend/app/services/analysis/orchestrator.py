@@ -1192,12 +1192,38 @@ class StopDecision:
                 "Action queue exhausted; no more transforms to try.",
             )
 
-        # 6. Sufficiently deobfuscated.
+        # 6. Sufficiently deobfuscated — check both confidence and readability.
         if confidence >= self.sufficiency_threshold:
             return StopVerdict(
                 StopAction.STOP,
                 f"Code sufficiently deobfuscated (confidence {confidence:.2f}).",
             )
+
+        # 6b. High readability with moderate confidence — good enough.
+        readability_history = state_manager.readability_history
+        if (
+            len(readability_history) >= 3
+            and readability_history[-1] >= 0.75
+            and confidence >= 0.6
+        ):
+            # Readability is high and confidence is decent — code is clean.
+            return StopVerdict(
+                StopAction.STOP,
+                f"Code highly readable ({readability_history[-1]:.2f}) "
+                f"with adequate confidence ({confidence:.2f}).",
+            )
+
+        # 6c. Readability plateau — no improvement in last 3 measurements.
+        if len(readability_history) >= 4:
+            recent = readability_history[-3:]
+            if all(abs(recent[i] - recent[i - 1]) < 0.02 for i in range(1, len(recent))):
+                # Readability has plateaued — further transforms are unlikely to help.
+                if confidence >= 0.5 and iteration >= 5:
+                    return StopVerdict(
+                        StopAction.STOP,
+                        f"Readability plateaued at {recent[-1]:.2f}; "
+                        f"further transforms unlikely to improve output.",
+                    )
 
         # 7. Last action failed -> consider retry or continue.
         if not last_transform_success:
@@ -1257,7 +1283,7 @@ class Verifier:
         read_before = StateManager._estimate_readability(code_before)
         read_after = StateManager._estimate_readability(code_after)
         read_delta = read_after - read_before
-        scores.append((0.25, read_delta))
+        scores.append((0.20, read_delta))
 
         # 2. Length change (shorter is usually better for deobfuscation).
         if len(code_before) > 0:
@@ -1268,23 +1294,51 @@ class Verifier:
                 len_score = 0.5 - (len_ratio - 0.5)
             else:
                 len_score = len_ratio * 0.5
-            scores.append((0.15, len_score))
+            scores.append((0.10, len_score))
 
         # 3. String recovery.
         new_strings = details.get("strings") or []
         decoded_strings = details.get("decoded_strings") or []
         recovered = details.get("recovered") or []
-        string_count = len(new_strings) + len(decoded_strings) + len(recovered)
+        decrypted_strings = details.get("decrypted_strings") or []
+        string_count = (
+            len(new_strings) + len(decoded_strings)
+            + len(recovered) + len(decrypted_strings)
+        )
         if string_count > 0:
-            scores.append((0.25, min(string_count * 0.1, 0.5)))
+            scores.append((0.20, min(string_count * 0.1, 0.5)))
 
         # 4. IOC extraction.
-        iocs = details.get("iocs") or []
+        iocs = details.get("iocs") or details.get("iocs_found") or []
         if iocs:
-            scores.append((0.15, min(len(iocs) * 0.1, 0.5)))
+            scores.append((0.10, min(len(iocs) * 0.1, 0.5)))
 
         # 5. Transform confidence as a signal.
-        scores.append((0.20, result.confidence * 0.5))
+        scores.append((0.15, result.confidence * 0.5))
+
+        # 6. Entropy improvement (lower entropy after decode = better).
+        if details.get("overall_entropy") is not None:
+            # Entropy analysis provides info but doesn't modify code.
+            scores.append((0.05, result.confidence * 0.3))
+        elif code_before != code_after:
+            ent_score = self._entropy_delta(code_before, code_after)
+            if ent_score != 0.0:
+                scores.append((0.10, ent_score))
+
+        # 7. Identifier quality improvement (renames, deobfuscation).
+        rename_count = details.get("rename_count", 0)
+        if not rename_count and details.get("renames"):
+            rename_count = len(details["renames"])
+        if rename_count > 0:
+            scores.append((0.10, min(rename_count * 0.05, 0.4)))
+
+        # 8. Structural improvements (CFF unflattened, layers unwrapped).
+        dispatchers = details.get("dispatchers_resolved", 0)
+        layers = details.get("layers", [])
+        if dispatchers:
+            scores.append((0.10, min(dispatchers * 0.2, 0.5)))
+        if layers:
+            scores.append((0.10, min(len(layers) * 0.15, 0.5)))
 
         # Weighted sum.
         total_weight = sum(w for w, _ in scores)
@@ -1292,11 +1346,33 @@ class Verifier:
             return 0.0
         improvement = sum(w * s for w, s in scores) / total_weight
 
-        # Regression check.
+        # Regression check: code became less readable AND no new intelligence
         if read_after < read_before * 0.8 and not string_count:
             improvement = min(improvement, -0.1)
 
         return max(-1.0, min(1.0, improvement))
+
+    @staticmethod
+    def _entropy_delta(before: str, after: str) -> float:
+        """Estimate Shannon entropy change. Lower entropy = improvement.
+        Returns positive if entropy decreased."""
+        import math
+        from collections import Counter
+
+        def _ent(s: str) -> float:
+            if not s:
+                return 0.0
+            c = Counter(s[:50000])
+            n = sum(c.values())
+            return -sum((v / n) * math.log2(v / n) for v in c.values() if v > 0)
+
+        ent_before = _ent(before)
+        ent_after = _ent(after)
+        if ent_before == 0:
+            return 0.0
+        # Normalise: if entropy dropped by 0.5+ bits, that's meaningful
+        delta = ent_before - ent_after
+        return max(-0.3, min(0.3, delta * 0.15))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1319,6 +1395,18 @@ class Planner:
     The planner runs purely deterministic heuristics.  When LLM transforms
     are available in the action space, it schedules them at appropriate
     phases alongside the deterministic transforms.
+
+    Key intelligence features:
+    - **Re-scanning**: After any successful code-modifying transform,
+      re-fingerprints to discover newly exposed patterns.
+    - **Entropy-driven**: Uses entropy analysis to decide between
+      decoding (high entropy) and simplification (medium entropy).
+    - **Context-aware decoding**: Schedules unicode normalisation and
+      string decryption when escape sequences or decrypt patterns found.
+    - **Control flow recovery**: Schedules CFF unflattening when
+      dispatcher patterns are detected.
+    - **Adaptive renaming**: Applies deterministic renaming before
+      (optionally) LLM-assisted semantic renaming.
     """
 
     def __init__(self, available_actions: Optional[Set[str]] = None) -> None:
@@ -1329,26 +1417,56 @@ class Planner:
         "detect_language",
         "fingerprint_obfuscation",
         "extract_strings",
+        "analyze_entropy",
     ]
     _PHASE_DECODE: List[str] = [
         "decode_base64",
         "decode_hex",
+        "normalize_unicode",
         "try_xor_recovery",
         "powershell_decode",
         "python_decode",
         "identify_string_resolver",
+        "decrypt_strings",
     ]
     _PHASE_SIMPLIFY: List[str] = [
         "constant_fold",
         "simplify_junk_code",
+        "unflatten_control_flow",
         "detect_eval_exec_reflection",
     ]
     _PHASE_FINAL: List[str] = [
         "recover_literals",
+        "apply_renames",
         "suggest_renames",
         "extract_iocs",
         "generate_findings",
     ]
+
+    def _should_rescan(self, action_queue: ActionQueue) -> bool:
+        """Determine if re-fingerprinting is warranted.
+
+        Re-scan when a code-modifying transform succeeded since the last
+        fingerprint run, exposing potentially new patterns.
+        """
+        _CODE_MODIFYING = {
+            "decode_base64", "decode_hex", "try_xor_recovery",
+            "powershell_decode", "python_decode", "constant_fold",
+            "simplify_junk_code", "identify_string_resolver",
+            "normalize_unicode", "decrypt_strings",
+            "unflatten_control_flow",
+            "llm_deobfuscate", "llm_multilayer_unwrap",
+        }
+        fingerprint_count = action_queue.success_count("fingerprint_obfuscation")
+        if fingerprint_count == 0:
+            return False  # hasn't run yet at all
+        # Count total successful code-modifying transforms since start
+        modifying_successes = sum(
+            action_queue.success_count(a) for a in _CODE_MODIFYING
+        )
+        # Re-scan if code-modifying transforms have succeeded more times
+        # than we've fingerprinted (roughly: new modifications since last scan).
+        return modifying_successes >= fingerprint_count
 
     def plan(
         self,
@@ -1363,10 +1481,10 @@ class Planner:
 
         recommendations: List[PlannedAction] = []
 
-        # Phase 1: Initial reconnaissance.
+        # ── Phase 1: Initial reconnaissance ──────────────────────────
         if iteration <= 1:
             for i, action in enumerate(self._PHASE_INITIAL):
-                if not action_queue.has_been_tried(action):
+                if action in self._available_actions and not action_queue.has_been_tried(action):
                     recommendations.append(PlannedAction(
                         action_name=action,
                         confidence=0.95,
@@ -1374,8 +1492,38 @@ class Planner:
                         priority=float(i),
                     ))
 
-        # Phase 2: Decoding -- driven by detected techniques.
+        # ── Smart re-scanning after code changes ─────────────────────
+        if iteration > 1 and self._should_rescan(action_queue):
+            recommendations.append(PlannedAction(
+                action_name="fingerprint_obfuscation",
+                confidence=0.90,
+                reason="Re-scanning after code modifications to discover new patterns.",
+                priority=5.0,
+            ))
+
+        # ── Entropy-driven scheduling ────────────────────────────────
+        # If entropy analysis was done and found high-entropy sections,
+        # prioritise decoding transforms.
+        entropy_details = {}
+        for record in state.transform_history:
+            if record.action == "analyze_entropy" and record.success:
+                entropy_details = record.outputs or {}
+        entropy_profile = entropy_details.get("entropy_profile", "")
+
+        if entropy_profile in ("encrypted", "heavily_obfuscated"):
+            # Aggressively schedule all decoders
+            for action in self._PHASE_DECODE:
+                if action in self._available_actions and not action_queue.success_count(action):
+                    recommendations.append(PlannedAction(
+                        action_name=action,
+                        confidence=0.85,
+                        reason=f"High entropy ({entropy_profile}) — aggressive decoding.",
+                        priority=8.0,
+                    ))
+
+        # ── Phase 2: Decoding — driven by detected techniques ────────
         techniques = set(t.lower().replace(" ", "_") for t in state.detected_techniques)
+
         if "base64_encoding" in techniques and not action_queue.success_count("decode_base64"):
             recommendations.append(PlannedAction(
                 action_name="decode_base64",
@@ -1397,6 +1545,40 @@ class Planner:
                 reason="XOR encryption patterns detected.",
                 priority=12.0,
             ))
+
+        # Unicode/escape normalisation — schedule if code has escape sequences.
+        if ("normalize_unicode" in self._available_actions
+                and not action_queue.success_count("normalize_unicode")):
+            _escape_hint = bool(
+                re.search(r'\\u[0-9a-fA-F]{4}|\\x[0-9a-fA-F]{2}|&#\d+;', code[:5000])
+            )
+            if _escape_hint or "unicode_escape" in techniques:
+                recommendations.append(PlannedAction(
+                    action_name="normalize_unicode",
+                    confidence=0.88,
+                    reason="Unicode/hex escape sequences detected.",
+                    priority=9.5,
+                ))
+
+        # String decryption — schedule if custom decrypt functions suspected.
+        if ("decrypt_strings" in self._available_actions
+                and not action_queue.success_count("decrypt_strings")):
+            _decrypt_hint = bool(
+                re.search(
+                    r'function\s+\w{1,6}\s*\(\s*\w+\s*\)\s*\{.*?(?:split|reverse|fromCharCode|charCodeAt|charAt)\b',
+                    code[:10000],
+                    re.DOTALL,
+                )
+            ) or "string_encryption" in techniques
+            if _decrypt_hint:
+                recommendations.append(PlannedAction(
+                    action_name="decrypt_strings",
+                    confidence=0.75,
+                    reason="Custom string decrypt function detected.",
+                    priority=11.5,
+                ))
+
+        # Language-specific decoders.
         if language in ("powershell", "ps1", "ps"):
             if not action_queue.success_count("powershell_decode"):
                 recommendations.append(PlannedAction(
@@ -1422,7 +1604,7 @@ class Planner:
                     priority=11.0,
                 ))
 
-        # Phase 3: Simplification.
+        # ── Phase 3: Simplification ──────────────────────────────────
         if "string_concatenation" in techniques or "junk_code" in techniques:
             if not action_queue.success_count("constant_fold"):
                 recommendations.append(PlannedAction(
@@ -1447,10 +1629,40 @@ class Planner:
                     priority=14.0,
                 ))
 
-        # Phase 4: Final passes -- always suggest if not done.
-        # But only after at least a few iterations.
+        # Control flow unflattening — if CFF detected.
+        if ("unflatten_control_flow" in self._available_actions
+                and not action_queue.success_count("unflatten_control_flow")):
+            _cff_hint = (
+                "control_flow_flattening" in techniques
+                or bool(re.search(
+                    r'while\s*\(\s*(?:true|1|!0)\s*\)\s*\{?\s*switch',
+                    code[:10000],
+                    re.IGNORECASE,
+                ))
+            )
+            if _cff_hint:
+                recommendations.append(PlannedAction(
+                    action_name="unflatten_control_flow",
+                    confidence=0.70,
+                    reason="Control flow flattening detected.",
+                    priority=14.5,
+                ))
+
+        # ── Phase 4: Final passes ────────────────────────────────────
         if iteration >= 3:
+            # Deterministic renaming before LLM renaming.
+            if ("apply_renames" in self._available_actions
+                    and not action_queue.success_count("apply_renames")):
+                recommendations.append(PlannedAction(
+                    action_name="apply_renames",
+                    confidence=0.75,
+                    reason="Apply deterministic variable renaming.",
+                    priority=19.0,
+                ))
+
             for i, action in enumerate(self._PHASE_FINAL):
+                if action == "apply_renames":
+                    continue  # already handled above
                 if not action_queue.success_count(action):
                     recommendations.append(PlannedAction(
                         action_name=action,
@@ -1459,11 +1671,10 @@ class Planner:
                         priority=20.0 + i,
                     ))
 
-        # If nothing was recommended but we are still early, schedule a broad
-        # decoding sweep.
+        # ── Exploratory sweep (if nothing recommended early on) ──────
         if not recommendations and iteration < 10:
             for action in self._PHASE_DECODE:
-                if not action_queue.has_been_tried(action):
+                if action in self._available_actions and not action_queue.has_been_tried(action):
                     recommendations.append(PlannedAction(
                         action_name=action,
                         confidence=0.5,
@@ -1479,6 +1690,72 @@ class Planner:
                     confidence=0.7,
                     reason="Second-pass constant folding after decoding.",
                     priority=18.0,
+                ))
+
+        # Second-pass string decryption after decoders expose new functions.
+        if (iteration >= 5
+                and "decrypt_strings" in self._available_actions
+                and action_queue.success_count("decrypt_strings") == 1):
+            total_decode_successes = sum(
+                action_queue.success_count(a) for a in [
+                    "decode_base64", "decode_hex", "normalize_unicode",
+                ]
+            )
+            if total_decode_successes >= 2:
+                recommendations.append(PlannedAction(
+                    action_name="decrypt_strings",
+                    confidence=0.65,
+                    reason="Second-pass string decryption after decoders exposed new code.",
+                    priority=18.5,
+                ))
+
+        # Second-pass CFF after constant folding / junk removal may
+        # have simplified dispatcher structures.
+        if (iteration >= 5
+                and "unflatten_control_flow" in self._available_actions
+                and action_queue.success_count("unflatten_control_flow") == 1):
+            simplify_successes = sum(
+                action_queue.success_count(a) for a in [
+                    "constant_fold", "simplify_junk_code",
+                ]
+            )
+            if simplify_successes >= 1:
+                recommendations.append(PlannedAction(
+                    action_name="unflatten_control_flow",
+                    confidence=0.60,
+                    reason="Second CFF pass after simplification exposed cleaner dispatchers.",
+                    priority=18.0,
+                ))
+
+        # Second-pass renaming after LLM deobfuscation may have
+        # introduced new identifiers worth renaming.
+        if (iteration >= 6
+                and "apply_renames" in self._available_actions
+                and action_queue.success_count("apply_renames") == 1
+                and action_queue.success_count("llm_deobfuscate") >= 1):
+            recommendations.append(PlannedAction(
+                action_name="apply_renames",
+                confidence=0.60,
+                reason="Second rename pass after LLM deobfuscation.",
+                priority=19.5,
+            ))
+
+        # Re-extract strings after significant code changes.
+        if (iteration >= 4
+                and action_queue.success_count("extract_strings") == 1):
+            total_code_changes = sum(
+                action_queue.success_count(a) for a in [
+                    "decode_base64", "decode_hex", "normalize_unicode",
+                    "decrypt_strings", "unflatten_control_flow",
+                    "constant_fold", "llm_deobfuscate",
+                ]
+            )
+            if total_code_changes >= 2:
+                recommendations.append(PlannedAction(
+                    action_name="extract_strings",
+                    confidence=0.70,
+                    reason="Re-extracting strings after significant code changes.",
+                    priority=17.0,
                 ))
 
         # ── LLM-powered actions (when provider is available) ─────────
@@ -1510,13 +1787,13 @@ class Planner:
                         priority=13.5,
                     ))
 
-            # LLM renaming — schedule after some deobfuscation has happened.
-            if iteration >= 3 and not action_queue.success_count("llm_rename"):
+            # LLM renaming — schedule after deterministic renaming has run.
+            if iteration >= 4 and not action_queue.success_count("llm_rename"):
                 recommendations.append(PlannedAction(
                     action_name="llm_rename",
                     confidence=0.7,
                     reason="LLM-assisted semantic identifier renaming.",
-                    priority=19.0,
+                    priority=19.5,
                 ))
 
             # LLM summariser — schedule in the final phase alongside findings.
@@ -1676,6 +1953,10 @@ class PreflightValidator:
         ("decode_hex", "decode_hex"),
         ("constant_fold", "constant_fold"),
         ("simplify_junk_code", "simplify_junk_code"),
+        ("normalize_unicode", "normalize_unicode"),
+        ("unflatten_control_flow", "unflatten_control_flow"),
+        ("apply_renames", "apply_renames"),
+        ("analyze_entropy", "analyze_entropy"),
         ("llm_deobfuscate", "llm_deobfuscate"),
         ("llm_rename", "llm_rename"),
         ("llm_summarize", "llm_summarize"),
@@ -1997,6 +2278,59 @@ class StateReconciler:
                 str(s)[:80] for s in suggestions[:10]
             )
 
+        # Deterministic renamer applied renames.
+        renames = details.get("renames", {})
+        if renames and isinstance(renames, dict):
+            sm.state.llm_suggestions.extend(
+                f"Renamed '{old}' -> '{new}'"
+                for old, new in list(renames.items())[:20]
+            )
+
+        # String decryptor results.
+        decrypted_strings = details.get("decrypted_strings", [])
+        if decrypted_strings:
+            entries = []
+            for d in decrypted_strings:
+                if isinstance(d, dict):
+                    entries.append(StringEntry(
+                        value=d.get("decrypted", d.get("value", "")),
+                        encoding="decrypted",
+                        context=d.get("original", d.get("context", ""))[:80],
+                    ))
+                elif isinstance(d, str):
+                    entries.append(StringEntry(
+                        value=d,
+                        encoding="decrypted",
+                    ))
+            sm.add_strings(entries)
+
+        # Unicode normaliser results.
+        unicode_decoded = details.get("unicode_decoded_count", 0)
+        if unicode_decoded > 0:
+            sm.state.llm_suggestions.append(
+                f"Normalised {unicode_decoded} Unicode/hex escape sequences."
+            )
+
+        # Control flow unflattener results.
+        dispatchers_found = details.get("dispatchers_found", 0)
+        dispatchers_resolved = details.get("dispatchers_resolved", 0)
+        if dispatchers_found > 0:
+            sm.state.llm_suggestions.append(
+                f"Found {dispatchers_found} CFF dispatchers, "
+                f"resolved {dispatchers_resolved}."
+            )
+
+        # Entropy analysis metadata.
+        entropy_profile = details.get("entropy_profile")
+        if entropy_profile:
+            sm.state.llm_suggestions.append(
+                f"Entropy profile: {entropy_profile} "
+                f"(overall: {details.get('overall_entropy', '?'):.2f} bits)"
+            )
+            high_regions = details.get("high_entropy_regions", [])
+            if high_regions:
+                sm.add_detected_techniques(["high_entropy_blob"])
+
         # ── LLM-specific detail extraction ────────────────────────
 
         # IOCs from LLM summarizer (uses "iocs_found" key).
@@ -2070,19 +2404,25 @@ def _build_action_space(llm_client: Optional[Any] = None) -> Dict[str, BaseTrans
     _EXTERNAL_MAP: Dict[str, Tuple[str, str]] = {
         "detect_language": ("app.services.transforms.language_detector", "LanguageDetector"),
         "fingerprint_obfuscation": ("app.services.transforms.obfuscation_fingerprinter", "ObfuscationFingerprinter"),
-        "extract_strings": ("app.services.transforms.string_extractor", "StringExtractor"),
+        "extract_strings": ("app.services.transforms.string_extraction", "StringExtractor"),
         "decode_base64": ("app.services.transforms.base64_decoder", "Base64Decoder"),
         "decode_hex": ("app.services.transforms.hex_decoder", "HexDecoder"),
         "try_xor_recovery": ("app.services.transforms.xor_recovery", "XorRecovery"),
         "constant_fold": ("app.services.transforms.constant_folder", "ConstantFolder"),
-        "simplify_junk_code": ("app.services.transforms.junk_code_remover", "JunkCodeRemover"),
-        "detect_eval_exec_reflection": ("app.services.transforms.eval_exec_detector", "EvalExecDetector"),
-        "identify_string_resolver": ("app.services.transforms.js_array_resolver", "JavaScriptArrayResolver"),
+        "simplify_junk_code": ("app.services.transforms.junk_code", "JunkCodeRemover"),
+        "detect_eval_exec_reflection": ("app.services.transforms.eval_detection", "EvalExecDetector"),
+        "identify_string_resolver": ("app.services.transforms.js_resolvers", "JavaScriptArrayResolver"),
         "suggest_renames": ("app.services.transforms.rename_suggester", "RenameSuggester"),
         "extract_iocs": ("app.services.transforms.ioc_extractor", "IOCExtractor"),
         "powershell_decode": ("app.services.transforms.powershell_decoder", "PowerShellDecoder"),
         "python_decode": ("app.services.transforms.python_decoder", "PythonDecoder"),
         "generate_findings": ("app.services.transforms.findings_generator", "FindingsGeneratorTransform"),
+        # ── New transforms ──
+        "analyze_entropy": ("app.services.transforms.entropy_analyzer", "EntropyAnalyzer"),
+        "normalize_unicode": ("app.services.transforms.unicode_normalizer", "UnicodeNormalizer"),
+        "unflatten_control_flow": ("app.services.transforms.control_flow_unflattener", "ControlFlowUnflattener"),
+        "apply_renames": ("app.services.transforms.deterministic_renamer", "DeterministicRenamer"),
+        "decrypt_strings": ("app.services.transforms.string_decryptor", "StringDecryptor"),
     }
 
     # Inline fallbacks.

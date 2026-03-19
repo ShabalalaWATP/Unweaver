@@ -60,13 +60,22 @@ class ActionQueue:
         "detect_language",
         "fingerprint_obfuscation",
         "extract_strings",
+        "analyze_entropy",
         "decode_base64",
         "decode_hex",
+        "normalize_unicode",
+        "decrypt_strings",
         "constant_fold",
         "simplify_junk_code",
+        "unflatten_control_flow",
+        "apply_renames",
         "extract_iocs",
         "powershell_decode",
         "python_decode",
+        "detect_eval_exec_reflection",
+        "identify_string_resolver",
+        "suggest_renames",
+        "generate_findings",
     }
 
     def __init__(self, auto_approve_threshold: float = 0.85) -> None:

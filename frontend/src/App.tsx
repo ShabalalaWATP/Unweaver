@@ -41,16 +41,65 @@ const styles = {
     alignItems: 'center',
     justifyContent: 'center',
     flex: 1,
-    color: 'var(--text-muted)',
-    fontSize: '14px',
     flexDirection: 'column',
-    gap: '8px',
+    gap: '16px',
+    animation: 'unweaver-fade-in 0.6s ease',
+    position: 'relative',
   } as React.CSSProperties,
-  emptyTitle: {
-    fontSize: '18px',
-    fontWeight: 600,
-    color: 'var(--text-secondary)',
-    letterSpacing: '0.04em',
+  emptyGlow: {
+    position: 'absolute',
+    width: '300px',
+    height: '300px',
+    borderRadius: '50%',
+    background: 'radial-gradient(circle, rgba(88,166,255,0.06) 0%, transparent 70%)',
+    pointerEvents: 'none',
+  } as React.CSSProperties,
+  emptyLogo: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '12px',
+    marginBottom: '4px',
+  } as React.CSSProperties,
+  emptyTerminal: {
+    fontFamily: 'var(--font-mono)',
+    fontSize: '28px',
+    fontWeight: 700,
+    background: 'linear-gradient(135deg, var(--accent) 0%, var(--purple, #bc8cff) 50%, var(--accent-bright) 100%)',
+    backgroundSize: '200% 200%',
+    animation: 'unweaver-gradient-flow 6s ease infinite',
+    WebkitBackgroundClip: 'text',
+    WebkitTextFillColor: 'transparent',
+    letterSpacing: '0.06em',
+  } as React.CSSProperties,
+  emptyCursor: {
+    display: 'inline-block',
+    width: '2px',
+    height: '28px',
+    background: 'var(--accent)',
+    animation: 'unweaver-cursor-blink 1s step-end infinite',
+    marginLeft: '2px',
+    borderRadius: '1px',
+  } as React.CSSProperties,
+  emptySubtitle: {
+    fontSize: '13px',
+    color: 'var(--text-muted)',
+    letterSpacing: '0.02em',
+  } as React.CSSProperties,
+  emptyHint: {
+    display: 'flex',
+    gap: '24px',
+    marginTop: '12px',
+  } as React.CSSProperties,
+  emptyHintItem: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    fontSize: '11px',
+    color: 'var(--text-muted)',
+    padding: '6px 14px',
+    borderRadius: 'var(--radius-lg)',
+    background: 'var(--bg-secondary)',
+    border: '1px solid var(--border)',
   } as React.CSSProperties,
 };
 
@@ -189,8 +238,19 @@ export default function App() {
                   />
                 ) : (
                   <div style={styles.emptyState}>
-                    <div style={styles.emptyTitle}>UNWEAVER</div>
-                    <div>Select or upload a sample to begin analysis</div>
+                    <div style={styles.emptyGlow} />
+                    <div style={styles.emptyLogo}>
+                      <span style={styles.emptyTerminal}>UNWEAVER</span>
+                      <span style={styles.emptyCursor} />
+                    </div>
+                    <div style={styles.emptySubtitle}>
+                      Agentic code deobfuscation workbench
+                    </div>
+                    <div style={styles.emptyHint}>
+                      <span style={styles.emptyHintItem}>
+                        Upload a file or paste code to begin
+                      </span>
+                    </div>
                   </div>
                 )}
               </div>

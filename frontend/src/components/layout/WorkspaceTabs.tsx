@@ -1,4 +1,7 @@
 import { useState } from 'react';
+import {
+  Code2, FileCheck, GitCompare, Type, Shield, History, AlertTriangle, BookOpen,
+} from 'lucide-react';
 import type { SampleDetail, AnalysisState } from '@/types';
 import OriginalTab from '@/components/tabs/OriginalTab';
 import RecoveredTab from '@/components/tabs/RecoveredTab';
@@ -19,15 +22,15 @@ type TabId =
   | 'findings'
   | 'notebook';
 
-const TABS: { id: TabId; label: string }[] = [
-  { id: 'original', label: 'Original' },
-  { id: 'recovered', label: 'Recovered' },
-  { id: 'diff', label: 'Diff' },
-  { id: 'strings', label: 'Strings' },
-  { id: 'iocs', label: 'IOCs' },
-  { id: 'transforms', label: 'Transform History' },
-  { id: 'findings', label: 'Findings' },
-  { id: 'notebook', label: 'Agent Notebook' },
+const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
+  { id: 'original', label: 'Original', icon: <Code2 size={13} /> },
+  { id: 'recovered', label: 'Recovered', icon: <FileCheck size={13} /> },
+  { id: 'diff', label: 'Diff', icon: <GitCompare size={13} /> },
+  { id: 'strings', label: 'Strings', icon: <Type size={13} /> },
+  { id: 'iocs', label: 'IOCs', icon: <Shield size={13} /> },
+  { id: 'transforms', label: 'Transforms', icon: <History size={13} /> },
+  { id: 'findings', label: 'Findings', icon: <AlertTriangle size={13} /> },
+  { id: 'notebook', label: 'Notebook', icon: <BookOpen size={13} /> },
 ];
 
 interface WorkspaceTabsProps {
@@ -48,21 +51,51 @@ const s = {
     borderBottom: '1px solid var(--border)',
     overflowX: 'auto',
     flexShrink: 0,
+    gap: '1px',
+    padding: '0 4px',
   } as React.CSSProperties,
   tab: {
-    padding: '8px 16px',
+    padding: '10px 14px 9px',
     fontSize: '11px',
     fontWeight: 500,
-    color: 'var(--text-secondary)',
+    color: 'var(--text-muted)',
     cursor: 'pointer',
     borderBottom: '2px solid transparent',
     whiteSpace: 'nowrap',
-    transition: 'color 0.1s, border-color 0.1s',
+    transition: 'all 0.15s ease',
     userSelect: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    position: 'relative',
   } as React.CSSProperties,
   tabActive: {
-    color: 'var(--text-primary)',
+    color: 'var(--accent)',
     borderBottomColor: 'var(--accent)',
+    background: 'rgba(88,166,255,0.04)',
+  } as React.CSSProperties,
+  tabIcon: {
+    opacity: 0.6,
+    flexShrink: 0,
+  } as React.CSSProperties,
+  tabIconActive: {
+    opacity: 1,
+  } as React.CSSProperties,
+  countBadge: {
+    fontSize: '9px',
+    fontWeight: 600,
+    fontFamily: 'var(--font-mono)',
+    padding: '1px 5px',
+    borderRadius: '8px',
+    background: 'var(--bg-tertiary)',
+    color: 'var(--text-muted)',
+    lineHeight: '1.3',
+    minWidth: '16px',
+    textAlign: 'center',
+  } as React.CSSProperties,
+  countBadgeActive: {
+    background: 'var(--accent-muted)',
+    color: 'var(--accent)',
   } as React.CSSProperties,
   content: {
     flex: 1,
@@ -72,6 +105,13 @@ const s = {
 
 export default function WorkspaceTabs({ sample, analysisState }: WorkspaceTabsProps) {
   const [activeTab, setActiveTab] = useState<TabId>('original');
+
+  // Count badges for data tabs
+  const counts: Partial<Record<TabId, number>> = {};
+  if (analysisState) {
+    if (analysisState.strings?.length) counts.strings = analysisState.strings.length;
+    if (analysisState.transform_history?.length) counts.transforms = analysisState.transform_history.length;
+  }
 
   const renderContent = () => {
     switch (activeTab) {
@@ -99,28 +139,45 @@ export default function WorkspaceTabs({ sample, analysisState }: WorkspaceTabsPr
   return (
     <div style={s.root}>
       <div style={s.tabBar}>
-        {TABS.map((tab) => (
-          <div
-            key={tab.id}
-            style={{
-              ...s.tab,
-              ...(activeTab === tab.id ? s.tabActive : {}),
-            }}
-            onClick={() => setActiveTab(tab.id)}
-            onMouseEnter={(e) => {
-              if (activeTab !== tab.id) {
-                e.currentTarget.style.color = 'var(--text-primary)';
-              }
-            }}
-            onMouseLeave={(e) => {
-              if (activeTab !== tab.id) {
-                e.currentTarget.style.color = 'var(--text-secondary)';
-              }
-            }}
-          >
-            {tab.label}
-          </div>
-        ))}
+        {TABS.map((tab) => {
+          const isActive = activeTab === tab.id;
+          const count = counts[tab.id];
+          return (
+            <div
+              key={tab.id}
+              style={{
+                ...s.tab,
+                ...(isActive ? s.tabActive : {}),
+              }}
+              onClick={() => setActiveTab(tab.id)}
+              onMouseEnter={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.color = 'var(--text-secondary)';
+                  e.currentTarget.style.background = 'var(--bg-hover, rgba(255,255,255,0.02))';
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.color = 'var(--text-muted)';
+                  e.currentTarget.style.background = 'transparent';
+                }
+              }}
+            >
+              <span style={{ ...(s.tabIcon), ...(isActive ? s.tabIconActive : {}) }}>
+                {tab.icon}
+              </span>
+              {tab.label}
+              {count !== undefined && count > 0 && (
+                <span style={{
+                  ...s.countBadge,
+                  ...(isActive ? s.countBadgeActive : {}),
+                }}>
+                  {count > 99 ? '99+' : count}
+                </span>
+              )}
+            </div>
+          );
+        })}
       </div>
       <div style={s.content}>{renderContent()}</div>
     </div>

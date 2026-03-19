@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { Play, Square, RefreshCw, Download, FileText, FileCode } from 'lucide-react';
+import { Play, Square, RefreshCw, Download, FileText, FileCode, Loader2 } from 'lucide-react';
 import type { SampleDetail, AnalysisStatus } from '@/types';
 import StatusBadge from '@/components/common/StatusBadge';
 import * as api from '@/services/api';
@@ -14,14 +14,15 @@ interface TopBarProps {
 
 const s = {
   root: {
-    height: 48,
-    minHeight: 48,
+    height: 52,
+    minHeight: 52,
     background: 'var(--bg-secondary)',
     borderBottom: '1px solid var(--border)',
     display: 'flex',
     alignItems: 'center',
     padding: '0 16px',
     gap: '12px',
+    position: 'relative',
   } as React.CSSProperties,
   title: {
     fontSize: '13px',
@@ -34,13 +35,14 @@ const s = {
   } as React.CSSProperties,
   lang: {
     fontSize: '10px',
-    padding: '2px 6px',
-    borderRadius: 'var(--radius-sm)',
+    padding: '2px 8px',
+    borderRadius: '10px',
     background: 'var(--bg-tertiary)',
     color: 'var(--text-secondary)',
     fontWeight: 500,
     textTransform: 'uppercase',
     letterSpacing: '0.05em',
+    border: '1px solid var(--border)',
   } as React.CSSProperties,
   separator: {
     width: 1,
@@ -54,57 +56,90 @@ const s = {
   progress: {
     display: 'flex',
     alignItems: 'center',
-    gap: '8px',
+    gap: '10px',
     fontSize: '11px',
     color: 'var(--text-secondary)',
+    animation: 'unweaver-fade-in 0.3s ease',
   } as React.CSSProperties,
   progressBar: {
-    width: 100,
-    height: 4,
+    width: 120,
+    height: 5,
     background: 'var(--bg-tertiary)',
-    borderRadius: 2,
+    borderRadius: 3,
     overflow: 'hidden',
+    border: '1px solid var(--border)',
   } as React.CSSProperties,
   progressFill: {
     height: '100%',
-    background: 'var(--accent)',
-    borderRadius: 2,
-    transition: 'width 0.3s ease',
+    background: 'linear-gradient(90deg, var(--accent) 0%, var(--accent-bright) 100%)',
+    borderRadius: 3,
+    transition: 'width 0.5s ease',
+    position: 'relative',
+  } as React.CSSProperties,
+  iterLabel: {
+    fontFamily: 'var(--font-mono)',
+    fontSize: '10px',
+    fontWeight: 600,
+    color: 'var(--accent)',
+    letterSpacing: '0.02em',
   } as React.CSSProperties,
   btn: {
-    padding: '5px 12px',
+    padding: '6px 14px',
     fontSize: '11px',
     fontWeight: 600,
-    borderRadius: 'var(--radius-sm)',
+    borderRadius: 'var(--radius-md)',
     display: 'flex',
     alignItems: 'center',
-    gap: '5px',
+    gap: '6px',
     cursor: 'pointer',
-    transition: 'opacity 0.15s',
+    transition: 'all var(--transition-med)',
     border: 'none',
   } as React.CSSProperties,
   analyseBtn: {
-    background: 'var(--accent)',
+    background: 'linear-gradient(135deg, #2563eb 0%, #3b82f6 50%, #60a5fa 100%)',
     color: '#fff',
+    boxShadow: '0 2px 8px rgba(37,99,235,0.3)',
+  } as React.CSSProperties,
+  analyseBtnHover: {
+    boxShadow: '0 4px 16px rgba(37,99,235,0.45)',
+    transform: 'translateY(-1px)',
   } as React.CSSProperties,
   stopBtn: {
     background: 'var(--danger-muted)',
     color: 'var(--danger)',
-    border: '1px solid var(--danger)',
+    border: '1px solid rgba(248,81,73,0.3)',
   } as React.CSSProperties,
   iconBtn: {
-    padding: '6px',
-    borderRadius: 'var(--radius-sm)',
-    color: 'var(--text-secondary)',
+    padding: '7px',
+    borderRadius: 'var(--radius-md)',
+    color: 'var(--text-muted)',
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
-    transition: 'color 0.15s, background 0.15s',
+    transition: 'all var(--transition-fast)',
   } as React.CSSProperties,
   actionInfo: {
     fontSize: '11px',
     color: 'var(--text-muted)',
     fontFamily: 'var(--font-mono)',
+    maxWidth: '200px',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  } as React.CSSProperties,
+  downloadBtn: {
+    background: 'var(--success-muted)',
+    color: 'var(--success)',
+    border: '1px solid rgba(63,185,80,0.3)',
+  } as React.CSSProperties,
+  emptyBar: {
+    height: 52,
+    minHeight: 52,
+    background: 'var(--bg-secondary)',
+    borderBottom: '1px solid var(--border)',
+    display: 'flex',
+    alignItems: 'center',
+    padding: '0 16px',
   } as React.CSSProperties,
 };
 
@@ -116,6 +151,7 @@ export default function TopBar({
   onRefresh,
 }: TopBarProps) {
   const [exporting, setExporting] = useState(false);
+  const [analyseHover, setAnalyseHover] = useState(false);
 
   const isRunning = sample?.status === 'running';
   const isPending = sample?.status === 'pending';
@@ -182,9 +218,9 @@ export default function TopBar({
 
   if (!sample) {
     return (
-      <div style={s.root}>
-        <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>
-          No sample selected
+      <div style={s.emptyBar}>
+        <span style={{ color: 'var(--text-muted)', fontSize: '12px', fontStyle: 'italic' }}>
+          Select a sample to begin
         </span>
       </div>
     );
@@ -197,20 +233,27 @@ export default function TopBar({
       <StatusBadge status={sample.status} />
 
       {/* Progress indicator during analysis */}
-      {isRunning && analysisStatus && (
+      {(isRunning || isPending) && analysisStatus && (
         <>
           <div style={s.separator} />
           <div style={s.progress}>
+            <Loader2
+              size={13}
+              style={{
+                animation: 'unweaver-spin 1s linear infinite',
+                color: 'var(--accent)',
+              }}
+            />
             <div style={s.progressBar}>
               <div
                 style={{
                   ...s.progressFill,
-                  width: `${analysisStatus.progress_pct}%`,
+                  width: `${Math.max(analysisStatus.progress_pct, 3)}%`,
                 }}
               />
             </div>
-            <span>
-              Iter {analysisStatus.current_iteration}/{analysisStatus.total_iterations || '?'}
+            <span style={s.iterLabel}>
+              {analysisStatus.current_iteration}/{analysisStatus.total_iterations || '?'}
             </span>
           </div>
           {analysisStatus.current_action && (
@@ -222,10 +265,12 @@ export default function TopBar({
       <div style={s.spacer} />
 
       {/* Action buttons */}
-      {isRunning ? (
+      {isRunning || isPending ? (
         <button
           style={{ ...s.btn, ...s.stopBtn }}
           onClick={onStopAnalysis}
+          onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(248,81,73,0.2)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = 'var(--danger-muted)'; }}
         >
           <Square size={12} />
           Stop
@@ -235,10 +280,13 @@ export default function TopBar({
           style={{
             ...s.btn,
             ...s.analyseBtn,
-            opacity: canStart ? 1 : 0.4,
+            ...(analyseHover && canStart ? s.analyseBtnHover : {}),
+            opacity: canStart ? 1 : 0.35,
             cursor: canStart ? 'pointer' : 'default',
           }}
           onClick={canStart ? onStartAnalysis : undefined}
+          onMouseEnter={() => setAnalyseHover(true)}
+          onMouseLeave={() => setAnalyseHover(false)}
         >
           <Play size={12} />
           Analyse &amp; Deobfuscate
@@ -251,8 +299,14 @@ export default function TopBar({
         style={s.iconBtn}
         onClick={onRefresh}
         title="Refresh"
-        onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.color = 'var(--text-primary)';
+          e.currentTarget.style.background = 'var(--bg-tertiary)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.color = 'var(--text-muted)';
+          e.currentTarget.style.background = 'transparent';
+        }}
       >
         <RefreshCw size={14} />
       </button>
@@ -261,17 +315,17 @@ export default function TopBar({
         <button
           style={{
             ...s.btn,
-            background: 'var(--success-muted, #1a3a2a)',
-            color: 'var(--success, #4ade80)',
-            border: '1px solid var(--success, #4ade80)',
+            ...s.downloadBtn,
             opacity: exporting ? 0.5 : 1,
           }}
           onClick={handleDownloadDeobfuscated}
           title="Download deobfuscated file"
           disabled={exporting}
+          onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(63,185,80,0.2)'; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = 'var(--success-muted)'; }}
         >
           <FileCode size={12} />
-          Download Deobfuscated
+          Download
         </button>
       )}
 
@@ -280,8 +334,14 @@ export default function TopBar({
         onClick={handleExportMd}
         title="Export Markdown report"
         disabled={exporting}
-        onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.color = 'var(--text-primary)';
+          e.currentTarget.style.background = 'var(--bg-tertiary)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.color = 'var(--text-muted)';
+          e.currentTarget.style.background = 'transparent';
+        }}
       >
         <FileText size={14} />
       </button>
@@ -290,8 +350,14 @@ export default function TopBar({
         onClick={handleExportJson}
         title="Export JSON report"
         disabled={exporting}
-        onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.color = 'var(--text-primary)';
+          e.currentTarget.style.background = 'var(--bg-tertiary)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.color = 'var(--text-muted)';
+          e.currentTarget.style.background = 'transparent';
+        }}
       >
         <Download size={14} />
       </button>

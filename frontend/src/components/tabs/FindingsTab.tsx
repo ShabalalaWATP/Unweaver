@@ -55,9 +55,10 @@ const s = {
   card: {
     background: 'var(--bg-secondary)',
     border: '1px solid var(--border)',
-    borderRadius: 'var(--radius-md)',
+    borderRadius: 'var(--radius-lg, 10px)',
     marginBottom: '10px',
     overflow: 'hidden',
+    transition: 'border-color 0.15s ease, box-shadow 0.15s ease',
   } as React.CSSProperties,
   cardHeader: {
     padding: '10px 14px',

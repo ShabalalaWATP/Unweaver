@@ -9,11 +9,17 @@ function getColor(val: number): string {
   return 'var(--danger)';
 }
 
+function getLabel(val: number): string {
+  if (val >= 70) return 'High confidence';
+  if (val >= 40) return 'Moderate';
+  return 'Low confidence';
+}
+
 const s = {
   root: {
     display: 'flex',
     alignItems: 'center',
-    gap: '10px',
+    gap: '12px',
   } as React.CSSProperties,
   ring: {
     position: 'relative',
@@ -27,13 +33,24 @@ const s = {
     fontWeight: 700,
     letterSpacing: '-0.02em',
   } as React.CSSProperties,
-  text: {
+  meta: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+  } as React.CSSProperties,
+  labelText: {
     fontSize: '11px',
+    fontWeight: 500,
     color: 'var(--text-secondary)',
+  } as React.CSSProperties,
+  subtext: {
+    fontSize: '10px',
+    color: 'var(--text-muted)',
+    fontFamily: 'var(--font-mono)',
   } as React.CSSProperties,
 };
 
-export default function ConfidenceGauge({ value, size = 52 }: ConfidenceGaugeProps) {
+export default function ConfidenceGauge({ value, size = 56 }: ConfidenceGaugeProps) {
   const clamped = Math.max(0, Math.min(100, value));
   const color = getColor(clamped);
   const strokeWidth = 4;
@@ -54,6 +71,20 @@ export default function ConfidenceGauge({ value, size = 52 }: ConfidenceGaugePro
             stroke="var(--bg-tertiary)"
             strokeWidth={strokeWidth}
           />
+          {/* Glow behind progress */}
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={radius}
+            fill="none"
+            stroke={color}
+            strokeWidth={strokeWidth + 4}
+            strokeDasharray={circumference}
+            strokeDashoffset={offset}
+            strokeLinecap="round"
+            opacity={0.15}
+            style={{ transition: 'stroke-dashoffset 0.6s ease, stroke 0.3s ease' }}
+          />
           {/* Progress ring */}
           <circle
             cx={size / 2}
@@ -65,25 +96,22 @@ export default function ConfidenceGauge({ value, size = 52 }: ConfidenceGaugePro
             strokeDasharray={circumference}
             strokeDashoffset={offset}
             strokeLinecap="round"
-            style={{ transition: 'stroke-dashoffset 0.5s ease, stroke 0.3s ease' }}
+            style={{ transition: 'stroke-dashoffset 0.6s ease, stroke 0.3s ease' }}
           />
         </svg>
         <span
           style={{
             ...s.label,
-            fontSize: size > 48 ? '13px' : '10px',
+            fontSize: size > 48 ? '14px' : '10px',
             color,
           }}
         >
           {clamped}%
         </span>
       </div>
-      <div style={s.text}>
-        {clamped >= 70
-          ? 'High confidence'
-          : clamped >= 40
-            ? 'Moderate confidence'
-            : 'Low confidence'}
+      <div style={s.meta as React.CSSProperties}>
+        <span style={s.labelText}>{getLabel(clamped)}</span>
+        <span style={s.subtext}>{clamped}/100 overall</span>
       </div>
     </div>
   );

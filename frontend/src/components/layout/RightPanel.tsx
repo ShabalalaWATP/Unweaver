@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { RotateCcw, Download, Trash2, Save } from 'lucide-react';
+import { RotateCcw, Download, Trash2, Save, Cpu, Eye, Zap } from 'lucide-react';
 import type { SampleDetail, AnalysisState } from '@/types';
 import ConfidenceGauge from '@/components/common/ConfidenceGauge';
 import * as api from '@/services/api';
@@ -12,8 +12,8 @@ interface RightPanelProps {
 
 const s = {
   root: {
-    width: 260,
-    minWidth: 260,
+    width: 272,
+    minWidth: 272,
     background: 'var(--bg-secondary)',
     borderLeft: '1px solid var(--border)',
     display: 'flex',
@@ -23,47 +23,72 @@ const s = {
   scrollArea: {
     flex: 1,
     overflowY: 'auto',
-    padding: '12px',
+    padding: '14px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '14px',
   } as React.CSSProperties,
-  section: {
-    marginBottom: '16px',
+  card: {
+    background: 'var(--bg-primary)',
+    border: '1px solid var(--border)',
+    borderRadius: 'var(--radius-lg)',
+    padding: '12px',
   } as React.CSSProperties,
   sectionTitle: {
     fontSize: '10px',
     fontWeight: 600,
     textTransform: 'uppercase',
-    letterSpacing: '0.08em',
+    letterSpacing: '0.1em',
     color: 'var(--text-muted)',
-    marginBottom: '8px',
+    marginBottom: '10px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+  } as React.CSSProperties,
+  sectionIcon: {
+    opacity: 0.5,
   } as React.CSSProperties,
   badge: {
     display: 'inline-block',
-    padding: '2px 8px',
-    borderRadius: 'var(--radius-sm)',
+    padding: '3px 10px',
+    borderRadius: '10px',
     fontSize: '11px',
-    fontWeight: 500,
+    fontWeight: 600,
     fontFamily: 'var(--font-mono)',
   } as React.CSSProperties,
   langBadge: {
     background: 'var(--accent-muted)',
     color: 'var(--accent)',
+    border: '1px solid rgba(88,166,255,0.2)',
   } as React.CSSProperties,
   techTag: {
     display: 'inline-block',
-    padding: '2px 6px',
+    padding: '3px 8px',
     margin: '2px 4px 2px 0',
-    borderRadius: 'var(--radius-sm)',
+    borderRadius: '10px',
     fontSize: '10px',
     fontWeight: 500,
     background: 'var(--bg-tertiary)',
     color: 'var(--text-secondary)',
     border: '1px solid var(--border)',
+    transition: 'all var(--transition-fast)',
   } as React.CSSProperties,
   apiItem: {
     fontFamily: 'var(--font-mono)',
     fontSize: '11px',
     color: 'var(--danger)',
-    padding: '2px 0',
+    padding: '3px 0',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+  } as React.CSSProperties,
+  apiDot: {
+    width: 4,
+    height: 4,
+    borderRadius: '50%',
+    background: 'var(--danger)',
+    flexShrink: 0,
+    boxShadow: '0 0 4px var(--danger)',
   } as React.CSSProperties,
   actions: {
     display: 'flex',
@@ -71,10 +96,10 @@ const s = {
     flexWrap: 'wrap',
   } as React.CSSProperties,
   actionBtn: {
-    padding: '4px 8px',
+    padding: '5px 10px',
     fontSize: '10px',
     fontWeight: 500,
-    borderRadius: 'var(--radius-sm)',
+    borderRadius: 'var(--radius-md)',
     border: '1px solid var(--border)',
     background: 'var(--bg-tertiary)',
     color: 'var(--text-secondary)',
@@ -82,64 +107,68 @@ const s = {
     alignItems: 'center',
     gap: '4px',
     cursor: 'pointer',
-    transition: 'border-color 0.15s',
+    transition: 'all var(--transition-fast)',
   } as React.CSSProperties,
   textarea: {
     width: '100%',
-    minHeight: 100,
-    padding: '8px',
+    minHeight: 90,
+    padding: '8px 10px',
     fontSize: '12px',
     fontFamily: 'var(--font-mono)',
-    background: 'var(--bg-primary)',
+    background: 'var(--bg-tertiary)',
     border: '1px solid var(--border)',
-    borderRadius: 'var(--radius-sm)',
+    borderRadius: 'var(--radius-md)',
     color: 'var(--text-primary)',
     outline: 'none',
     resize: 'vertical',
+    transition: 'border-color var(--transition-med)',
   } as React.CSSProperties,
   saveBtn: {
-    marginTop: '6px',
-    padding: '5px 10px',
+    marginTop: '8px',
+    padding: '6px 12px',
     fontSize: '11px',
     fontWeight: 600,
-    borderRadius: 'var(--radius-sm)',
+    borderRadius: 'var(--radius-md)',
     background: 'var(--accent-muted)',
     color: 'var(--accent)',
-    border: '1px solid var(--accent)',
+    border: '1px solid rgba(88,166,255,0.3)',
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
-    gap: '4px',
+    gap: '5px',
+    transition: 'all var(--transition-fast)',
   } as React.CSSProperties,
   savedMsg: {
     fontSize: '10px',
     color: 'var(--success)',
-    marginLeft: '8px',
+    marginLeft: 'auto',
+    fontWeight: 500,
   } as React.CSSProperties,
   readabilityBar: {
-    height: 4,
-    borderRadius: 2,
+    height: 6,
+    borderRadius: 3,
     background: 'var(--bg-tertiary)',
     overflow: 'hidden',
-    marginTop: '4px',
+    marginTop: '6px',
+    border: '1px solid var(--border)',
   } as React.CSSProperties,
   readabilityFill: {
     height: '100%',
-    borderRadius: 2,
-    transition: 'width 0.3s ease',
+    borderRadius: 3,
+    transition: 'width 0.5s ease',
   } as React.CSSProperties,
   statRow: {
     display: 'flex',
     justifyContent: 'space-between',
     alignItems: 'center',
     fontSize: '11px',
-    padding: '2px 0',
+    padding: '3px 0',
     color: 'var(--text-secondary)',
   } as React.CSSProperties,
   statValue: {
     fontFamily: 'var(--font-mono)',
     color: 'var(--text-primary)',
-    fontWeight: 500,
+    fontWeight: 600,
   } as React.CSSProperties,
 };
 
@@ -192,8 +221,11 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
     <div style={s.root}>
       <div style={s.scrollArea}>
         {/* Language */}
-        <div style={s.section}>
-          <div style={s.sectionTitle}>Language</div>
+        <div style={s.card}>
+          <div style={s.sectionTitle}>
+            <Cpu size={11} style={s.sectionIcon} />
+            Language
+          </div>
           <span style={{ ...s.badge, ...s.langBadge }}>
             {sample.language ?? 'Unknown'}
           </span>
@@ -201,11 +233,14 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
 
         {/* Confidence */}
         {overallConfidence !== null && (
-          <div style={s.section}>
-            <div style={s.sectionTitle}>Confidence</div>
+          <div style={s.card}>
+            <div style={s.sectionTitle}>
+              <Eye size={11} style={s.sectionIcon} />
+              Confidence
+            </div>
             <ConfidenceGauge value={overallConfidence} />
             {confidence && (
-              <div style={{ marginTop: '8px' }}>
+              <div style={{ marginTop: '10px' }}>
                 <div style={s.statRow}>
                   <span>Naming</span>
                   <span style={s.statValue}>{Math.round(confidence.naming * 100)}%</span>
@@ -225,18 +260,23 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
 
         {/* Readability */}
         {readability > 0 && (
-          <div style={s.section}>
-            <div style={s.sectionTitle}>Readability</div>
+          <div style={s.card}>
+            <div style={s.sectionTitle}>
+              <Zap size={11} style={s.sectionIcon} />
+              Readability
+            </div>
             <div style={s.statRow}>
               <span>Score</span>
-              <span style={s.statValue}>{Math.round(readability * 100)}%</span>
+              <span style={{ ...s.statValue, color: getReadabilityColor(readability) }}>
+                {Math.round(readability * 100)}%
+              </span>
             </div>
             <div style={s.readabilityBar}>
               <div
                 style={{
                   ...s.readabilityFill,
                   width: `${readability * 100}%`,
-                  background: getReadabilityColor(readability),
+                  background: `linear-gradient(90deg, ${getReadabilityColor(readability)}, ${getReadabilityColor(readability)}cc)`,
                 }}
               />
             </div>
@@ -245,9 +285,9 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
 
         {/* Detected techniques */}
         {techniques.length > 0 && (
-          <div style={s.section}>
+          <div style={s.card}>
             <div style={s.sectionTitle}>Detected Techniques</div>
-            <div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
               {techniques.map((t, i) => (
                 <span key={i} style={s.techTag}>
                   {t}
@@ -259,10 +299,11 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
 
         {/* Suspicious APIs */}
         {suspiciousApis.length > 0 && (
-          <div style={s.section}>
+          <div style={s.card}>
             <div style={s.sectionTitle}>Suspicious APIs</div>
             {suspiciousApis.map((a, i) => (
               <div key={i} style={s.apiItem}>
+                <div style={s.apiDot} />
                 {a}
               </div>
             ))}
@@ -270,21 +311,53 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
         )}
 
         {/* Quick actions */}
-        <div style={s.section}>
+        <div style={s.card}>
           <div style={s.sectionTitle}>Quick Actions</div>
           <div style={s.actions}>
-            <button style={s.actionBtn} onClick={handleReanalyse} title="Re-analyse">
+            <button
+              style={s.actionBtn}
+              onClick={handleReanalyse}
+              title="Re-analyse"
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = 'var(--accent)';
+                e.currentTarget.style.color = 'var(--accent)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = 'var(--border)';
+                e.currentTarget.style.color = 'var(--text-secondary)';
+              }}
+            >
               <RotateCcw size={10} />
               Re-analyse
             </button>
-            <button style={s.actionBtn} onClick={handleExport} title="Export">
+            <button
+              style={s.actionBtn}
+              onClick={handleExport}
+              title="Export"
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = 'var(--accent)';
+                e.currentTarget.style.color = 'var(--accent)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = 'var(--border)';
+                e.currentTarget.style.color = 'var(--text-secondary)';
+              }}
+            >
               <Download size={10} />
               Export
             </button>
             <button
-              style={{ ...s.actionBtn, borderColor: 'var(--danger)', color: 'var(--danger)' }}
+              style={{ ...s.actionBtn, borderColor: 'rgba(248,81,73,0.2)', color: 'var(--danger)' }}
               onClick={onRefresh}
               title="Refresh"
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = 'var(--danger)';
+                e.currentTarget.style.background = 'var(--danger-muted)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = 'rgba(248,81,73,0.2)';
+                e.currentTarget.style.background = 'var(--bg-tertiary)';
+              }}
             >
               <Trash2 size={10} />
               Clear Cache
@@ -293,7 +366,7 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
         </div>
 
         {/* Analyst notes */}
-        <div style={s.section}>
+        <div style={s.card}>
           <div style={s.sectionTitle}>
             Analyst Notes
             {saved && <span style={s.savedMsg}>Saved</span>}
@@ -304,7 +377,12 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
             onChange={(e) => setNotes(e.target.value)}
             placeholder="Enter notes..."
           />
-          <button style={s.saveBtn} onClick={handleSaveNotes}>
+          <button
+            style={s.saveBtn}
+            onClick={handleSaveNotes}
+            onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(88,166,255,0.15)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = 'var(--accent-muted)'; }}
+          >
             <Save size={10} />
             Save Notes
           </button>

@@ -330,29 +330,33 @@ class StateManager:
     def _estimate_readability(code: str) -> float:
         """Quick heuristic readability score for code (0.0 to 1.0).
 
-        Heuristics used:
-        * Average identifier length (longer is usually more readable).
-        * Ratio of alphanumeric characters to total.
-        * Ratio of printable lines to total lines.
-        * Presence of comments.
-        * Average line length penalty (extremely long lines are bad).
+        Never raises — returns 0.0 on any internal error.
         """
+        try:
+            return StateManager._estimate_readability_inner(code)
+        except Exception:
+            logger.exception("Readability estimation failed")
+            return 0.0
+
+    @staticmethod
+    def _estimate_readability_inner(code: str) -> float:
+        """Core readability heuristic (may raise)."""
         if not code or not code.strip():
             return 0.0
 
-        lines = code.splitlines()
-        total_lines = len(lines)
-        if total_lines == 0:
-            return 0.0
+        # Cap input to prevent ReDoS on extremely large samples
+        capped = code[:200_000]
+
+        lines = capped.splitlines()
+        total_lines = max(len(lines), 1)
 
         # --- Metric 1: printable ratio ---
-        total_chars = len(code)
-        alpha_count = sum(1 for c in code if c.isalnum() or c in " _\n\t")
-        alpha_ratio = alpha_count / total_chars if total_chars else 0.0
+        total_chars = max(len(capped), 1)
+        alpha_count = sum(1 for c in capped if c.isalnum() or c in " _\n\t")
+        alpha_ratio = alpha_count / total_chars
 
         # --- Metric 2: average line length penalty ---
         avg_line_len = total_chars / total_lines
-        # Sweet spot: 40-80 chars.  Penalise very short or very long.
         if avg_line_len < 5:
             line_score = 0.2
         elif avg_line_len <= 100:
@@ -368,21 +372,20 @@ class StateManager:
             1 for line in lines
             if line.strip().startswith(comment_markers)
         )
-        comment_ratio = min(comment_lines / total_lines, 0.3) / 0.3  # cap at 30%
+        comment_ratio = min(comment_lines / total_lines, 0.3) / 0.3
 
         # --- Metric 4: short-identifier penalty ---
-        # Count tokens that look like identifiers (alphanumeric + underscore).
         import re
-        identifiers = re.findall(r"\b[a-zA-Z_]\w*\b", code)
+        identifiers = re.findall(r"\b[a-zA-Z_]\w*\b", capped)
         if identifiers:
-            avg_id_len = sum(len(i) for i in identifiers) / len(identifiers)
-            id_score = min(avg_id_len / 8.0, 1.0)  # 8+ chars is good
+            avg_id_len = sum(len(i) for i in identifiers) / max(len(identifiers), 1)
+            id_score = min(avg_id_len / 8.0, 1.0)
         else:
             id_score = 0.3
 
         # --- Metric 5: non-whitespace line ratio ---
         non_empty = sum(1 for line in lines if line.strip())
-        content_ratio = non_empty / total_lines if total_lines else 0.0
+        content_ratio = non_empty / total_lines
 
         # Weighted combination.
         score = (

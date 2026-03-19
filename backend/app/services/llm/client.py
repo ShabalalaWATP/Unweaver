@@ -135,18 +135,37 @@ class LLMClient:
 
         timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
 
-        async with httpx.AsyncClient(
-            verify=self._ssl_context,
-            timeout=timeout,
-        ) as client:
-            response = await client.post(
-                url,
-                headers=self._build_headers(),
-                json=payload,
+        try:
+            async with httpx.AsyncClient(
+                verify=self._ssl_context,
+                timeout=timeout,
+            ) as client:
+                response = await client.post(
+                    url,
+                    headers=self._build_headers(),
+                    json=payload,
+                )
+                response.raise_for_status()
+        except httpx.TimeoutException:
+            logger.error("LLM request timed out: %s", url)
+            raise
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "LLM HTTP error %d from %s", exc.response.status_code, url
             )
-            response.raise_for_status()
+            raise
+        except httpx.ConnectError as exc:
+            logger.error("LLM connection failed: %s — %s", url, exc)
+            raise
+        except Exception as exc:
+            logger.error("LLM request failed: %s — %s", url, exc)
+            raise
 
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception as exc:
+            logger.error("LLM response is not valid JSON: %s", response.text[:500])
+            raise ValueError("LLM response is not valid JSON") from exc
 
         # Standard OpenAI response shape
         try:

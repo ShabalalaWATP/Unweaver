@@ -64,7 +64,7 @@ async def start_analysis(
 
     # Reset status if previously completed / failed / stopped
     sample.status = SampleStatus.PENDING.value
-    await db.flush()
+    await db.commit()
 
     background_tasks.add_task(run_analysis, sample_id)
 

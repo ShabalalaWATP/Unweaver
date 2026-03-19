@@ -1233,11 +1233,25 @@ class Verifier:
         """Return an improvement score in [-1.0, 1.0].
 
         Positive = improvement, negative = regression, zero = no change.
+        Never raises — returns 0.0 on any internal error.
         """
+        try:
+            return self._verify_inner(code_before, code_after, result)
+        except Exception:
+            logger.exception("Verifier encountered an internal error")
+            return 0.0
+
+    def _verify_inner(
+        self,
+        code_before: str,
+        code_after: str,
+        result: TransformResult,
+    ) -> float:
         if code_before == code_after and not result.details:
             return 0.0
 
         scores: List[Tuple[float, float]] = []  # (weight, score)
+        details = result.details or {}
 
         # 1. Readability delta.
         read_before = StateManager._estimate_readability(code_before)
@@ -1248,25 +1262,24 @@ class Verifier:
         # 2. Length change (shorter is usually better for deobfuscation).
         if len(code_before) > 0:
             len_ratio = (len(code_before) - len(code_after)) / len(code_before)
-            # Moderate shrinkage is good; extreme shrinkage might be data loss.
             if 0 < len_ratio < 0.5:
                 len_score = len_ratio
             elif len_ratio >= 0.5:
-                len_score = 0.5 - (len_ratio - 0.5)  # penalise drastic cuts
+                len_score = 0.5 - (len_ratio - 0.5)
             else:
-                len_score = len_ratio * 0.5  # mild penalty for growth
+                len_score = len_ratio * 0.5
             scores.append((0.15, len_score))
 
         # 3. String recovery.
-        new_strings = result.details.get("strings", [])
-        decoded_strings = result.details.get("decoded_strings", [])
-        recovered = result.details.get("recovered", [])
+        new_strings = details.get("strings") or []
+        decoded_strings = details.get("decoded_strings") or []
+        recovered = details.get("recovered") or []
         string_count = len(new_strings) + len(decoded_strings) + len(recovered)
         if string_count > 0:
             scores.append((0.25, min(string_count * 0.1, 0.5)))
 
         # 4. IOC extraction.
-        iocs = result.details.get("iocs", [])
+        iocs = details.get("iocs") or []
         if iocs:
             scores.append((0.15, min(len(iocs) * 0.1, 0.5)))
 
@@ -1279,7 +1292,7 @@ class Verifier:
             return 0.0
         improvement = sum(w * s for w, s in scores) / total_weight
 
-        # Regression check: if code actually got worse.
+        # Regression check.
         if read_after < read_before * 0.8 and not string_count:
             improvement = min(improvement, -0.1)
 
@@ -2104,6 +2117,9 @@ class Orchestrator:
         stop_reason = "Completed normally."
         iterations_run = 0
 
+        consecutive_stage_errors = 0
+        _MAX_STAGE_ERRORS = 5  # abort if too many iterations fail entirely
+
         try:
             for _ in range(max_iterations):
                 iteration = self._state_manager.advance_iteration()
@@ -2114,10 +2130,15 @@ class Orchestrator:
                 logger.debug("=== Iteration %d ===", iteration)
 
                 # ── Stage 1: Plan ────────────────────────────────────
-                recommendations = self._planner.plan(
-                    self._state_manager,
-                    self._action_queue,
-                )
+                try:
+                    recommendations = self._planner.plan(
+                        self._state_manager,
+                        self._action_queue,
+                    )
+                except Exception:
+                    logger.exception("Planner failed at iteration %d", iteration)
+                    recommendations = []
+
                 logger.debug(
                     "Planner recommended %d action(s): %s",
                     len(recommendations),
@@ -2125,11 +2146,16 @@ class Orchestrator:
                 )
 
                 # ── Stage 2: Select ──────────────────────────────────
-                selected = self._selector.select(
-                    recommendations,
-                    self._action_queue,
-                    self._state_manager,
-                )
+                try:
+                    selected = self._selector.select(
+                        recommendations,
+                        self._action_queue,
+                        self._state_manager,
+                    )
+                except Exception:
+                    logger.exception("Selector failed at iteration %d", iteration)
+                    selected = None
+
                 if selected is None:
                     # Nothing to do -- check stop conditions.
                     verdict = self._stop_decision.evaluate(
@@ -2163,14 +2189,22 @@ class Orchestrator:
                 )
 
                 # ── Stage 3: Pre-flight ──────────────────────────────
-                preflight = self._preflight.validate(
-                    action_name,
-                    code_before,
-                    language,
-                    self.action_space,
-                    self._action_queue,
-                    self._state_manager,
-                )
+                try:
+                    preflight = self._preflight.validate(
+                        action_name,
+                        code_before,
+                        language,
+                        self.action_space,
+                        self._action_queue,
+                        self._state_manager,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Pre-flight validation crashed for '%s'", action_name,
+                    )
+                    # Treat as approved — let the executor handle errors.
+                    preflight = PreflightResult(approved=True)
+
                 if not preflight.approved:
                     logger.info(
                         "Pre-flight rejected '%s': %s",
@@ -2181,7 +2215,12 @@ class Orchestrator:
                     continue
 
                 # ── Stage 4: Execute ─────────────────────────────────
-                state_dict = self._state_manager.state.model_dump()
+                try:
+                    state_dict = self._state_manager.state.model_dump()
+                except Exception:
+                    logger.exception("Failed to serialise state for executor")
+                    state_dict = {}
+
                 result = await self._executor.execute(
                     action_name,
                     code_before,
@@ -2190,49 +2229,80 @@ class Orchestrator:
                 )
 
                 # ── Stage 5: Post-process ────────────────────────────
-                if result.success and result.output != code_before:
-                    cleaned = self._post_processor.process(
-                        result.output, code_before,
+                try:
+                    if result.success and result.output != code_before:
+                        cleaned = self._post_processor.process(
+                            result.output, code_before,
+                        )
+                        if cleaned != result.output:
+                            logger.debug(
+                                "Post-processor normalised output "
+                                "(%d -> %d chars)",
+                                len(result.output),
+                                len(cleaned),
+                            )
+                            result = TransformResult(
+                                success=result.success,
+                                output=cleaned,
+                                confidence=result.confidence,
+                                description=result.description,
+                                details=result.details,
+                            )
+                except Exception:
+                    logger.exception(
+                        "Post-processor failed; using raw executor output",
                     )
-                    if cleaned != result.output:
-                        logger.debug(
-                            "Post-processor normalised output "
-                            "(%d -> %d chars)",
-                            len(result.output),
-                            len(cleaned),
-                        )
-                        result = TransformResult(
-                            success=result.success,
-                            output=cleaned,
-                            confidence=result.confidence,
-                            description=result.description,
-                            details=result.details,
-                        )
+                    # result stays as-is from executor — safe to continue
 
                 # ── Stage 6: Verify / Score ──────────────────────────
-                improvement = self._verifier.verify(
-                    code_before,
-                    result.output,
-                    result,
-                    self._state_manager,
-                )
+                try:
+                    improvement = self._verifier.verify(
+                        code_before,
+                        result.output,
+                        result,
+                        self._state_manager,
+                    )
+                except Exception:
+                    logger.exception("Verifier failed; assuming zero improvement")
+                    improvement = 0.0
 
                 # ── Stage 7: State Reconciler ────────────────────────
-                # Merge results into state, record transform, update
-                # queue feedback, stall tracking, confidence.
-                self._reconciler.reconcile(
-                    action_name=action_name,
-                    selected=selected,
-                    result=result,
-                    improvement=improvement,
-                    code_before=code_before,
-                    iteration=iteration,
-                    state_manager=self._state_manager,
-                    action_queue=self._action_queue,
-                    stop_decision=self._stop_decision,
-                    all_iocs=all_iocs,
-                    confidence_fn=self._compute_new_confidence,
-                )
+                try:
+                    self._reconciler.reconcile(
+                        action_name=action_name,
+                        selected=selected,
+                        result=result,
+                        improvement=improvement,
+                        code_before=code_before,
+                        iteration=iteration,
+                        state_manager=self._state_manager,
+                        action_queue=self._action_queue,
+                        stop_decision=self._stop_decision,
+                        all_iocs=all_iocs,
+                        confidence_fn=self._compute_new_confidence,
+                    )
+                    consecutive_stage_errors = 0  # reconciler OK
+                except Exception:
+                    logger.exception(
+                        "State reconciler failed at iteration %d; "
+                        "marking action as failed and continuing",
+                        iteration,
+                    )
+                    # Ensure queue doesn't re-pick this broken action.
+                    try:
+                        self._action_queue.mark_failed(action_name)
+                        self._stop_decision.record_failure()
+                    except Exception:
+                        pass
+                    consecutive_stage_errors += 1
+                    if consecutive_stage_errors >= _MAX_STAGE_ERRORS:
+                        stop_reason = (
+                            f"Aborting: {_MAX_STAGE_ERRORS} consecutive "
+                            f"stage errors."
+                        )
+                        logger.error(stop_reason)
+                        break
+                    continue
 
                 # Update orchestrator-level language if detect succeeded.
                 if action_name == "detect_language" and result.success:
@@ -2240,17 +2310,32 @@ class Orchestrator:
                     if detected:
                         self.language = detected
 
-                # Take snapshot.
-                self._state_manager.take_snapshot()
-                await self._state_manager.persist_snapshot()
+                # Take snapshot (non-fatal if it fails).
+                try:
+                    self._state_manager.take_snapshot()
+                    await self._state_manager.persist_snapshot()
+                except Exception:
+                    logger.exception(
+                        "Failed to persist snapshot at iteration %d; "
+                        "continuing without snapshot",
+                        iteration,
+                    )
 
                 # ── Stage 8: Stop Decision ───────────────────────────
-                verdict = self._stop_decision.evaluate(
-                    self._state_manager,
-                    self._action_queue,
-                    last_transform_success=result.success,
-                    improvement_score=improvement,
-                )
+                try:
+                    verdict = self._stop_decision.evaluate(
+                        self._state_manager,
+                        self._action_queue,
+                        last_transform_success=result.success,
+                        improvement_score=improvement,
+                    )
+                except Exception:
+                    logger.exception("Stop decision failed; defaulting to CONTINUE")
+                    verdict = StopVerdict(
+                        action=StopAction.CONTINUE,
+                        reason="Stop decision error; continuing.",
+                    )
+
                 logger.debug(
                     "Stop decision: %s (%s)",
                     verdict.action.value,
@@ -2263,13 +2348,14 @@ class Orchestrator:
                     break
                 elif verdict.action == StopAction.BACKTRACK:
                     logger.info("Backtracking: %s", verdict.reason)
-                    self._state_manager.rollback()
-                    self._state_manager.reset_stall()
+                    try:
+                        self._state_manager.rollback()
+                        self._state_manager.reset_stall()
+                    except Exception:
+                        logger.exception("Rollback failed; continuing forward")
                     stop_reason = verdict.reason
-                    # Continue the loop to try other actions.
                 elif verdict.action == StopAction.RETRY:
                     logger.info("Retry mode: %s", verdict.reason)
-                    # The queue will provide a different action next round.
             else:
                 stop_reason = f"Maximum iterations reached ({max_iterations})."
 
@@ -2278,11 +2364,15 @@ class Orchestrator:
             stop_reason = "Unhandled error during orchestration."
 
         # ── Final findings generation ────────────────────────────────
-        findings = self._findings_gen.generate(
-            self._state_manager.state,
-            self._state_manager.current_code,
-            iocs=all_iocs,
-        )
+        try:
+            findings = self._findings_gen.generate(
+                self._state_manager.state,
+                self._state_manager.current_code,
+                iocs=all_iocs,
+            )
+        except Exception:
+            logger.exception("Findings generation failed")
+            findings = []
 
         # Build summary.
         self._state_manager.set_summary(

@@ -118,7 +118,13 @@ async def upload_sample(
     upload_dir = settings.ensure_upload_dir()
     disk_name = f"{uuid.uuid4().hex}_{safe_name}"
     disk_path = upload_dir / disk_name
-    disk_path.write_bytes(content_bytes)
+    try:
+        disk_path.write_bytes(content_bytes)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save uploaded file to disk: {exc}",
+        )
 
     sample = Sample(
         project_id=project_id,
@@ -518,4 +524,5 @@ async def delete_sample(
             detail=f"Sample {sample_id} not found",
         )
     await db.delete(sample)
+    await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

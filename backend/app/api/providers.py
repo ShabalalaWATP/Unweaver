@@ -197,6 +197,7 @@ async def delete_provider(
             detail=f"Provider {provider_id} not found",
         )
     await db.delete(provider)
+    await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -286,7 +287,13 @@ async def upload_cert(
 
     safe_name = f"{uuid.uuid4().hex}.pem"
     cert_path = certs_dir / safe_name
-    cert_path.write_bytes(content)
+    try:
+        cert_path.write_bytes(content)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save certificate to disk: {exc}",
+        )
 
     # Update provider
     provider.cert_bundle_path = str(cert_path)

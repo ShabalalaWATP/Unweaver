@@ -98,15 +98,22 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
 
     tracker = _running_analyses[sample_id]
 
-    # Load sample
+    # Load sample — verify it still exists.
     sample = await db.get(Sample, sample_id)
     if sample is None:
         tracker["status"] = "failed"
         tracker["error"] = "Sample not found"
         return
 
+    if not sample.original_text:
+        tracker["status"] = "failed"
+        tracker["error"] = "Sample has no code to analyse"
+        sample.status = SampleStatus.FAILED.value
+        await _safe_commit(db, "mark empty sample as failed")
+        return
+
     sample.status = SampleStatus.RUNNING.value
-    await db.commit()
+    await _safe_commit(db, "mark sample as running")
 
     # The orchestrator works fully deterministically without an LLM.
     from app.services.analysis.orchestrator import Orchestrator
@@ -132,71 +139,115 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
     tracker["progress_pct"] = 100.0
     tracker["current_action"] = f"completed: {result.stop_reason}"
 
-    # Persist results
+    # ── Persist results in isolated batches ─────────────────────────
+    # Re-fetch sample in case the session state drifted during the long
+    # orchestration run.
+    sample = await db.get(Sample, sample_id)
+    if sample is None:
+        tracker["status"] = "failed"
+        tracker["error"] = "Sample was deleted during analysis"
+        return
+
     sample.recovered_text = result.deobfuscated_code
     sample.language = result.language or sample.language
     sample.status = SampleStatus.COMPLETED.value
+    await _safe_commit(db, "persist recovered text and status")
 
     # Transform history
     for tr in result.transform_history:
-        db.add(TransformHistory(
-            sample_id=sample_id,
-            iteration=tr.iteration,
-            action=tr.action,
-            reason=tr.reason,
-            inputs=tr.inputs,
-            outputs=tr.outputs,
-            confidence_before=tr.confidence_before,
-            confidence_after=tr.confidence_after,
-            readability_before=tr.readability_before,
-            readability_after=tr.readability_after,
-            success=tr.success,
-            retry_revert=tr.retry_revert,
-        ))
+        try:
+            db.add(TransformHistory(
+                sample_id=sample_id,
+                iteration=tr.iteration,
+                action=tr.action,
+                reason=tr.reason,
+                inputs=tr.inputs,
+                outputs=tr.outputs,
+                confidence_before=tr.confidence_before,
+                confidence_after=tr.confidence_after,
+                readability_before=tr.readability_before,
+                readability_after=tr.readability_after,
+                success=tr.success,
+                retry_revert=tr.retry_revert,
+            ))
+        except Exception:
+            logger.exception("Failed to add transform record for iteration %d", tr.iteration)
+    await _safe_commit(db, "persist transform history")
 
     # Strings
     for s in result.strings:
-        db.add(StringRecord(
-            sample_id=sample_id,
-            value=s.value,
-            encoding=s.encoding,
-            offset=s.offset,
-            context=s.context,
-            decoded=s.decoded,
-        ))
+        try:
+            db.add(StringRecord(
+                sample_id=sample_id,
+                value=(s.value or "")[:10_000],
+                encoding=s.encoding,
+                offset=s.offset,
+                context=(s.context or "")[:500],
+                decoded=s.decoded,
+            ))
+        except Exception:
+            logger.exception("Failed to add string record")
+    await _safe_commit(db, "persist strings")
 
     # Findings
     for f in result.findings:
-        severity_val = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
-        db.add(FindingRecord(
-            sample_id=sample_id,
-            title=f.title,
-            severity=severity_val,
-            description=f.description,
-            evidence=f.evidence or "",
-            confidence=f.confidence,
-        ))
+        try:
+            severity_val = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+            db.add(FindingRecord(
+                sample_id=sample_id,
+                title=(f.title or "")[:500],
+                severity=severity_val,
+                description=(f.description or "")[:5000],
+                evidence=(f.evidence or "")[:5000],
+                confidence=f.confidence,
+            ))
+        except Exception:
+            logger.exception("Failed to add finding record")
+    await _safe_commit(db, "persist findings")
 
     # IOCs
     for ioc in result.iocs:
-        ioc_type_val = ioc.type.value if hasattr(ioc.type, "value") else str(ioc.type)
-        db.add(IOCRecord(
-            sample_id=sample_id,
-            ioc_type=ioc_type_val,
-            value=ioc.value,
-            context=ioc.context or "",
-            confidence=ioc.confidence,
-        ))
+        try:
+            ioc_type_val = ioc.type.value if hasattr(ioc.type, "value") else str(ioc.type)
+            db.add(IOCRecord(
+                sample_id=sample_id,
+                ioc_type=ioc_type_val,
+                value=(ioc.value or "")[:2000],
+                context=(ioc.context or "")[:500],
+                confidence=ioc.confidence,
+            ))
+        except Exception:
+            logger.exception("Failed to add IOC record")
+    await _safe_commit(db, "persist IOCs")
 
     # Final iteration state
     if result.state:
-        db.add(IterationState(
-            sample_id=sample_id,
-            iteration_number=result.iterations,
-            state_json=result.state.model_dump_json(),
-        ))
-
-    await db.commit()
+        try:
+            db.add(IterationState(
+                sample_id=sample_id,
+                iteration_number=result.iterations,
+                state_json=result.state.model_dump_json(),
+            ))
+            await _safe_commit(db, "persist final iteration state")
+        except Exception:
+            logger.exception("Failed to persist final iteration state")
 
     tracker["status"] = "completed"
     tracker["current_action"] = "analysis complete"
+
+
+async def _safe_commit(db: AsyncSession, context: str) -> bool:
+    """Commit the current transaction, rolling back on failure.
+
+    Returns True on success, False on failure.  Never raises.
+    """
+    try:
+        await db.commit()
+        return True
+    except Exception:
+        logger.exception("DB commit failed (%s); rolling back", context)
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("DB rollback also failed (%s)", context)
+        return False

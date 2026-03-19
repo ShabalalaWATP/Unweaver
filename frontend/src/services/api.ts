@@ -35,6 +35,7 @@ class ApiError extends Error {
 async function request<T>(
   path: string,
   options: RequestInit = {},
+  timeoutMs = 120_000,
 ): Promise<T> {
   const url = `${BASE_URL}${path}`;
   const headers: Record<string, string> = {
@@ -49,7 +50,24 @@ async function request<T>(
     headers['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(url, { ...options, headers });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new ApiError(`Request timed out after ${timeoutMs}ms: ${path}`, 0, null);
+    }
+    throw err;
+  }
+  clearTimeout(timer);
 
   if (!res.ok) {
     let body: unknown;

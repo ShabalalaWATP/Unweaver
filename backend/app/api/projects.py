@@ -91,4 +91,5 @@ async def delete_project(
             detail=f"Project {project_id} not found",
         )
     await db.delete(project)
+    await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

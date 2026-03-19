@@ -167,28 +167,46 @@ export function useAnalysisStatus(sampleId: string | null, active = false) {
       return;
     }
 
-    let timer: ReturnType<typeof setInterval>;
+    let timer: ReturnType<typeof setTimeout>;
+    let consecutiveErrors = 0;
+    const BASE_INTERVAL = 2000;
+    const MAX_INTERVAL = 30000;
+    const MAX_CONSECUTIVE_ERRORS = 30;
 
     const poll = async () => {
       try {
         const s = await api.getAnalysisStatus(sampleId);
+        consecutiveErrors = 0;
         if (mountedRef.current) {
           setStatus(s);
           if (s.status !== 'running' && s.status !== 'pending') {
-            clearInterval(timer);
+            return; // stop polling
           }
         }
-      } catch {
-        // Silently continue polling on transient errors
+      } catch (err) {
+        consecutiveErrors++;
+        if (consecutiveErrors <= 3) {
+          console.warn('Analysis status poll error:', err);
+        }
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          console.error('Analysis status polling stopped after too many errors');
+          return; // stop polling
+        }
+      }
+      if (mountedRef.current) {
+        // Exponential backoff on errors, base interval on success
+        const delay = consecutiveErrors > 0
+          ? Math.min(BASE_INTERVAL * Math.pow(1.5, consecutiveErrors), MAX_INTERVAL)
+          : BASE_INTERVAL;
+        timer = setTimeout(poll, delay);
       }
     };
 
     poll();
-    timer = setInterval(poll, 2000);
 
     return () => {
       mountedRef.current = false;
-      clearInterval(timer);
+      clearTimeout(timer);
     };
   }, [sampleId, active]);
 

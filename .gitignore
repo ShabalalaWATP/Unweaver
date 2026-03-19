@@ -1,0 +1,15 @@
+*.db
+__pycache__/
+*.py[cod]
+node_modules/
+dist/
+.env
+*.pem
+*.crt
+data/
+uploads/
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+package-lock.json

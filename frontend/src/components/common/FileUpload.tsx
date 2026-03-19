@@ -2,7 +2,7 @@ import { useState, useCallback, useRef } from 'react';
 import { Upload, X, FileText, AlertCircle } from 'lucide-react';
 
 interface FileUploadProps {
-  onUpload: (file: File) => void;
+  onUpload: (file: File) => void | Promise<void>;
   onClose: () => void;
   maxSizeMB?: number;
 }
@@ -196,9 +196,19 @@ export default function FileUpload({
     [validateFile],
   );
 
-  const handleUpload = useCallback(() => {
-    if (file) onUpload(file);
-  }, [file, onUpload]);
+  const [uploading, setUploading] = useState(false);
+
+  const handleUpload = useCallback(async () => {
+    if (!file || uploading) return;
+    setUploading(true);
+    setError(null);
+    try {
+      await onUpload(file);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed. Please try again.');
+      setUploading(false);
+    }
+  }, [file, onUpload, uploading]);
 
   return (
     <div style={s.overlay} onClick={onClose}>
@@ -257,12 +267,12 @@ export default function FileUpload({
             Cancel
           </button>
           <button
-            style={{ ...s.uploadBtn, opacity: file ? 1 : 0.4 }}
+            style={{ ...s.uploadBtn, opacity: file && !uploading ? 1 : 0.4 }}
             onClick={handleUpload}
-            disabled={!file}
+            disabled={!file || uploading}
           >
             <Upload size={12} />
-            Upload
+            {uploading ? 'Uploading...' : 'Upload'}
           </button>
         </div>
       </div>

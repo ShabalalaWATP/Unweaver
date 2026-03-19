@@ -201,9 +201,13 @@ export default function Sidebar({
 
   const handlePaste = useCallback(
     async (text: string, filename?: string, language?: string) => {
-      const sample = await paste(text, filename, language);
-      setShowPaste(false);
-      onSelectSample(sample.id);
+      try {
+        const sample = await paste(text, filename, language);
+        setShowPaste(false);
+        onSelectSample(sample.id);
+      } catch (err) {
+        console.error('Paste failed:', err);
+      }
     },
     [paste, onSelectSample],
   );

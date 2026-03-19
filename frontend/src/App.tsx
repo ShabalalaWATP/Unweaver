@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import type { AnalysisState } from '@/types';
 import { useSample, useAnalysisStatus } from '@/hooks/useApi';
 import * as api from '@/services/api';
@@ -60,20 +60,30 @@ export default function App() {
   const [selectedSampleId, setSelectedSampleId] = useState<string | null>(null);
   const [analysisState, setAnalysisState] = useState<AnalysisState | null>(null);
 
+  // Local flag: set to true immediately when user clicks "Analyse"
+  // so polling starts before the sample refetch completes.
+  const [analysisActive, setAnalysisActive] = useState(false);
+
   const { sample, refetch: refetchSample } = useSample(selectedSampleId);
 
-  const isRunning = sample?.status === 'running' || sample?.status === 'pending';
+  // isRunning includes the local flag so polling starts instantly
+  const isRunning =
+    sample?.status === 'running' ||
+    sample?.status === 'pending' ||
+    analysisActive;
   const analysisStatus = useAnalysisStatus(selectedSampleId, isRunning);
 
   const handleSelectProject = useCallback((id: string) => {
     setSelectedProjectId(id);
     setSelectedSampleId(null);
     setAnalysisState(null);
+    setAnalysisActive(false);
     setView('workspace');
   }, []);
 
   const handleSelectSample = useCallback(async (id: string) => {
     setSelectedSampleId(id);
+    setAnalysisActive(false);
     setView('workspace');
     try {
       const state = await api.getAnalysisState(id);
@@ -85,17 +95,28 @@ export default function App() {
 
   const handleStartAnalysis = useCallback(async () => {
     if (!selectedSampleId) return;
-    await api.startAnalysis(selectedSampleId);
-    refetchSample();
+    try {
+      setAnalysisActive(true);
+      await api.startAnalysis(selectedSampleId);
+      refetchSample();
+    } catch (err) {
+      console.error('Failed to start analysis:', err);
+      setAnalysisActive(false);
+    }
   }, [selectedSampleId, refetchSample]);
 
   const handleStopAnalysis = useCallback(async () => {
     if (!selectedSampleId) return;
-    await api.stopAnalysis(selectedSampleId);
-    refetchSample();
+    try {
+      await api.stopAnalysis(selectedSampleId);
+      refetchSample();
+    } catch (err) {
+      console.error('Failed to stop analysis:', err);
+    }
   }, [selectedSampleId, refetchSample]);
 
   const handleAnalysisComplete = useCallback(async () => {
+    setAnalysisActive(false);
     refetchSample();
     if (selectedSampleId) {
       try {
@@ -107,15 +128,36 @@ export default function App() {
     }
   }, [refetchSample, selectedSampleId]);
 
-  // When polling detects completion, update state
-  if (
-    analysisStatus &&
-    (analysisStatus.status === 'completed' || analysisStatus.status === 'failed' || analysisStatus.status === 'stopped') &&
-    sample &&
-    sample.status === 'running'
-  ) {
-    handleAnalysisComplete();
-  }
+  // ── Detect analysis completion via polling status transitions ──────
+  // Track the previous polling status so we fire exactly once on transition.
+  const prevAnalysisStatusRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const currentStatus = analysisStatus?.status ?? null;
+    const prevStatus = prevAnalysisStatusRef.current;
+    prevAnalysisStatusRef.current = currentStatus;
+
+    // Detect transition from active (running/pending) to terminal state
+    if (
+      prevStatus &&
+      (prevStatus === 'running' || prevStatus === 'pending') &&
+      currentStatus &&
+      currentStatus !== 'running' &&
+      currentStatus !== 'pending'
+    ) {
+      handleAnalysisComplete();
+    }
+  }, [analysisStatus?.status, handleAnalysisComplete]);
+
+  // ── Periodically refresh sample data while analysis is active ──────
+  // This keeps the sample status badge and TopBar in sync with reality.
+  useEffect(() => {
+    if (!isRunning) return;
+    const timer = setInterval(() => {
+      refetchSample();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [isRunning, refetchSample]);
 
   return (
     <div style={styles.container}>

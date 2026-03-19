@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react';
 import { X, ClipboardPaste } from 'lucide-react';
 
 interface PasteInputProps {
-  onSubmit: (text: string, filename?: string, language?: string) => void;
+  onSubmit: (text: string, filename?: string, language?: string) => void | Promise<void>;
   onClose: () => void;
 }
 
@@ -160,10 +160,20 @@ export default function PasteInput({ onSubmit, onClose }: PasteInputProps) {
   const [filename, setFilename] = useState('');
   const [language, setLanguage] = useState('');
 
-  const handleSubmit = useCallback(() => {
-    if (!text.trim()) return;
-    onSubmit(text, filename || undefined, language || undefined);
-  }, [text, filename, language, onSubmit]);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = useCallback(async () => {
+    if (!text.trim() || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onSubmit(text, filename || undefined, language || undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Submit failed. Please try again.');
+      setSubmitting(false);
+    }
+  }, [text, filename, language, onSubmit, submitting]);
 
   return (
     <div style={s.overlay} onClick={onClose}>
@@ -213,18 +223,23 @@ export default function PasteInput({ onSubmit, onClose }: PasteInputProps) {
               autoFocus
             />
           </div>
+          {error && (
+            <div style={{ marginTop: 8, padding: '8px 12px', background: 'var(--danger-muted)', border: '1px solid var(--danger)', borderRadius: 'var(--radius-sm)', color: 'var(--danger)', fontSize: '12px' }}>
+              {error}
+            </div>
+          )}
         </div>
         <div style={s.footer}>
           <button style={s.cancelBtn} onClick={onClose}>
             Cancel
           </button>
           <button
-            style={{ ...s.submitBtn, opacity: text.trim() ? 1 : 0.4 }}
+            style={{ ...s.submitBtn, opacity: text.trim() && !submitting ? 1 : 0.4 }}
             onClick={handleSubmit}
-            disabled={!text.trim()}
+            disabled={!text.trim() || submitting}
           >
             <ClipboardPaste size={12} />
-            Submit
+            {submitting ? 'Submitting...' : 'Submit'}
           </button>
         </div>
       </div>

@@ -189,7 +189,7 @@ export default function WorkspaceTabs({ sample, analysisState, activeTab: active
           );
         })}
       </div>
-      <div style={s.content}>{renderContent()}</div>
+      <div key={activeTab} className="unweaver-tab-enter" style={s.content}>{renderContent()}</div>
     </div>
   );
 }

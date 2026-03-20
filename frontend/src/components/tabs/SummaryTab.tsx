@@ -211,7 +211,7 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
       </div>
 
       {/* AI Summary */}
-      <div style={s.card}>
+      <div className="unweaver-card unweaver-glow-border" style={s.card}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <div style={s.cardTitle}>AI Summary</div>
           {!generating && (
@@ -237,7 +237,7 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
       </div>
 
       {/* Metrics */}
-      <div style={s.card}>
+      <div className="unweaver-card" style={s.card}>
         <div style={s.cardTitle}>Metrics</div>
         <div style={s.metricGrid}>
           <div style={s.metric}>
@@ -270,7 +270,7 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
       </div>
 
       {/* Confidence Breakdown */}
-      <div style={s.card}>
+      <div className="unweaver-card" style={s.card}>
         <div style={s.cardTitle}>Confidence Breakdown</div>
         {(['naming', 'structure', 'strings'] as const).map((key) => {
           const val = confidence[key] ?? 0;
@@ -300,7 +300,7 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
 
       {/* Detected Techniques */}
       {techniques.length > 0 && (
-        <div style={s.card}>
+        <div className="unweaver-card" style={s.card}>
           <div style={s.cardTitle}>Detected Obfuscation Techniques</div>
           <div style={s.techniqueList}>
             {techniques.map((t, i) => (
@@ -312,7 +312,7 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
 
       {/* LLM Suggestions */}
       {suggestions.length > 0 && (
-        <div style={s.card}>
+        <div className="unweaver-card" style={s.card}>
           <div style={s.cardTitle}>AI Insights ({suggestions.length})</div>
           {suggestions.slice(0, 15).map((sug, i) => (
             <div key={i} style={s.suggestionItem}>{sug}</div>

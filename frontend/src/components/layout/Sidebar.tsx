@@ -35,7 +35,9 @@ const s = {
     alignItems: 'center',
     gap: '10px',
     userSelect: 'none',
-    background: 'var(--sidebar-header-bg)',
+    background: 'rgba(17,21,28,0.6)',
+    backdropFilter: 'blur(16px) saturate(1.3)',
+    WebkitBackdropFilter: 'blur(16px) saturate(1.3)',
   } as React.CSSProperties,
   logoMark: {
     display: 'flex',
@@ -91,15 +93,16 @@ const s = {
     gap: '8px',
     fontSize: '12px',
     color: 'var(--text-secondary)',
-    transition: 'all 0.12s ease',
+    transition: 'all 0.15s ease',
     userSelect: 'none',
     margin: '0 6px',
     borderRadius: 'var(--radius-sm)',
+    position: 'relative',
+    overflow: 'hidden',
   } as React.CSSProperties,
   itemActive: {
     background: 'var(--accent-muted)',
     color: 'var(--text-primary)',
-    borderLeft: 'none',
   } as React.CSSProperties,
   iconBtn: {
     padding: '3px',
@@ -383,7 +386,7 @@ export default function Sidebar({
       )}
 
       {/* Logo header */}
-      <div style={s.header}>
+      <div className="unweaver-glass-header" style={s.header}>
         <div style={s.logoMark}>
           <Sparkles size={14} />
         </div>
@@ -424,6 +427,7 @@ export default function Sidebar({
           {projects.map((p) => (
             <div
               key={p.id}
+              className={`unweaver-nav-item${selectedProjectId === p.id ? ' unweaver-nav-item--active' : ''}`}
               style={{
                 ...s.item,
                 ...(selectedProjectId === p.id ? s.itemActive : {}),
@@ -532,6 +536,7 @@ export default function Sidebar({
             >
               <Upload size={12} />
               Upload
+              <span className="unweaver-kbd">U</span>
             </button>
             <button
               style={s.actionBtn}
@@ -549,12 +554,14 @@ export default function Sidebar({
             >
               <ClipboardPaste size={12} />
               Paste
+              <span className="unweaver-kbd">P</span>
             </button>
           </div>
           <div style={{ ...s.list, flex: 1 }}>
             {samples.map((sm) => (
               <div
                 key={sm.id}
+                className={`unweaver-nav-item${selectedSampleId === sm.id ? ' unweaver-nav-item--active' : ''}`}
                 style={{
                   ...s.item,
                   ...(selectedSampleId === sm.id ? s.itemActive : {}),
@@ -578,6 +585,7 @@ export default function Sidebar({
                 }}
               >
                 <div
+                  className={sm.status === 'running' ? 'unweaver-dot-ripple' : undefined}
                   style={{
                     ...s.statusDot,
                     color: statusColors[sm.status] ?? 'var(--text-muted)',

@@ -238,7 +238,7 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
     <div style={s.root}>
       <div style={s.scrollArea}>
         {/* Language */}
-        <div style={s.card}>
+        <div className="unweaver-card" style={s.card}>
           <div style={s.sectionTitle}>
             <Cpu size={11} style={s.sectionIcon} />
             Language
@@ -250,7 +250,7 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
 
         {/* Confidence */}
         {overallConfidence !== null && (
-          <div style={s.card}>
+          <div className="unweaver-card" style={s.card}>
             <div style={s.sectionTitle}>
               <Eye size={11} style={s.sectionIcon} />
               Confidence
@@ -277,7 +277,7 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
 
         {/* Readability */}
         {readability > 0 && (
-          <div style={s.card}>
+          <div className="unweaver-card" style={s.card}>
             <div style={s.sectionTitle}>
               <Zap size={11} style={s.sectionIcon} />
               Readability
@@ -302,7 +302,7 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
 
         {/* Detected techniques */}
         {techniques.length > 0 && (
-          <div style={s.card}>
+          <div className="unweaver-card" style={s.card}>
             <div style={s.sectionTitle}>Detected Techniques</div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
               {techniques.map((t, i) => (

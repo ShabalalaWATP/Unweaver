@@ -75,6 +75,7 @@ export default function StatusBadge({ status }: StatusBadgeProps) {
       }}
     >
       <span
+        className={cfg.pulse ? 'unweaver-dot-ripple' : undefined}
         style={{
           ...dotStyle,
           background: cfg.color,

@@ -16,13 +16,15 @@ const s = {
   root: {
     height: 52,
     minHeight: 52,
-    background: 'var(--bg-secondary)',
+    background: 'rgba(17,21,28,0.75)',
     borderBottom: '1px solid var(--border)',
     display: 'flex',
     alignItems: 'center',
     padding: '0 16px',
     gap: '12px',
     position: 'relative',
+    backdropFilter: 'blur(12px) saturate(1.2)',
+    WebkitBackdropFilter: 'blur(12px) saturate(1.2)',
   } as React.CSSProperties,
   title: {
     fontSize: '13px',
@@ -75,6 +77,7 @@ const s = {
     borderRadius: 3,
     transition: 'width 0.5s ease',
     position: 'relative',
+    overflow: 'hidden',
   } as React.CSSProperties,
   iterLabel: {
     fontFamily: 'var(--font-mono)',
@@ -135,11 +138,13 @@ const s = {
   emptyBar: {
     height: 52,
     minHeight: 52,
-    background: 'var(--bg-secondary)',
+    background: 'rgba(17,21,28,0.75)',
     borderBottom: '1px solid var(--border)',
     display: 'flex',
     alignItems: 'center',
     padding: '0 16px',
+    backdropFilter: 'blur(12px) saturate(1.2)',
+    WebkitBackdropFilter: 'blur(12px) saturate(1.2)',
   } as React.CSSProperties,
 };
 
@@ -218,7 +223,7 @@ export default function TopBar({
 
   if (!sample) {
     return (
-      <div style={s.emptyBar}>
+      <div className="unweaver-glass-bar" style={s.emptyBar}>
         <span style={{ color: 'var(--text-muted)', fontSize: '12px', fontStyle: 'italic' }}>
           Select a sample to begin
         </span>
@@ -227,7 +232,7 @@ export default function TopBar({
   }
 
   return (
-    <div style={s.root}>
+    <div className="unweaver-glass-bar" style={s.root}>
       <span style={s.title}>{sample.filename}</span>
       {sample.language && <span style={s.lang}>{sample.language}</span>}
       <StatusBadge status={sample.status} />
@@ -246,6 +251,7 @@ export default function TopBar({
             />
             <div style={s.progressBar}>
               <div
+                className="unweaver-progress-striped"
                 style={{
                   ...s.progressFill,
                   width: `${Math.max(analysisStatus.progress_pct, 3)}%`,
@@ -281,6 +287,7 @@ export default function TopBar({
             ...s.btn,
             ...s.analyseBtn,
             ...(analyseHover && canStart ? s.analyseBtnHover : {}),
+            ...(canStart && !analyseHover ? { animation: 'unweaver-glow-pulse 2.5s ease-in-out infinite' } : {}),
             opacity: canStart ? 1 : 0.35,
             cursor: canStart ? 'pointer' : 'default',
           }}
@@ -289,7 +296,8 @@ export default function TopBar({
           onMouseLeave={() => setAnalyseHover(false)}
         >
           <Play size={12} />
-          Analyse &amp; Deobfuscate
+          Analyse
+          <span className="unweaver-kbd" style={{ marginLeft: '4px' }}>Ctrl+Enter</span>
         </button>
       )}
 

@@ -29,6 +29,13 @@ const styles = {
     display: 'flex',
     flex: 1,
     overflow: 'hidden',
+    position: 'relative',
+  } as React.CSSProperties,
+  meshOverlay: {
+    position: 'absolute',
+    inset: 0,
+    pointerEvents: 'none',
+    zIndex: 0,
   } as React.CSSProperties,
   content: {
     flex: 1,
@@ -252,6 +259,24 @@ export default function App() {
     return () => clearInterval(timer);
   }, [isRunning, refetchSample]);
 
+  // ── Global keyboard shortcuts ──────────────────────────────────────
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ctrl+Enter — start analysis
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        if (selectedSampleId && !isRunning) handleStartAnalysis();
+      }
+      // Ctrl+Shift+S — open settings
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'S') {
+        e.preventDefault();
+        setView((v) => (v === 'settings' ? 'workspace' : 'settings'));
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedSampleId, isRunning, handleStartAnalysis]);
+
   // ── Callbacks for sidebar delete actions ────────────────────────────
   const handleDeleteProject = useCallback((id: string) => {
     if (selectedProjectId === id) {
@@ -292,6 +317,7 @@ export default function App() {
               onRefresh={refetchSample}
             />
             <div style={styles.workspace}>
+              <div className="unweaver-mesh-bg" style={styles.meshOverlay} />
               <div style={styles.content}>
                 {sample ? (
                   <WorkspaceTabs

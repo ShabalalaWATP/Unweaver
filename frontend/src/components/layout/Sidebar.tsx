@@ -1,6 +1,8 @@
-import { useState, useCallback } from 'react';
-import { FolderPlus, Upload, ClipboardPaste, Settings, ChevronRight, File, Folder, Sparkles } from 'lucide-react';
+import { useState, useCallback, useRef } from 'react';
+import { FolderPlus, Upload, ClipboardPaste, Settings, ChevronRight, File, Folder, Sparkles, Trash2, Sun, Moon } from 'lucide-react';
 import { useProjects, useSamples } from '@/hooks/useApi';
+import { useToast } from '@/components/common/Toast';
+import { useTheme } from '@/contexts/ThemeContext';
 import FileUpload from '@/components/common/FileUpload';
 import PasteInput from '@/components/common/PasteInput';
 import { formatDate, truncate } from '@/utils/format';
@@ -11,6 +13,8 @@ interface SidebarProps {
   onSelectProject: (id: string) => void;
   onSelectSample: (id: string) => void;
   onOpenSettings: () => void;
+  onDeleteProject?: (id: string) => void;
+  onDeleteSample?: (id: string) => void;
 }
 
 const s = {
@@ -25,12 +29,13 @@ const s = {
     overflow: 'hidden',
   } as React.CSSProperties,
   header: {
-    padding: '14px 16px',
+    padding: '16px 16px',
     borderBottom: '1px solid var(--border)',
     display: 'flex',
     alignItems: 'center',
     gap: '10px',
     userSelect: 'none',
+    background: 'var(--sidebar-header-bg)',
   } as React.CSSProperties,
   logoMark: {
     display: 'flex',
@@ -104,6 +109,18 @@ const s = {
     display: 'flex',
     alignItems: 'center',
     transition: 'all var(--transition-fast)',
+  } as React.CSSProperties,
+  deleteBtn: {
+    padding: '3px',
+    borderRadius: 'var(--radius-sm)',
+    color: 'var(--text-muted)',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    transition: 'all 0.15s',
+    opacity: 0,
+    marginLeft: 'auto',
+    flexShrink: 0,
   } as React.CSSProperties,
   actions: {
     padding: '6px 10px',
@@ -179,8 +196,23 @@ const s = {
   sampleMeta: {
     fontSize: '10px',
     color: 'var(--text-muted)',
-    marginLeft: 'auto',
     fontFamily: 'var(--font-mono)',
+  } as React.CSSProperties,
+  dropOverlay: {
+    position: 'absolute',
+    inset: 0,
+    background: 'rgba(88,166,255,0.08)',
+    border: '2px dashed var(--accent)',
+    borderRadius: 'var(--radius-md)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '12px',
+    fontWeight: 600,
+    color: 'var(--accent)',
+    zIndex: 10,
+    pointerEvents: 'none',
+    backdropFilter: 'blur(2px)',
   } as React.CSSProperties,
 };
 
@@ -198,29 +230,46 @@ export default function Sidebar({
   onSelectProject,
   onSelectSample,
   onOpenSettings,
+  onDeleteProject,
+  onDeleteSample,
 }: SidebarProps) {
-  const { projects, create } = useProjects();
-  const { samples, upload, paste } = useSamples(selectedProjectId);
+  const { projects, create, remove: removeProject } = useProjects();
+  const { samples, upload, paste, remove: removeSample } = useSamples(selectedProjectId);
+  const { toggleTheme, isDark } = useTheme();
   const [showNewProject, setShowNewProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
   const [showUpload, setShowUpload] = useState(false);
   const [showPaste, setShowPaste] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<{ type: 'project' | 'sample'; id: string } | null>(null);
+  const dragCounter = useRef(0);
+  const toast = useToast();
 
   const handleCreate = useCallback(async () => {
     if (!newProjectName.trim()) return;
-    const p = await create(newProjectName.trim());
-    setNewProjectName('');
-    setShowNewProject(false);
-    onSelectProject(p.id);
-  }, [newProjectName, create, onSelectProject]);
+    try {
+      const p = await create(newProjectName.trim());
+      setNewProjectName('');
+      setShowNewProject(false);
+      onSelectProject(p.id);
+      toast.success(`Project "${p.name}" created`);
+    } catch (err) {
+      toast.error('Failed to create project');
+    }
+  }, [newProjectName, create, onSelectProject, toast]);
 
   const handleUpload = useCallback(
     async (file: File) => {
-      const sample = await upload(file);
-      setShowUpload(false);
-      onSelectSample(sample.id);
+      try {
+        const sample = await upload(file);
+        setShowUpload(false);
+        onSelectSample(sample.id);
+        toast.success(`Uploaded "${file.name}"`);
+      } catch (err) {
+        toast.error('Failed to upload file');
+      }
     },
-    [upload, onSelectSample],
+    [upload, onSelectSample, toast],
   );
 
   const handlePaste = useCallback(
@@ -229,15 +278,110 @@ export default function Sidebar({
         const sample = await paste(text, filename, language);
         setShowPaste(false);
         onSelectSample(sample.id);
+        toast.success('Code pasted successfully');
       } catch (err) {
-        console.error('Paste failed:', err);
+        toast.error('Failed to paste code');
       }
     },
-    [paste, onSelectSample],
+    [paste, onSelectSample, toast],
+  );
+
+  const handleDeleteProject = useCallback(
+    async (id: string) => {
+      try {
+        await removeProject(id);
+        onDeleteProject?.(id);
+        setConfirmDelete(null);
+        toast.success('Project deleted');
+      } catch (err) {
+        toast.error('Failed to delete project');
+      }
+    },
+    [removeProject, onDeleteProject, toast],
+  );
+
+  const handleDeleteSample = useCallback(
+    async (id: string) => {
+      try {
+        await removeSample(id);
+        onDeleteSample?.(id);
+        setConfirmDelete(null);
+        toast.success('Sample deleted');
+      } catch (err) {
+        toast.error('Failed to delete sample');
+      }
+    },
+    [removeSample, onDeleteSample, toast],
+  );
+
+  // ── Drag-and-drop handlers ──────────────────────────────────────
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current++;
+    if (e.dataTransfer.types.includes('Files')) {
+      setDragOver(true);
+    }
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current--;
+    if (dragCounter.current === 0) {
+      setDragOver(false);
+    }
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragOver(false);
+      dragCounter.current = 0;
+
+      if (!selectedProjectId) {
+        toast.warning('Select a project first to upload files');
+        return;
+      }
+
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
+
+      for (const file of files) {
+        try {
+          const sample = await upload(file);
+          onSelectSample(sample.id);
+          toast.success(`Uploaded "${file.name}"`);
+        } catch (err) {
+          toast.error(`Failed to upload "${file.name}"`);
+        }
+      }
+    },
+    [selectedProjectId, upload, onSelectSample, toast],
   );
 
   return (
-    <div style={s.root}>
+    <div
+      style={s.root}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+    >
+      {/* Drag overlay */}
+      {dragOver && (
+        <div style={s.dropOverlay as React.CSSProperties}>
+          <Upload size={16} style={{ marginRight: '6px' }} />
+          Drop files to upload
+        </div>
+      )}
+
       {/* Logo header */}
       <div style={s.header}>
         <div style={s.logoMark}>
@@ -290,12 +434,17 @@ export default function Sidebar({
                   e.currentTarget.style.background = 'var(--bg-hover)';
                   e.currentTarget.style.color = 'var(--text-primary)';
                 }
+                // Show delete button
+                const delBtn = e.currentTarget.querySelector('[data-delete-btn]') as HTMLElement;
+                if (delBtn) delBtn.style.opacity = '1';
               }}
               onMouseLeave={(e) => {
                 if (selectedProjectId !== p.id) {
                   e.currentTarget.style.background = 'transparent';
                   e.currentTarget.style.color = 'var(--text-secondary)';
                 }
+                const delBtn = e.currentTarget.querySelector('[data-delete-btn]') as HTMLElement;
+                if (delBtn) delBtn.style.opacity = '0';
               }}
             >
               <Folder
@@ -306,16 +455,50 @@ export default function Sidebar({
                   flexShrink: 0,
                 }}
               />
-              {truncate(p.name, 26)}
-              <ChevronRight
-                size={10}
-                style={{
-                  marginLeft: 'auto',
-                  transform: selectedProjectId === p.id ? 'rotate(90deg)' : 'none',
-                  transition: 'transform 0.2s ease',
-                  opacity: 0.3,
-                }}
-              />
+              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {truncate(p.name, 22)}
+              </span>
+              {confirmDelete?.type === 'project' && confirmDelete.id === p.id ? (
+                <span style={{ display: 'flex', gap: '4px', marginLeft: 'auto', flexShrink: 0 }}>
+                  <button
+                    style={{ ...s.iconBtn, color: 'var(--danger)', fontSize: '10px', fontWeight: 600, padding: '1px 4px' }}
+                    onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
+                  >
+                    Yes
+                  </button>
+                  <button
+                    style={{ ...s.iconBtn, color: 'var(--text-muted)', fontSize: '10px', fontWeight: 600, padding: '1px 4px' }}
+                    onClick={(e) => { e.stopPropagation(); setConfirmDelete(null); }}
+                  >
+                    No
+                  </button>
+                </span>
+              ) : (
+                <>
+                  <button
+                    data-delete-btn
+                    style={s.deleteBtn}
+                    title="Delete project"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setConfirmDelete({ type: 'project', id: p.id });
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--danger)'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
+                  >
+                    <Trash2 size={11} />
+                  </button>
+                  <ChevronRight
+                    size={10}
+                    style={{
+                      transform: selectedProjectId === p.id ? 'rotate(90deg)' : 'none',
+                      transition: 'transform 0.2s ease',
+                      opacity: 0.3,
+                      flexShrink: 0,
+                    }}
+                  />
+                </>
+              )}
             </div>
           ))}
           {projects.length === 0 && (
@@ -328,7 +511,7 @@ export default function Sidebar({
 
       {/* Samples */}
       {selectedProjectId && (
-        <div style={{ ...s.section, flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div style={{ ...s.section, flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', position: 'relative' }}>
           <div style={s.sectionHeader}>
             <span>Samples</span>
           </div>
@@ -382,12 +565,16 @@ export default function Sidebar({
                     e.currentTarget.style.background = 'var(--bg-hover)';
                     e.currentTarget.style.color = 'var(--text-primary)';
                   }
+                  const delBtn = e.currentTarget.querySelector('[data-delete-btn]') as HTMLElement;
+                  if (delBtn) delBtn.style.opacity = '1';
                 }}
                 onMouseLeave={(e) => {
                   if (selectedSampleId !== sm.id) {
                     e.currentTarget.style.background = 'transparent';
                     e.currentTarget.style.color = 'var(--text-secondary)';
                   }
+                  const delBtn = e.currentTarget.querySelector('[data-delete-btn]') as HTMLElement;
+                  if (delBtn) delBtn.style.opacity = '0';
                 }}
               >
                 <div
@@ -402,12 +589,44 @@ export default function Sidebar({
                 <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {sm.filename}
                 </span>
-                <span style={s.sampleMeta}>{formatDate(sm.created_at).split(',')[0]}</span>
+                {confirmDelete?.type === 'sample' && confirmDelete.id === sm.id ? (
+                  <span style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+                    <button
+                      style={{ ...s.iconBtn, color: 'var(--danger)', fontSize: '10px', fontWeight: 600, padding: '1px 4px' }}
+                      onClick={(e) => { e.stopPropagation(); handleDeleteSample(sm.id); }}
+                    >
+                      Yes
+                    </button>
+                    <button
+                      style={{ ...s.iconBtn, color: 'var(--text-muted)', fontSize: '10px', fontWeight: 600, padding: '1px 4px' }}
+                      onClick={(e) => { e.stopPropagation(); setConfirmDelete(null); }}
+                    >
+                      No
+                    </button>
+                  </span>
+                ) : (
+                  <>
+                    <button
+                      data-delete-btn
+                      style={s.deleteBtn}
+                      title="Delete sample"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setConfirmDelete({ type: 'sample', id: sm.id });
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--danger)'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                    <span style={s.sampleMeta}>{formatDate(sm.created_at).split(',')[0]}</span>
+                  </>
+                )}
               </div>
             ))}
             {samples.length === 0 && (
               <div style={{ ...s.item, color: 'var(--text-muted)', cursor: 'default', opacity: 0.6 }}>
-                No samples
+                {dragOver ? 'Drop files here' : 'No samples'}
               </div>
             )}
           </div>
@@ -428,23 +647,51 @@ export default function Sidebar({
         />
       )}
 
-      {/* Settings */}
+      {/* Footer: Settings + Theme toggle */}
       <div style={s.footer}>
-        <button
-          style={s.settingsBtn}
-          onClick={onOpenSettings}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.background = 'var(--bg-tertiary)';
-            e.currentTarget.style.color = 'var(--text-primary)';
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.background = 'transparent';
-            e.currentTarget.style.color = 'var(--text-muted)';
-          }}
-        >
-          <Settings size={14} style={{ opacity: 0.7 }} />
-          Provider Settings
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+          <button
+            style={{ ...s.settingsBtn, flex: 1 }}
+            onClick={onOpenSettings}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'var(--bg-tertiary)';
+              e.currentTarget.style.color = 'var(--text-primary)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'transparent';
+              e.currentTarget.style.color = 'var(--text-muted)';
+            }}
+          >
+            <Settings size={14} style={{ opacity: 0.7 }} />
+            Settings
+          </button>
+          <button
+            onClick={toggleTheme}
+            title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+            style={{
+              padding: '8px',
+              borderRadius: 'var(--radius-md)',
+              color: 'var(--text-muted)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: 'transparent',
+              border: 'none',
+              flexShrink: 0,
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'var(--bg-tertiary)';
+              e.currentTarget.style.color = isDark ? 'var(--warning)' : 'var(--accent)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'transparent';
+              e.currentTarget.style.color = 'var(--text-muted)';
+            }}
+          >
+            {isDark ? <Sun size={15} /> : <Moon size={15} />}
+          </button>
+        </div>
       </div>
     </div>
   );

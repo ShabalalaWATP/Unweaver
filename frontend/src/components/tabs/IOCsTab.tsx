@@ -1,7 +1,8 @@
 import { useState, useMemo, useCallback } from 'react';
-import { Copy, Search, Shield } from 'lucide-react';
+import { Copy, Search, Shield, ClipboardCopy, Regex } from 'lucide-react';
 import type { IOC, IOCType } from '@/types';
 import { useAsync } from '@/hooks/useApi';
+import { useToast } from '@/components/common/Toast';
 import * as api from '@/services/api';
 import { defangIOC, truncate } from '@/utils/format';
 
@@ -10,15 +11,15 @@ interface IOCsTabProps {
 }
 
 const TYPE_COLORS: Record<IOCType, string> = {
-  ip: '#58a6ff',
-  domain: '#79c0ff',
-  url: '#d2a8ff',
-  hash: '#a5d6ff',
-  email: '#7ee787',
-  filepath: '#d29922',
-  registry: '#f0883e',
-  mutex: '#db6d28',
-  other: '#8b949e',
+  ip: 'var(--ioc-ip)',
+  domain: 'var(--ioc-domain)',
+  url: 'var(--ioc-url)',
+  hash: 'var(--ioc-hash)',
+  email: 'var(--ioc-email)',
+  filepath: 'var(--ioc-filepath)',
+  registry: 'var(--ioc-registry)',
+  mutex: 'var(--ioc-mutex)',
+  other: 'var(--ioc-other)',
 };
 
 const s = {
@@ -57,12 +58,38 @@ const s = {
     flex: 1,
     padding: 0,
   } as React.CSSProperties,
+  toggleBtn: {
+    padding: '3px 8px',
+    fontSize: '10px',
+    fontWeight: 500,
+    borderRadius: 'var(--radius-sm)',
+    border: '1px solid var(--border)',
+    cursor: 'pointer',
+    transition: 'all 0.15s',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+  } as React.CSSProperties,
   defangToggle: {
     padding: '3px 8px',
     fontSize: '10px',
     fontWeight: 500,
     borderRadius: 'var(--radius-sm)',
     border: '1px solid var(--border)',
+    cursor: 'pointer',
+    transition: 'all 0.15s',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+  } as React.CSSProperties,
+  copyAllBtn: {
+    padding: '3px 8px',
+    fontSize: '10px',
+    fontWeight: 500,
+    borderRadius: 'var(--radius-sm)',
+    border: '1px solid var(--border)',
+    background: 'var(--bg-tertiary)',
+    color: 'var(--text-secondary)',
     cursor: 'pointer',
     transition: 'all 0.15s',
     display: 'flex',
@@ -124,6 +151,11 @@ const s = {
     color: 'var(--text-muted)',
     fontSize: '13px',
   } as React.CSSProperties,
+  regexError: {
+    fontSize: '10px',
+    color: 'var(--danger)',
+    padding: '0 4px',
+  } as React.CSSProperties,
 };
 
 function getConfidenceColor(val: number): string {
@@ -138,27 +170,57 @@ export default function IOCsTab({ sampleId }: IOCsTabProps) {
     [sampleId],
   );
   const [filter, setFilter] = useState('');
+  const [useRegex, setUseRegex] = useState(false);
   const [defanged, setDefanged] = useState(true);
+  const toast = useToast();
 
-  const filtered = useMemo(() => {
-    if (!iocs) return [];
-    if (!filter) return iocs;
-    const lower = filter.toLowerCase();
-    return iocs.filter(
-      (ioc) =>
-        ioc.value.toLowerCase().includes(lower) ||
-        ioc.type.toLowerCase().includes(lower) ||
-        (ioc.context && ioc.context.toLowerCase().includes(lower)),
-    );
-  }, [iocs, filter]);
+  const { filtered, regexError } = useMemo(() => {
+    if (!iocs) return { filtered: [], regexError: null };
+    let result = iocs;
+    let regexErr: string | null = null;
+
+    if (filter) {
+      if (useRegex) {
+        try {
+          const re = new RegExp(filter, 'i');
+          result = result.filter(
+            (ioc) =>
+              re.test(ioc.value) ||
+              re.test(ioc.type) ||
+              (ioc.context && re.test(ioc.context)),
+          );
+        } catch (e) {
+          regexErr = e instanceof Error ? e.message : 'Invalid regex';
+        }
+      } else {
+        const lower = filter.toLowerCase();
+        result = result.filter(
+          (ioc) =>
+            ioc.value.toLowerCase().includes(lower) ||
+            ioc.type.toLowerCase().includes(lower) ||
+            (ioc.context && ioc.context.toLowerCase().includes(lower)),
+        );
+      }
+    }
+    return { filtered: result, regexError: regexErr };
+  }, [iocs, filter, useRegex]);
 
   const copyToClipboard = useCallback(
     (ioc: IOC) => {
       const text = defanged ? defangIOC(ioc.value, ioc.type) : ioc.value;
       navigator.clipboard.writeText(text);
+      toast.success('IOC copied to clipboard');
     },
-    [defanged],
+    [defanged, toast],
   );
+
+  const copyAll = useCallback(() => {
+    const text = filtered
+      .map((ioc) => (defanged ? defangIOC(ioc.value, ioc.type) : ioc.value))
+      .join('\n');
+    navigator.clipboard.writeText(text);
+    toast.success(`Copied ${filtered.length} IOCs`);
+  }, [filtered, defanged, toast]);
 
   if (loading) {
     return <div style={s.emptyState}>Loading IOCs...</div>;
@@ -171,15 +233,31 @@ export default function IOCsTab({ sampleId }: IOCsTabProps) {
   return (
     <div style={s.root}>
       <div style={s.toolbar}>
-        <div style={s.searchWrap}>
+        <div style={{
+          ...s.searchWrap,
+          ...(regexError ? { borderColor: 'var(--danger)' } : {}),
+        }}>
           <Search size={12} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
           <input
             style={s.searchInput}
-            placeholder="Filter IOCs..."
+            placeholder={useRegex ? 'Regex filter...' : 'Filter IOCs...'}
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
           />
         </div>
+        <button
+          style={{
+            ...s.toggleBtn,
+            background: useRegex ? 'var(--accent-muted)' : 'var(--bg-tertiary)',
+            color: useRegex ? 'var(--accent)' : 'var(--text-secondary)',
+            borderColor: useRegex ? 'var(--accent)' : 'var(--border)',
+          }}
+          onClick={() => setUseRegex(!useRegex)}
+          title="Toggle regex search"
+        >
+          <Regex size={10} />
+          Regex
+        </button>
         <button
           style={{
             ...s.defangToggle,
@@ -192,9 +270,26 @@ export default function IOCsTab({ sampleId }: IOCsTabProps) {
           <Shield size={10} />
           {defanged ? 'Defanged' : 'Raw'}
         </button>
+        <button
+          style={s.copyAllBtn}
+          onClick={copyAll}
+          title="Copy all filtered IOCs"
+          onMouseEnter={(e) => {
+            e.currentTarget.style.borderColor = 'var(--accent)';
+            e.currentTarget.style.color = 'var(--accent)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.borderColor = 'var(--border)';
+            e.currentTarget.style.color = 'var(--text-secondary)';
+          }}
+        >
+          <ClipboardCopy size={10} />
+          Copy All
+        </button>
         <span style={s.count}>
           {filtered.length} / {iocs.length}
         </span>
+        {regexError && <span style={s.regexError}>{regexError}</span>}
       </div>
       <div style={s.tableWrap}>
         <table>

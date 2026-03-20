@@ -8,6 +8,8 @@ inside a project.  They can be uploaded as files or pasted directly.
 from __future__ import annotations
 
 import difflib
+import json
+import logging
 import os
 import re
 import uuid
@@ -25,6 +27,7 @@ from app.models.db_models import (
     IOCRecord,
     IterationState,
     Project,
+    ProviderConfig,
     Sample,
     StringRecord,
     TransformHistory,
@@ -34,6 +37,9 @@ from app.models.schemas import (
     SampleDetail,
     SampleResponse,
 )
+from app.services.llm.client import LLMClient, _MAX_TOKENS_MAP
+
+logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel, Field
 
@@ -526,3 +532,152 @@ async def delete_sample(
     await db.delete(sample)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ── POST /api/samples/{id}/summary ─────────────────────────────────
+@router.post("/samples/{sample_id}/summary")
+async def generate_summary(
+    sample_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """Generate an AI-written analysis summary for a completed sample."""
+    sample = await db.get(Sample, sample_id)
+    if sample is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Sample {sample_id} not found",
+        )
+
+    # Gather analysis data
+    transforms = (await db.execute(
+        select(TransformHistory)
+        .where(TransformHistory.sample_id == sample_id)
+        .order_by(TransformHistory.iteration)
+    )).scalars().all()
+
+    findings = (await db.execute(
+        select(FindingRecord)
+        .where(FindingRecord.sample_id == sample_id)
+    )).scalars().all()
+
+    iocs = (await db.execute(
+        select(IOCRecord)
+        .where(IOCRecord.sample_id == sample_id)
+    )).scalars().all()
+
+    strings = (await db.execute(
+        select(StringRecord)
+        .where(StringRecord.sample_id == sample_id)
+    )).scalars().all()
+
+    # Get the latest iteration state for detected techniques
+    iter_state_row = (await db.execute(
+        select(IterationState)
+        .where(IterationState.sample_id == sample_id)
+        .order_by(IterationState.iteration_number.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    detected_techniques: List[str] = []
+    if iter_state_row and iter_state_row.state_json:
+        try:
+            state_data = iter_state_row.state_json
+            if isinstance(state_data, str):
+                state_data = json.loads(state_data)
+            detected_techniques = state_data.get("detected_techniques", [])
+        except Exception:
+            pass
+
+    # Build analysis context for the LLM
+    success_transforms = [t for t in transforms if t.success and not t.retry_revert]
+    failed_transforms = [t for t in transforms if not t.success]
+    reverted_transforms = [t for t in transforms if t.retry_revert]
+
+    original_snippet = (sample.original_text or "")[:2000]
+    recovered_snippet = (sample.recovered_text or "")[:2000]
+
+    context = (
+        f"Filename: {sample.filename}\n"
+        f"Language: {sample.language or 'unknown'}\n"
+        f"Original code length: {len(sample.original_text or '')} chars\n"
+        f"Recovered code length: {len(sample.recovered_text or '')} chars\n\n"
+        f"Detected obfuscation techniques: {detected_techniques}\n\n"
+        f"Transform results: {len(success_transforms)} successful, "
+        f"{len(reverted_transforms)} reverted, {len(failed_transforms)} failed\n"
+        f"Successful transforms: {[t.action for t in success_transforms]}\n\n"
+        f"Findings: {len(findings)}\n"
+        f"IOCs extracted: {len(iocs)}\n"
+        f"Strings extracted: {len(strings)}\n\n"
+        f"--- Original code (first 2000 chars) ---\n{original_snippet}\n\n"
+        f"--- Recovered code (first 2000 chars) ---\n{recovered_snippet}\n"
+    )
+
+    # Load LLM client
+    result = await db.execute(
+        select(ProviderConfig)
+        .where(ProviderConfig.is_active == True)  # noqa: E712
+        .order_by(ProviderConfig.created_at.desc())
+        .limit(1)
+    )
+    provider = result.scalar_one_or_none()
+    if provider is None:
+        result = await db.execute(
+            select(ProviderConfig)
+            .order_by(ProviderConfig.created_at.desc())
+            .limit(1)
+        )
+        provider = result.scalar_one_or_none()
+
+    if provider is None:
+        # No LLM available — generate a basic summary from data
+        summary_parts = [
+            f"Analysis of {sample.filename} ({sample.language or 'unknown'} code).",
+            f"\nDeobfuscation applied {len(success_transforms)} successful transform(s) "
+            f"across {len(transforms)} total attempt(s).",
+        ]
+        if detected_techniques:
+            summary_parts.append(
+                f"\nDetected techniques: {', '.join(detected_techniques)}."
+            )
+        if findings:
+            summary_parts.append(f"\n{len(findings)} security finding(s) identified.")
+        if iocs:
+            summary_parts.append(f"\n{len(iocs)} indicator(s) of compromise extracted.")
+        return {"summary": " ".join(summary_parts)}
+
+    max_tokens = _MAX_TOKENS_MAP.get(provider.max_tokens_preset, 4096)
+    client = LLMClient(
+        base_url=provider.base_url,
+        api_key=provider.api_key_encrypted,
+        model=provider.model_name,
+        max_tokens=max_tokens,
+        cert_bundle=provider.cert_bundle_path,
+        use_system_trust=provider.use_system_trust,
+    )
+
+    prompt = (
+        "You are a malware analyst writing a deobfuscation report summary. "
+        "Based on the following analysis data, write a clear, professional "
+        "summary (3-5 paragraphs) covering:\n"
+        "1. What the code is and what obfuscation was used\n"
+        "2. What the deobfuscation engine did (transforms applied)\n"
+        "3. Key findings and any IOCs discovered\n"
+        "4. Overall assessment of the recovered code\n\n"
+        "Be specific and reference actual data from the analysis. "
+        "Write in a technical but readable style.\n\n"
+        f"{context}"
+    )
+
+    try:
+        reply = await client.chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=2048,
+        )
+        return {"summary": reply.strip()}
+    except Exception as exc:
+        logger.error("Failed to generate AI summary: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"LLM request failed: {type(exc).__name__}: {exc}",
+        )

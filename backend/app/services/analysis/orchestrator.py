@@ -18,12 +18,13 @@ confidence scores, and improvement metrics to make decisions.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
 from app.models.schemas import (
     AnalysisState,
@@ -1380,6 +1381,37 @@ class Verifier:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def _extract_planning_json(text: str) -> Optional[Dict[str, Any]]:
+    """Extract a JSON object from an LLM planning response.
+
+    Handles markdown code fences, leading prose, etc.  Mirrors the
+    ``LLMTransform.extract_json`` approach from ``llm_base.py``.
+    """
+    # Direct parse.
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Code-fence extraction.
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # First { ... } block.
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        try:
+            return json.loads(brace_match.group(0))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return None
+
+
 @dataclass
 class PlannedAction:
     """A single action recommended by the planner."""
@@ -1409,8 +1441,9 @@ class Planner:
       (optionally) LLM-assisted semantic renaming.
     """
 
-    def __init__(self, available_actions: Optional[Set[str]] = None) -> None:
+    def __init__(self, available_actions: Optional[Set[str]] = None, llm_client: Optional[Any] = None) -> None:
         self._available_actions: Set[str] = available_actions or set()
+        self._llm_client = llm_client
 
     # Ordered plan templates by analysis phase.
     _PHASE_INITIAL: List[str] = [
@@ -1467,6 +1500,149 @@ class Planner:
         # Re-scan if code-modifying transforms have succeeded more times
         # than we've fingerprinted (roughly: new modifications since last scan).
         return modifying_successes >= fingerprint_count
+
+    async def plan_with_llm(
+        self,
+        state_manager: StateManager,
+        action_queue: ActionQueue,
+    ) -> List[PlannedAction]:
+        """Produce LLM-assisted recommendations, merged with deterministic ones.
+
+        When ``self._llm_client`` is available, sends a planning prompt to
+        the LLM describing the current obfuscation state and asks for
+        recommended next actions.  The LLM suggestions are merged with the
+        deterministic plan: overlapping actions use the LLM-suggested
+        priority, and novel LLM suggestions are appended.
+
+        Falls back to purely deterministic planning on any error.
+        """
+        # Always start with deterministic recommendations as a baseline.
+        deterministic = self.plan(state_manager, action_queue)
+
+        if self._llm_client is None:
+            return deterministic
+
+        try:
+            state = state_manager.state
+            iteration = state_manager.current_iteration
+            code = state_manager.current_code
+            techniques = list(state.detected_techniques)
+            actions_list = sorted(self._available_actions)
+
+            # Build success / failure summaries from the action queue ledger.
+            successes: List[str] = []
+            failures: List[str] = []
+            for action_name in sorted(action_queue._ledger.keys()):
+                s_count = action_queue.success_count(action_name)
+                f_count = action_queue.failure_count(action_name)
+                if s_count:
+                    successes.append(f"{action_name} (x{s_count})")
+                if f_count:
+                    failures.append(f"{action_name} (x{f_count})")
+
+            confidence = state_manager.overall_confidence
+            readability_hist = state_manager.readability_history
+            readability = readability_hist[-1] if readability_hist else 0.0
+
+            code_snippet = code[:3000]
+
+            prompt = (
+                "You are an expert code deobfuscation planner. Analyze the "
+                "following obfuscated code and recommend the next "
+                "deobfuscation actions to take.\n\n"
+                f"Current code (first 3000 chars):\n{code_snippet}\n\n"
+                f"Detected obfuscation techniques: {techniques}\n"
+                f"Available actions: {actions_list}\n"
+                f"Already tried (successes): {successes}\n"
+                f"Already tried (failures): {failures}\n"
+                f"Current iteration: {iteration}\n"
+                f"Current confidence: {confidence}\n"
+                f"Current readability: {readability}\n\n"
+                "Respond with a JSON object:\n"
+                "{\n"
+                '  "analysis": "Brief analysis of what kind of obfuscation this is",\n'
+                '  "recommended_actions": [\n'
+                '    {"action": "action_name", "confidence": 0.9, '
+                '"reason": "why this action", "priority": 1.0},\n'
+                "    ...\n"
+                "  ]\n"
+                "}\n\n"
+                "Only recommend actions from the available actions list. "
+                "Prioritize actions that haven't been tried yet."
+            )
+
+            messages = [{"role": "user", "content": prompt}]
+            reply = await self._llm_client.chat(
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1024,
+            )
+
+            # Parse the LLM response using the same pattern as LLMTransform.
+            parsed = _extract_planning_json(reply)
+            if parsed is None:
+                logger.warning("LLM planner returned unparseable response; "
+                               "falling back to deterministic plan")
+                return deterministic
+
+            llm_actions: List[PlannedAction] = []
+            for item in parsed.get("recommended_actions", []):
+                action = item.get("action", "")
+                if action not in self._available_actions:
+                    continue
+                llm_actions.append(PlannedAction(
+                    action_name=action,
+                    confidence=float(item.get("confidence", 0.7)),
+                    reason=str(item.get("reason", "LLM recommendation")),
+                    priority=float(item.get("priority", 10.0)),
+                ))
+
+            if not llm_actions:
+                logger.debug("LLM planner returned no valid actions; "
+                             "using deterministic plan")
+                return deterministic
+
+            # Merge: LLM suggestions override priorities for overlapping
+            # actions; novel LLM suggestions are appended.
+            llm_by_name = {a.action_name: a for a in llm_actions}
+            merged: List[PlannedAction] = []
+            seen: Set[str] = set()
+
+            for det in deterministic:
+                if det.action_name in llm_by_name:
+                    # Use LLM priority/confidence when there's overlap.
+                    llm_rec = llm_by_name[det.action_name]
+                    merged.append(PlannedAction(
+                        action_name=det.action_name,
+                        confidence=llm_rec.confidence,
+                        reason=f"{det.reason} [LLM: {llm_rec.reason}]",
+                        priority=llm_rec.priority,
+                    ))
+                else:
+                    merged.append(det)
+                seen.add(det.action_name)
+
+            # Append novel LLM suggestions not in deterministic set.
+            for llm_rec in llm_actions:
+                if llm_rec.action_name not in seen:
+                    merged.append(llm_rec)
+                    seen.add(llm_rec.action_name)
+
+            merged.sort(key=lambda r: r.priority)
+
+            analysis = parsed.get("analysis", "")
+            if analysis:
+                logger.info("LLM planner analysis: %s", analysis[:200])
+            logger.debug(
+                "LLM-assisted plan: %d actions (deterministic=%d, llm=%d, merged=%d)",
+                len(merged), len(deterministic), len(llm_actions), len(merged),
+            )
+            return merged
+
+        except Exception:
+            logger.exception("LLM-assisted planning failed; falling back to "
+                             "deterministic plan")
+            return deterministic
 
     def plan(
         self,
@@ -2537,6 +2713,7 @@ class Orchestrator:
         min_confidence: float = 0.3,
         max_iterations: int = 20,
         stall_limit: int = 3,
+        progress_callback: Optional[Callable[[int, int, str, float], None]] = None,
     ) -> AnalysisResult:
         """Execute the full multi-pass deobfuscation pipeline.
 
@@ -2567,7 +2744,10 @@ class Orchestrator:
         self._action_queue = ActionQueue(
             auto_approve_threshold=auto_approve_threshold,
         )
-        self._planner = Planner(available_actions=set(self.action_space.keys()))
+        self._planner = Planner(
+            available_actions=set(self.action_space.keys()),
+            llm_client=self.llm_client,
+        )
         self._selector = ActionSelector()
         self._preflight = PreflightValidator()
         self._executor = Executor(self.action_space)
@@ -2606,12 +2786,24 @@ class Orchestrator:
 
                 logger.debug("=== Iteration %d ===", iteration)
 
+                # Report progress via callback if provided.
+                if progress_callback is not None:
+                    pct = (iteration / max_iterations) * 100.0
+                    progress_callback(iteration, max_iterations,
+                                      f"iteration {iteration}", pct)
+
                 # ── Stage 1: Plan ────────────────────────────────────
                 try:
-                    recommendations = self._planner.plan(
-                        self._state_manager,
-                        self._action_queue,
-                    )
+                    if self._planner._llm_client is not None:
+                        recommendations = await self._planner.plan_with_llm(
+                            self._state_manager,
+                            self._action_queue,
+                        )
+                    else:
+                        recommendations = self._planner.plan(
+                            self._state_manager,
+                            self._action_queue,
+                        )
                 except Exception:
                     logger.exception("Planner failed at iteration %d", iteration)
                     recommendations = []
@@ -2797,6 +2989,49 @@ class Orchestrator:
                         "continuing without snapshot",
                         iteration,
                     )
+
+                # ── Feedback-driven replanning ──────────────────────
+                # After a successful transform with meaningful
+                # improvement, re-plan to discover newly exposed
+                # patterns without waiting for the next full cycle.
+                if result.success and improvement > 0.05:
+                    try:
+                        logger.info(
+                            "Feedback: significant improvement (%.3f), "
+                            "re-planning...",
+                            improvement,
+                        )
+                        if self._planner._llm_client is not None:
+                            feedback_recs = await self._planner.plan_with_llm(
+                                self._state_manager,
+                                self._action_queue,
+                            )
+                        else:
+                            feedback_recs = self._planner.plan(
+                                self._state_manager,
+                                self._action_queue,
+                            )
+                        enqueued_count = 0
+                        for rec in feedback_recs:
+                            added = self._action_queue.enqueue(
+                                rec.action_name,
+                                confidence=rec.confidence,
+                                reason=f"[feedback] {rec.reason}",
+                                priority=rec.priority,
+                            )
+                            if added:
+                                enqueued_count += 1
+                        if enqueued_count:
+                            logger.info(
+                                "Feedback replanning enqueued %d new action(s)",
+                                enqueued_count,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Feedback replanning failed at iteration %d; "
+                            "continuing normally",
+                            iteration,
+                        )
 
                 # ── Stage 8: Stop Decision ───────────────────────────
                 try:

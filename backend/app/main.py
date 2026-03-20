@@ -20,6 +20,7 @@ from app.api.export import router as export_router
 from app.api.projects import router as projects_router
 from app.api.providers import router as providers_router
 from app.api.samples import router as samples_router
+from app.api.websocket import router as websocket_router
 from app.core.config import settings
 from app.core.database import init_db
 
@@ -78,6 +79,7 @@ app.include_router(samples_router, prefix="/api")
 app.include_router(analysis_router, prefix="/api")
 app.include_router(providers_router, prefix="/api")
 app.include_router(export_router, prefix="/api")
+app.include_router(websocket_router, prefix="/api")
 
 
 # ── Health check ─────────────────────────────────────────────────────

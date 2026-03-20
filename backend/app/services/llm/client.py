@@ -41,12 +41,37 @@ class LLMClient:
         self.cert_bundle = cert_bundle
         self.use_system_trust = use_system_trust
 
+        # Decide whether to use 'max_completion_tokens' (modern) or 'max_tokens'
+        # (legacy).  Modern models (OpenAI o-series, gpt-4o, etc.) require the
+        # new parameter name; legacy models may only support the old one.
+        # Default to the modern parameter and fall back on error.
+        self._use_max_completion_tokens = self._should_prefer_completion_tokens(model)
+
         # Build SSL context
         self._ssl_context = self._build_ssl_context()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _should_prefer_completion_tokens(model_name: str) -> bool:
+        """Return True if the model is known (or likely) to require
+        ``max_completion_tokens`` instead of the legacy ``max_tokens``.
+
+        Conservative heuristic: default to **True** (modern parameter) for
+        any model whose name we don't explicitly recognise as legacy-only.
+        The auto-retry logic in :meth:`chat` will correct a wrong guess.
+        """
+        name = model_name.lower()
+        # Explicitly legacy models that only support max_tokens
+        legacy_prefixes = ("gpt-3.5", "gpt-3", "text-davinci", "text-curie",
+                           "text-babbage", "text-ada")
+        for prefix in legacy_prefixes:
+            if name.startswith(prefix):
+                return False
+        # Everything else (gpt-4o, o1, o3, claude, etc.) → modern parameter
+        return True
 
     def _build_ssl_context(self) -> ssl.SSLContext | bool:
         """Build an SSL context based on configuration.
@@ -117,18 +142,23 @@ class LLMClient:
         """
         effective_max = max_tokens or self.max_tokens
 
+        # Use the modern 'max_completion_tokens' or legacy 'max_tokens'
+        # based on model detection (set in __init__) and auto-correction.
+        token_key = "max_completion_tokens" if self._use_max_completion_tokens else "max_tokens"
+
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": effective_max,
+            token_key: effective_max,
         }
 
         url = self._chat_url()
         logger.debug(
-            "LLM request to %s  model=%s  max_tokens=%s  key=%s",
+            "LLM request to %s  model=%s  %s=%s  key=%s",
             url,
             self.model,
+            token_key,
             effective_max,
             self._safe_key_repr(),
         )
@@ -146,13 +176,40 @@ class LLMClient:
                     json=payload,
                 )
                 response.raise_for_status()
-        except httpx.TimeoutException:
-            logger.error("LLM request timed out: %s", url)
-            raise
         except httpx.HTTPStatusError as exc:
+            # Auto-detect: if the API rejects 'max_tokens' asking for
+            # 'max_completion_tokens' (or vice versa), retry with the
+            # alternative parameter and remember for future calls.
+            if exc.response.status_code == 400:
+                try:
+                    body = exc.response.json()
+                    err_msg = str(body.get("error", {}).get("message", "")).lower()
+                except Exception:
+                    err_msg = exc.response.text[:500].lower()
+
+                needs_swap = (
+                    ("max_tokens" in err_msg and "max_completion_tokens" in err_msg)
+                    or ("unsupported parameter" in err_msg and "max_tokens" in err_msg)
+                )
+                if needs_swap and not getattr(self, "_token_param_retried", False):
+                    self._token_param_retried = True
+                    self._use_max_completion_tokens = not self._use_max_completion_tokens
+                    alt_key = "max_completion_tokens" if self._use_max_completion_tokens else "max_tokens"
+                    logger.info(
+                        "Switching token parameter from '%s' to '%s' and retrying",
+                        token_key, alt_key,
+                    )
+                    # Retry with swapped parameter (recursion depth = 1)
+                    result = await self.chat(messages, temperature, max_tokens)
+                    self._token_param_retried = False
+                    return result
+
             logger.error(
                 "LLM HTTP error %d from %s", exc.response.status_code, url
             )
+            raise
+        except httpx.TimeoutException:
+            logger.error("LLM request timed out: %s", url)
             raise
         except httpx.ConnectError as exc:
             logger.error("LLM connection failed: %s — %s", url, exc)

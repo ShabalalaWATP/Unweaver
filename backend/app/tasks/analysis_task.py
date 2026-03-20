@@ -56,6 +56,11 @@ def is_running(sample_id: str) -> bool:
     return status is not None and status.get("status") == "running"
 
 
+def clear_tracker(sample_id: str) -> None:
+    """Remove the in-memory tracker for a sample (cleanup after stale state)."""
+    _running_analyses.pop(sample_id, None)
+
+
 async def run_analysis(sample_id: str) -> None:
     """Run the full analysis pipeline for a sample.
 
@@ -132,12 +137,21 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         llm_client=llm_client,
     )
 
+    # Progress callback: updates the in-memory tracker as the orchestrator
+    # progresses through iterations.
+    def _on_progress(iteration: int, total: int, action: str, pct: float) -> None:
+        tracker["current_iteration"] = iteration
+        tracker["total_iterations"] = total
+        tracker["current_action"] = action
+        tracker["progress_pct"] = pct
+
     # Run the full multi-pass analysis loop.
     result = await orchestrator.run(
         auto_approve_threshold=settings.AUTO_APPROVE_THRESHOLD,
         min_confidence=settings.MIN_CONFIDENCE_THRESHOLD,
         max_iterations=settings.MAX_ITERATIONS,
         stall_limit=settings.STALL_THRESHOLD,
+        progress_callback=_on_progress,
     )
 
     tracker["current_iteration"] = result.iterations

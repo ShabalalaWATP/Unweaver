@@ -1,6 +1,5 @@
-import { useState } from 'react';
 import {
-  Code2, FileCheck, GitCompare, Type, Shield, History, AlertTriangle, BookOpen,
+  Code2, FileCheck, GitCompare, Type, Shield, History, AlertTriangle, BookOpen, FileText,
 } from 'lucide-react';
 import type { SampleDetail, AnalysisState } from '@/types';
 import OriginalTab from '@/components/tabs/OriginalTab';
@@ -11,8 +10,10 @@ import IOCsTab from '@/components/tabs/IOCsTab';
 import TransformHistoryTab from '@/components/tabs/TransformHistoryTab';
 import FindingsTab from '@/components/tabs/FindingsTab';
 import AgentNotebookTab from '@/components/tabs/AgentNotebookTab';
+import SummaryTab from '@/components/tabs/SummaryTab';
 
 type TabId =
+  | 'summary'
   | 'original'
   | 'recovered'
   | 'diff'
@@ -23,6 +24,7 @@ type TabId =
   | 'notebook';
 
 const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
+  { id: 'summary', label: 'Summary', icon: <FileText size={13} /> },
   { id: 'original', label: 'Original', icon: <Code2 size={13} /> },
   { id: 'recovered', label: 'Recovered', icon: <FileCheck size={13} /> },
   { id: 'diff', label: 'Diff', icon: <GitCompare size={13} /> },
@@ -36,6 +38,8 @@ const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
 interface WorkspaceTabsProps {
   sample: SampleDetail;
   analysisState: AnalysisState | null;
+  activeTab?: string;
+  onTabChange?: (tab: string) => void;
 }
 
 const s = {
@@ -103,8 +107,12 @@ const s = {
   } as React.CSSProperties,
 };
 
-export default function WorkspaceTabs({ sample, analysisState }: WorkspaceTabsProps) {
-  const [activeTab, setActiveTab] = useState<TabId>('original');
+export default function WorkspaceTabs({ sample, analysisState, activeTab: activeTabProp, onTabChange }: WorkspaceTabsProps) {
+  const activeTab = (activeTabProp ?? 'original') as TabId;
+
+  const setActiveTab = (tab: TabId) => {
+    onTabChange?.(tab);
+  };
 
   // Count badges for data tabs
   const counts: Partial<Record<TabId, number>> = {};
@@ -115,6 +123,8 @@ export default function WorkspaceTabs({ sample, analysisState }: WorkspaceTabsPr
 
   const renderContent = () => {
     switch (activeTab) {
+      case 'summary':
+        return <SummaryTab sample={sample} analysisState={analysisState} />;
       case 'original':
         return <OriginalTab sample={sample} />;
       case 'recovered':

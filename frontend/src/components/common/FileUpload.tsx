@@ -13,7 +13,7 @@ const s = {
   overlay: {
     position: 'fixed',
     inset: 0,
-    background: 'rgba(0, 0, 0, 0.7)',
+    background: 'var(--overlay-bg)',
     backdropFilter: 'blur(4px)',
     display: 'flex',
     alignItems: 'center',
@@ -28,7 +28,7 @@ const s = {
     width: 460,
     maxWidth: '90vw',
     overflow: 'hidden',
-    boxShadow: 'var(--shadow-lg)',
+    boxShadow: 'var(--shadow-lg, 0 4px 20px rgba(0,0,0,0.4))',
     animation: 'unweaver-fade-in 0.2s ease',
   } as React.CSSProperties,
   header: {

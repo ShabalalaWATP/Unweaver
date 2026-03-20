@@ -1,8 +1,8 @@
 # Unweaver
 
-A dark-mode analyst workbench for automated, multi-pass code deobfuscation. Unweaver combines deterministic transforms with an LLM-assisted agentic orchestration loop to iteratively recover readable source from obfuscated JavaScript, TypeScript, Python, PowerShell, and C#/.NET scripts.
+An agentic code deobfuscation workbench for malware analysts and security researchers. Unweaver combines 28+ deterministic transforms with an LLM-assisted orchestration loop to iteratively recover readable source from obfuscated JavaScript, TypeScript, Python, PowerShell, and C#/.NET scripts.
 
-Built for malware analysts and security researchers who need to understand what hostile code actually does — without ever executing it.
+Paste or upload hostile code, hit Analyse, and watch the multi-pass engine strip away obfuscation layers — without ever executing the code.
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![React](https://img.shields.io/badge/React-18-61dafb)
@@ -13,10 +13,12 @@ Built for malware analysts and security researchers who need to understand what 
 
 ## Table of Contents
 
+- [What It Does](#what-it-does)
 - [Architecture](#architecture)
 - [Features](#features)
-- [Quick Start — Docker](#quick-start--docker)
-- [Quick Start — Local Development](#quick-start--local-development)
+- [Setup on Ubuntu](#setup-on-ubuntu)
+- [Setup on Windows](#setup-on-windows)
+- [Setup with Docker](#setup-with-docker)
 - [Configuration](#configuration)
 - [Usage Guide](#usage-guide)
 - [API Reference](#api-reference)
@@ -27,43 +29,59 @@ Built for malware analysts and security researchers who need to understand what 
 
 ---
 
+## What It Does
+
+Unweaver is a web application that takes obfuscated code (malware scripts, packed JS, encoded PowerShell, etc.) and automatically deobfuscates it through multiple passes. The engine:
+
+1. **Detects** the language and obfuscation techniques used (base64 encoding, hex encoding, string array rotation, control flow flattening, eval/exec wrapping, XOR encryption, junk code insertion, etc.)
+2. **Applies** deterministic transforms to decode, decrypt, and simplify the code — base64 decoding (up to 3 nested layers), hex decoding (5 formats), constant folding, control flow unflattening, junk code removal, XOR key recovery, variable renaming, and more
+3. **Uses AI** (optional) to plan which transforms to apply next, suggest variable names, and generate analysis summaries via any OpenAI-compatible LLM endpoint
+4. **Scores** each transform result — measuring readability, confidence, and string recovery — and automatically rolls back transforms that make the code worse
+5. **Extracts** IOCs (URLs, IPs, email addresses, file paths, registry keys, mutexes, hashes), strings, and security findings from the recovered code
+6. **Presents** results in a dark/light themed analyst workbench with a Monaco code editor, side-by-side diff viewer, AI-generated summary reports, and exportable Markdown/JSON reports
+
+Everything happens statically — **no code is ever executed**.
+
+---
+
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│               React Frontend                 │
-│   Vite · TypeScript · Monaco Editor · Diff   │
-│              Port 3000 (dev)                 │
-└──────────────────┬───────────────────────────┘
-                   │  REST / JSON
-                   │  (proxied via Vite)
-┌──────────────────▼───────────────────────────┐
-│               FastAPI Backend                │
-│            Port 8000 · async                 │
-├──────────┬───────────┬───────────────────────┤
-│ Transform│Orchestrator│   LLM Client         │
-│ Pipeline │ (agentic   │   (OpenAI-compatible) │
-│ (14+     │  multi-    │   httpx async         │
-│  actions)│  pass)     │   custom CA support   │
-├──────────┴───────────┴───────────────────────┤
-│           SQLite (aiosqlite)                 │
-│   projects · samples · transforms · IOCs     │
-│   findings · strings · providers · state     │
-└──────────────────────────────────────────────┘
++----------------------------------------------+
+|               React Frontend                 |
+|   Vite - TypeScript - Monaco Editor - Diff   |
+|   Dark/Light themes - 9 workspace tabs       |
+|              Port 3000 (dev)                 |
++------------------+---------------------------+
+                   |  REST / JSON
+                   |  (proxied via Vite)
++------------------v---------------------------+
+|               FastAPI Backend                |
+|            Port 8000 - async                 |
++----------+-----------+-----------------------+
+| Transform|Orchestrator|   LLM Client         |
+| Pipeline | (agentic   |   (OpenAI-compatible) |
+| (28+     |  multi-    |   httpx async         |
+|  actions)|  pass)     |   auto max_tokens     |
++----------+-----------+-----------------------+
+|           SQLite (aiosqlite)                 |
+|   projects - samples - transforms - IOCs     |
+|   findings - strings - providers - state     |
++----------------------------------------------+
 ```
 
-The analysis engine runs an **8-stage loop** on every iteration:
+### 8-Stage Analysis Loop
 
-1. **Planner** — surveys the code, detects the language and obfuscation techniques, recommends prioritised actions
+Each iteration of the analysis engine runs through:
+
+1. **Planner** — surveys the code, detects language and obfuscation techniques, recommends prioritised actions (LLM-assisted when available, deterministic fallback)
 2. **Action Selector** — feeds recommendations into a priority queue, pops the best action (deterministic transforms get a priority bonus)
-3. **Pre-flight Validator** — checks preconditions before executing: language compatibility, input size, retry cap, conflict detection (prevents redundant back-to-back transforms)
+3. **Pre-flight Validator** — checks preconditions: language compatibility, input size, retry cap, conflict detection
 4. **Executor** — runs the selected transform in a thread executor (non-blocking)
-5. **Post-processor** — normalises output: strips BOM, removes control characters, normalises line endings, collapses excessive blank lines, trims trailing whitespace
-6. **Verifier / Scorer** — measures improvement via readability heuristics, string recovery count, IOC extraction, and confidence delta
-7. **State Reconciler** — merges extracted strings, IOCs, techniques, and APIs into the canonical state; updates confidence, readability, and transform history; records queue feedback and stall tracking
+5. **Post-processor** — normalises output: strips BOM, removes control characters, normalises line endings, collapses blank lines
+6. **Verifier** — measures improvement via readability heuristics, string recovery, IOC extraction, and confidence delta
+7. **State Reconciler** — merges extracted data into canonical state; updates confidence, readability, and transform history; auto-rollback on regression
 8. **Stop Decision** — checks 7 termination conditions (budget exhausted, stall, confidence regression, consecutive failures, queue empty, sufficiency, manual stop)
-
-High-confidence deterministic transforms are auto-approved; uncertain or LLM-dependent actions are queued as suggestions with human-in-the-loop approval.
 
 ---
 
@@ -72,85 +90,77 @@ High-confidence deterministic transforms are auto-approved; uncertain or LLM-dep
 | Category | Capabilities |
 |----------|-------------|
 | **Languages** | JavaScript, TypeScript, Python, PowerShell, C#/.NET — extensible |
-| **Deterministic transforms** | Base64 decoding (nested, 3 layers), hex decoding (5 formats), constant folding (`String.fromCharCode`, `chr()` lists), junk code removal, eval/exec detection, JavaScript array resolver, PowerShell `-EncodedCommand` decoder, Python `exec`/`codecs` decoder |
+| **Deterministic transforms** | Base64 decoding (nested, 3 layers), hex decoding (5 formats), constant folding (`String.fromCharCode`, `chr()` lists), junk code removal, eval/exec detection, JavaScript array resolver, PowerShell `-EncodedCommand` decoder, Python `exec`/`codecs` decoder, XOR key recovery, control flow unflattening, string decryption, safe expression evaluation, deterministic variable renaming |
+| **LLM transforms** | LLM-powered deobfuscation, variable/function renaming, code summarisation, multi-layer analysis planning |
 | **IOC extraction** | URLs, IPs (v4/v6), emails, file paths, registry keys, mutexes, hashes (MD5, SHA1, SHA256), defanged indicator support |
-| **Analysis engine** | Priority queue with auto-approve, per-iteration state snapshots with rollback, confidence tracking, stall detection, readability scoring |
-| **LLM integration** | OpenAI-compatible (OpenAI, Azure, vLLM, Ollama, LM Studio), custom CA cert bundles, 128k/200k max-token presets, connection testing |
-| **UI** | Dark-mode-only, Monaco editor, side-by-side diff viewer, 8 workspace tabs, confidence gauge, transform timeline, analyst notes |
-| **Export** | Download deobfuscated code as a standalone file, Markdown and JSON reports with full findings, IOCs, transforms, and strings |
+| **Analysis engine** | Priority queue with auto-approve, per-iteration state snapshots with rollback, confidence tracking, stall detection, readability scoring, progress reporting |
+| **LLM integration** | OpenAI-compatible (OpenAI, Azure, vLLM, Ollama, LM Studio), auto-detects `max_tokens` vs `max_completion_tokens`, custom CA cert bundles, 128k/200k token presets, connection testing |
+| **UI** | Dark and light themes with smooth transitions, Monaco editor with syntax highlighting, side-by-side diff viewer, 9 workspace tabs, confidence gauge, transform timeline, analyst notes |
+| **AI Summary** | LLM-generated analysis reports covering obfuscation techniques, transforms applied, findings, and IOCs |
+| **Export** | Download deobfuscated code, Markdown reports, and JSON reports |
 
 ---
 
-## Quick Start — Docker
+## Setup on Ubuntu
 
-The fastest way to get Unweaver running. Requires [Docker](https://www.docker.com/) and Docker Compose.
-
-```bash
-# Clone the repository
-git clone https://github.com/AlexOleszler/unweaver.git
-cd unweaver
-
-# Build and start both services
-docker compose up --build
-```
-
-Once both containers are healthy:
-
-| Service | URL |
-|---------|-----|
-| Frontend | [http://localhost:5173](http://localhost:5173) |
-| Backend API | [http://localhost:8000](http://localhost:8000) |
-| Swagger docs | [http://localhost:8000/docs](http://localhost:8000/docs) |
-| ReDoc | [http://localhost:8000/redoc](http://localhost:8000/redoc) |
-
-To stop:
-
-```bash
-docker compose down
-```
-
-To reset the database and start fresh:
-
-```bash
-docker compose down -v
-docker compose up --build
-```
-
----
-
-## Quick Start — Local Development
+Tested on Ubuntu 22.04 and 24.04.
 
 ### Prerequisites
 
-- **Python 3.12+**
-- **Node.js 20+** and npm
-- (Optional) An OpenAI-compatible LLM endpoint for LLM-assisted analysis — the deterministic transforms work without one
+```bash
+# Update packages
+sudo apt update && sudo apt upgrade -y
 
-### Backend
+# Install Python 3.12+ (Ubuntu 24.04 has it; on 22.04 use deadsnakes PPA)
+sudo apt install -y python3 python3-pip python3-venv
+
+# On Ubuntu 22.04, if Python < 3.12:
+sudo add-apt-repository ppa:deadsnakes/ppa -y
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv
+
+# Install Node.js 20+ (via NodeSource)
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+
+# Install git
+sudo apt install -y git
+```
+
+### Clone the Repository
+
+```bash
+git clone https://github.com/ShabalalaWATP/Unweaver.git
+cd Unweaver
+```
+
+### Start the Backend
 
 ```bash
 cd backend
 
-# Create and activate a virtual environment
-python -m venv venv
-# Linux / macOS:
+# Create virtual environment
+python3 -m venv venv
 source venv/bin/activate
-# Windows:
-venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# (Optional) Install test dependencies
-pip install pytest pytest-asyncio httpx
-
-# Start the server (auto-reloads on file changes)
-uvicorn app.main:app --reload --port 8000
+# Start the server
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 The backend creates `unweaver.db` (SQLite) and an `uploads/` directory automatically on first start.
 
-### Frontend
+To run in the background:
+
+```bash
+nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+```
+
+### Start the Frontend
+
+Open a new terminal:
 
 ```bash
 cd frontend
@@ -158,43 +168,163 @@ cd frontend
 # Install dependencies
 npm install
 
-# Start the dev server (proxies /api → localhost:8000)
+# Start the dev server (proxies /api to localhost:8000)
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser. The Vite dev server proxies all `/api` requests to the backend on port 8000.
+Open [http://localhost:3000](http://localhost:3000) in your browser.
 
-To build for production:
+### Production Build (Optional)
 
 ```bash
+cd frontend
 npm run build    # outputs to frontend/dist/
-npm run preview  # serve the production build locally
+
+# Serve the production build
+npm run preview
+```
+
+For a production deployment, serve `frontend/dist/` with nginx and proxy `/api` to the backend:
+
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    root /path/to/Unweaver/frontend/dist;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+    }
+}
+```
+
+### Systemd Service (Optional)
+
+Create `/etc/systemd/system/unweaver.service`:
+
+```ini
+[Unit]
+Description=Unweaver Backend
+After=network.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/path/to/Unweaver/backend
+ExecStart=/path/to/Unweaver/backend/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable unweaver
+sudo systemctl start unweaver
+sudo systemctl status unweaver
+```
+
+---
+
+## Setup on Windows
+
+### Prerequisites
+
+- **Python 3.12+** — [python.org](https://www.python.org/downloads/)
+- **Node.js 20+** — [nodejs.org](https://nodejs.org/)
+- **Git** — [git-scm.com](https://git-scm.com/)
+
+### Clone and Run
+
+```powershell
+git clone https://github.com/ShabalalaWATP/Unweaver.git
+cd Unweaver
+```
+
+**Backend** (PowerShell):
+
+```powershell
+cd backend
+python -m venv venv
+.\venv\Scripts\Activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+**Frontend** (new terminal):
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+---
+
+## Setup with Docker
+
+The fastest way to get Unweaver running. Requires [Docker](https://www.docker.com/) and Docker Compose.
+
+```bash
+git clone https://github.com/ShabalalaWATP/Unweaver.git
+cd Unweaver
+
+# Build and start both services
+docker compose up --build
+```
+
+| Service | URL |
+|---------|-----|
+| Frontend | [http://localhost:5173](http://localhost:5173) |
+| Backend API | [http://localhost:8000](http://localhost:8000) |
+| Swagger docs | [http://localhost:8000/docs](http://localhost:8000/docs) |
+
+```bash
+# Stop
+docker compose down
+
+# Reset database and start fresh
+docker compose down -v && docker compose up --build
 ```
 
 ---
 
 ## Configuration
 
-All settings are loaded from environment variables using the `UNWEAVER_` prefix. You can also place them in a `.env` file in the `backend/` directory.
+All settings use the `UNWEAVER_` prefix. Place them in a `.env` file in the `backend/` directory or export as environment variables.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `UNWEAVER_DATABASE_URL` | `sqlite+aiosqlite:///./unweaver.db` | Database connection string |
-| `UNWEAVER_UPLOAD_DIR` | `backend/uploads` | Directory for uploaded sample files |
+| `UNWEAVER_UPLOAD_DIR` | `backend/uploads` | Directory for uploaded files |
 | `UNWEAVER_MAX_FILE_SIZE` | `5242880` (5 MB) | Maximum upload size in bytes |
 | `UNWEAVER_MAX_ITERATIONS` | `20` | Maximum deobfuscation loop iterations |
-| `UNWEAVER_AUTO_APPROVE_THRESHOLD` | `0.85` | Confidence threshold for auto-approving deterministic transforms |
+| `UNWEAVER_AUTO_APPROVE_THRESHOLD` | `0.85` | Confidence threshold for auto-approving transforms |
 | `UNWEAVER_MIN_CONFIDENCE_THRESHOLD` | `0.3` | Minimum confidence to enqueue an action |
-| `UNWEAVER_STALL_THRESHOLD` | `3` | Consecutive no-progress iterations before stopping |
+| `UNWEAVER_STALL_THRESHOLD` | `3` | No-progress iterations before stopping |
 | `UNWEAVER_DEBUG` | `false` | Enable debug mode |
 | `UNWEAVER_LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `UNWEAVER_DEFAULT_LLM_MAX_TOKENS` | `4096` | Default max tokens for LLM responses |
 
-Example `.env` file:
+Example `.env`:
 
 ```env
 UNWEAVER_MAX_ITERATIONS=30
-UNWEAVER_AUTO_APPROVE_THRESHOLD=0.9
 UNWEAVER_LOG_LEVEL=DEBUG
 ```
 
@@ -204,68 +334,69 @@ UNWEAVER_LOG_LEVEL=DEBUG
 
 ### 1. Create a Project
 
-Projects are top-level containers for grouping related samples. Click the **"+"** button in the left sidebar to create one.
+Projects group related samples. Click the **"+"** button in the sidebar.
 
 ### 2. Add Samples
 
-You have two options:
+- **Upload** — drag-and-drop an obfuscated file (up to 5 MB)
+- **Paste** — paste code directly into the text area
 
-- **Upload**: Click **"Upload"** and drag-and-drop an obfuscated file (up to 5 MB). Optionally select the language if auto-detection isn't sufficient.
-- **Paste**: Click **"Paste"** and paste obfuscated code directly into the text area. Choose a filename and language.
+### 3. Configure an LLM Provider (Optional)
 
-### 3. Run Analysis
+Click the **gear icon** in the sidebar. Add an OpenAI-compatible endpoint:
 
-Click **"Analyse"** in the top bar. The orchestrator will:
+- **Base URL**: e.g. `https://api.openai.com`, `http://localhost:11434`
+- **Model**: e.g. `gpt-4o`, `llama3`, `o3-mini`
+- **API Key**: stored securely, masked in all responses
+- **Max Tokens**: 128k or 200k preset
+
+Click **"Test Connection"** to verify. The deterministic engine works fully without an LLM — the AI integration adds planning intelligence, variable naming, and summary generation.
+
+### 4. Run Analysis
+
+Click **"Analyse"**. The engine will:
 
 1. Detect the language and obfuscation techniques
-2. Run deterministic transforms (base64 decoding, hex decoding, string extraction, etc.)
-3. Score each result and decide whether to accept, rollback, or try something else
-4. Repeat until a stop condition is met (sufficient confidence, budget exhausted, or no more progress)
+2. Apply deterministic transforms (base64, hex, constant folding, etc.)
+3. Score each result and rollback if quality drops
+4. Use LLM planning (if configured) to choose optimal next steps
+5. Repeat until confidence is high enough or no more progress
 
-The progress bar and status indicator update in real-time via polling.
+Progress updates appear in real-time.
 
-### 4. Review Results
+### 5. Review Results
 
-Navigate the **8 workspace tabs**:
+Navigate the **9 workspace tabs**:
 
-| Tab | What it shows |
+| Tab | What It Shows |
 |-----|---------------|
-| **Original** | The original obfuscated code (Monaco editor with syntax highlighting) |
-| **Recovered** | The deobfuscated result after all transforms |
-| **Diff** | Side-by-side diff between original and recovered code |
-| **Strings** | All extracted strings with encoding, offset, and context |
-| **IOCs** | Extracted indicators of compromise (URLs, IPs, hashes, etc.) with defanging toggle |
-| **Transform History** | Timeline of every transform applied, with confidence/readability before/after |
-| **Findings** | Severity-ranked finding cards (suspicious APIs, techniques, behavioural patterns) |
-| **Agent Notebook** | Internal orchestrator state, LLM suggestions, and decision log |
+| **Summary** | AI-generated analysis report, confidence metrics, detected techniques, transform statistics |
+| **Original** | The original obfuscated code (Monaco editor) |
+| **Recovered** | The deobfuscated result |
+| **Diff** | Side-by-side diff between original and recovered |
+| **Strings** | Extracted strings with encoding, offset, and context |
+| **IOCs** | Indicators of compromise (URLs, IPs, hashes, etc.) with defanging |
+| **Transforms** | Timeline of every transform applied with before/after metrics |
+| **Findings** | Severity-ranked security findings |
+| **Notebook** | Internal orchestrator state, LLM suggestions, and decision log |
 
-The **right panel** shows metadata: language, confidence gauge, readability bar, detected techniques, suspicious APIs, and analyst notes.
+### 6. Generate AI Summary
 
-### 5. Configure LLM Provider (Optional)
+On the **Summary** tab, click **"Generate Summary"** to produce an LLM-written analysis report covering what the code does, what obfuscation was used, and what was recovered.
 
-Click the **gear icon** in the sidebar to open Provider Settings. Add an OpenAI-compatible endpoint:
+### 7. Export Reports
 
-- **Name**: A label for this provider (e.g., "Local Ollama", "GPT-4o")
-- **Base URL**: The endpoint root (e.g., `http://localhost:11434`, `https://api.openai.com`)
-- **Model**: The model name (e.g., `llama3`, `gpt-4o`)
-- **API Key**: Your API key (stored encrypted, masked in all responses)
-- **Max Tokens**: Choose 128k or 200k preset
-- **CA Certificate**: Upload a custom cert bundle for enterprise TLS inspection
+Use the export buttons to download:
 
-Click **"Test Connection"** to verify the endpoint is reachable before saving.
-
-### 6. Export Reports
-
-Use the **export buttons** in the top bar to download:
-
-- **Markdown** — A full human-readable report with findings, IOCs, transforms, and strings
-- **JSON** — Machine-readable structured report for integration with other tools
+- **Markdown** — full human-readable report
+- **JSON** — structured report for tool integration
+- **Deobfuscated code** — standalone recovered file
 
 ---
 
 ## API Reference
 
-All endpoints are under `/api`. Interactive documentation is available at `/docs` (Swagger UI) and `/redoc` when the backend is running.
+All endpoints are under `/api`. Interactive docs at `/docs` (Swagger) and `/redoc`.
 
 ### Projects
 
@@ -284,7 +415,7 @@ All endpoints are under `/api`. Interactive documentation is available at `/docs
 | `POST` | `/api/projects/{id}/samples/upload` | Upload a file as a sample |
 | `GET` | `/api/projects/{id}/samples` | List samples in a project |
 | `GET` | `/api/samples/{id}` | Get full sample detail |
-| `GET` | `/api/samples/{id}/original` | Get original obfuscated text |
+| `GET` | `/api/samples/{id}/original` | Get original text |
 | `GET` | `/api/samples/{id}/recovered` | Get deobfuscated text |
 | `GET` | `/api/samples/{id}/diff` | Get unified diff |
 | `GET` | `/api/samples/{id}/strings` | Get extracted strings |
@@ -292,6 +423,7 @@ All endpoints are under `/api`. Interactive documentation is available at `/docs
 | `GET` | `/api/samples/{id}/findings` | Get analysis findings |
 | `GET` | `/api/samples/{id}/transforms` | Get transform history |
 | `GET` | `/api/samples/{id}/iterations` | Get iteration state snapshots |
+| `POST` | `/api/samples/{id}/summary` | Generate AI analysis summary |
 | `PUT` | `/api/samples/{id}/notes` | Save analyst notes |
 | `DELETE` | `/api/samples/{id}` | Delete a sample |
 
@@ -319,7 +451,7 @@ All endpoints are under `/api`. Interactive documentation is available at `/docs
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/samples/{id}/export/deobfuscated` | Download deobfuscated code as a file |
+| `GET` | `/api/samples/{id}/export/deobfuscated` | Download deobfuscated code |
 | `GET` | `/api/samples/{id}/export/markdown` | Download Markdown report |
 | `GET` | `/api/samples/{id}/export/json` | Download JSON report |
 
@@ -333,67 +465,50 @@ All endpoints are under `/api`. Interactive documentation is available at `/docs
 
 ## Demo Samples
 
-The `backend/demo_samples/` directory contains obfuscated code samples for testing the full transform pipeline:
+The `backend/demo_samples/` directory contains safe obfuscated code samples for testing:
 
 | File | Language | Techniques |
 |------|----------|------------|
 | `js_obfuscated.js` | JavaScript | Array-based string table, base64, eval, `String.fromCharCode` |
-| `ps_obfuscated.ps1` | PowerShell | Base64 `-EncodedCommand`, format string obfuscation, backtick insertion, IEX |
+| `ps_obfuscated.ps1` | PowerShell | Base64 `-EncodedCommand`, format strings, backtick insertion, IEX |
 | `py_obfuscated.py` | Python | Nested base64, `exec`, `codecs.decode` (ROT13), `chr()` lists |
 | `cs_obfuscated.cs` | C# | Reflection, base64, string construction, `Type.GetType` |
 
-These are **safe demonstration files** that decode to benign strings. They exercise the full pipeline without executing anything harmful.
-
-To try them: create a project, upload one of these files, and click **Analyse**.
+These decode to benign strings and exercise the full pipeline safely.
 
 ---
 
 ## Testing
 
-### Backend Tests
-
 ```bash
 cd backend
+source venv/bin/activate
 
-# Install test dependencies (if not already)
+# Install test dependencies
 pip install pytest pytest-asyncio httpx
 
 # Run all tests
 pytest
 
-# Run with verbose output
+# Verbose output
 pytest -v
 
-# Run a specific test file
+# Specific test file
 pytest tests/test_transforms.py -v
 ```
 
-The test suite covers:
-
-- **160 tests** across 4 test modules
-- **API endpoints** — project CRUD, sample paste/upload, analysis start/status, provider management, sub-resources (strings, IOCs, findings, transforms)
-- **Transforms** — base64 decoding (nested layers, wrapper patterns), hex decoding (5 formats), string extraction (4 languages), constant folding, IOC extraction, language detection, readability scoring
-- **Orchestrator** — action queue (priority ordering, deterministic bonus, failure caps, auto-approve), state manager (snapshots, rollback, confidence tracking, stall detection), stop conditions (7 termination criteria), verifier (improvement detection)
-- **LLM providers** — schema validation, API key masking, max token presets, connection test mocking
-
-### Frontend Build Verification
-
-```bash
-cd frontend
-npm run build  # TypeScript compilation + Vite production build
-```
+The suite covers 160+ tests across API endpoints, transform correctness, orchestrator logic, and LLM provider handling.
 
 ---
 
 ## Security Notes
 
-- **No code execution** — Unweaver never executes uploaded code. All analysis is pattern matching, string decoding, and LLM inference.
-- **API keys** are stored in the database and **masked in all API responses** (only the last 4 characters are visible).
-- **File uploads** are sanitised: filenames are stripped of directory components and dangerous characters, file size is capped at 5 MB.
-- **Uploads treated as hostile** — no file paths from uploads are trusted, content is decoded as text only.
-- **CORS** is configured for local development origins (`localhost:3000`, `localhost:5173`). For production, restrict `allow_origins` to your frontend domain in `app/main.py`.
-- **Custom CA certificates** can be uploaded for LLM providers in enterprise environments with TLS inspection.
-- **No secrets in logs** — API keys are masked in all log output via the LLM client.
+- **No code execution** — all analysis is static pattern matching, string decoding, and LLM inference
+- **API keys** are masked in all API responses (only last 4 characters visible)
+- **File uploads** are sanitised: filenames stripped of directory components, size capped at 5 MB
+- **CORS** is configured for local dev origins; restrict `allow_origins` in production
+- **Custom CA certificates** supported for enterprise TLS inspection environments
+- **No secrets in logs** — API keys are masked in all log output
 
 ---
 
@@ -405,6 +520,7 @@ npm run build  # TypeScript compilation + Vite production build
 | Backend | Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0 (async) |
 | Database | SQLite via aiosqlite (zero-config, single-file) |
 | LLM Client | httpx (async), OpenAI-compatible chat/completions protocol |
+| Styling | CSS custom properties with dark/light theme system |
 | Testing | pytest, pytest-asyncio, httpx AsyncClient |
 | Containers | Docker, Docker Compose |
 

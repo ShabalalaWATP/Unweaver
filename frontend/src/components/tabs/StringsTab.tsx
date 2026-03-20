@@ -1,7 +1,8 @@
 import { useState, useMemo, useCallback } from 'react';
-import { Copy, Search, ArrowUpDown } from 'lucide-react';
+import { Copy, Search, ArrowUpDown, ClipboardCopy, Regex } from 'lucide-react';
 import type { StringEntry } from '@/types';
 import { useAsync } from '@/hooks/useApi';
+import { useToast } from '@/components/common/Toast';
 import * as api from '@/services/api';
 import { truncate } from '@/utils/format';
 
@@ -52,6 +53,32 @@ const s = {
     fontSize: '11px',
     color: 'var(--text-muted)',
   } as React.CSSProperties,
+  toggleBtn: {
+    padding: '3px 8px',
+    fontSize: '10px',
+    fontWeight: 500,
+    borderRadius: 'var(--radius-sm)',
+    border: '1px solid var(--border)',
+    cursor: 'pointer',
+    transition: 'all 0.15s',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+  } as React.CSSProperties,
+  copyAllBtn: {
+    padding: '3px 8px',
+    fontSize: '10px',
+    fontWeight: 500,
+    borderRadius: 'var(--radius-sm)',
+    border: '1px solid var(--border)',
+    background: 'var(--bg-tertiary)',
+    color: 'var(--text-secondary)',
+    cursor: 'pointer',
+    transition: 'all 0.15s',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+  } as React.CSSProperties,
   tableWrap: {
     flex: 1,
     overflow: 'auto',
@@ -87,6 +114,11 @@ const s = {
     color: 'var(--text-muted)',
     fontSize: '13px',
   } as React.CSSProperties,
+  regexError: {
+    fontSize: '10px',
+    color: 'var(--danger)',
+    padding: '0 4px',
+  } as React.CSSProperties,
 };
 
 export default function StringsTab({ sampleId }: StringsTabProps) {
@@ -95,8 +127,10 @@ export default function StringsTab({ sampleId }: StringsTabProps) {
     [sampleId],
   );
   const [filter, setFilter] = useState('');
+  const [useRegex, setUseRegex] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey>('value');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
+  const toast = useToast();
 
   const handleSort = useCallback(
     (key: SortKey) => {
@@ -110,17 +144,33 @@ export default function StringsTab({ sampleId }: StringsTabProps) {
     [sortKey],
   );
 
-  const filtered = useMemo(() => {
-    if (!strings) return [];
+  const { filtered, regexError } = useMemo(() => {
+    if (!strings) return { filtered: [], regexError: null };
     let result = strings;
+    let regexErr: string | null = null;
+
     if (filter) {
-      const lower = filter.toLowerCase();
-      result = result.filter(
-        (s) =>
-          s.value.toLowerCase().includes(lower) ||
-          (s.decoded && s.decoded.toLowerCase().includes(lower)) ||
-          (s.context && s.context.toLowerCase().includes(lower)),
-      );
+      if (useRegex) {
+        try {
+          const re = new RegExp(filter, 'i');
+          result = result.filter(
+            (entry) =>
+              re.test(entry.value) ||
+              (entry.decoded && re.test(entry.decoded)) ||
+              (entry.context && re.test(entry.context)),
+          );
+        } catch (e) {
+          regexErr = e instanceof Error ? e.message : 'Invalid regex';
+        }
+      } else {
+        const lower = filter.toLowerCase();
+        result = result.filter(
+          (entry) =>
+            entry.value.toLowerCase().includes(lower) ||
+            (entry.decoded && entry.decoded.toLowerCase().includes(lower)) ||
+            (entry.context && entry.context.toLowerCase().includes(lower)),
+        );
+      }
     }
     result = [...result].sort((a, b) => {
       const aVal = (a[sortKey] ?? '') as string;
@@ -128,12 +178,19 @@ export default function StringsTab({ sampleId }: StringsTabProps) {
       const cmp = aVal.localeCompare(bVal);
       return sortDir === 'asc' ? cmp : -cmp;
     });
-    return result;
-  }, [strings, filter, sortKey, sortDir]);
+    return { filtered: result, regexError: regexErr };
+  }, [strings, filter, useRegex, sortKey, sortDir]);
 
   const copyToClipboard = useCallback((text: string) => {
     navigator.clipboard.writeText(text);
-  }, []);
+    toast.success('Copied to clipboard');
+  }, [toast]);
+
+  const copyAll = useCallback(() => {
+    const text = filtered.map((e) => e.decoded ?? e.value).join('\n');
+    navigator.clipboard.writeText(text);
+    toast.success(`Copied ${filtered.length} strings`);
+  }, [filtered, toast]);
 
   if (loading) {
     return <div style={s.emptyState}>Loading strings...</div>;
@@ -153,18 +210,51 @@ export default function StringsTab({ sampleId }: StringsTabProps) {
   return (
     <div style={s.root}>
       <div style={s.toolbar}>
-        <div style={s.searchWrap}>
+        <div style={{
+          ...s.searchWrap,
+          ...(regexError ? { borderColor: 'var(--danger)' } : {}),
+        }}>
           <Search size={12} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
           <input
             style={s.searchInput}
-            placeholder="Filter strings..."
+            placeholder={useRegex ? 'Regex filter...' : 'Filter strings...'}
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
           />
         </div>
+        <button
+          style={{
+            ...s.toggleBtn,
+            background: useRegex ? 'var(--accent-muted)' : 'var(--bg-tertiary)',
+            color: useRegex ? 'var(--accent)' : 'var(--text-secondary)',
+            borderColor: useRegex ? 'var(--accent)' : 'var(--border)',
+          }}
+          onClick={() => setUseRegex(!useRegex)}
+          title="Toggle regex search"
+        >
+          <Regex size={10} />
+          Regex
+        </button>
+        <button
+          style={s.copyAllBtn}
+          onClick={copyAll}
+          title="Copy all filtered strings"
+          onMouseEnter={(e) => {
+            e.currentTarget.style.borderColor = 'var(--accent)';
+            e.currentTarget.style.color = 'var(--accent)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.borderColor = 'var(--border)';
+            e.currentTarget.style.color = 'var(--text-secondary)';
+          }}
+        >
+          <ClipboardCopy size={10} />
+          Copy All
+        </button>
         <span style={s.count}>
           {filtered.length} / {strings.length}
         </span>
+        {regexError && <span style={s.regexError}>{regexError}</span>}
       </div>
       <div style={s.tableWrap}>
         <table>

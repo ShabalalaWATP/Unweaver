@@ -1,4 +1,5 @@
 import ReactDiffViewer, { DiffMethod } from 'react-diff-viewer-continued';
+import { useTheme } from '@/contexts/ThemeContext';
 
 interface DiffViewerProps {
   original: string;
@@ -50,16 +51,63 @@ const darkStyles = {
   },
 };
 
+const lightStyles = {
+  variables: {
+    light: {
+      diffViewerBackground: '#ffffff',
+      diffViewerColor: '#1f2328',
+      addedBackground: '#dafbe1',
+      addedColor: '#1a7f37',
+      removedBackground: '#ffebe9',
+      removedColor: '#cf222e',
+      wordAddedBackground: '#aceebb',
+      wordRemovedBackground: '#ffd7d5',
+      addedGutterBackground: '#ccffd8',
+      removedGutterBackground: '#ffd7d5',
+      gutterBackground: '#f6f8fa',
+      gutterBackgroundDark: '#eef1f5',
+      highlightBackground: '#fff8c5',
+      highlightGutterBackground: '#fff8c5',
+      codeFoldGutterBackground: '#f6f8fa',
+      codeFoldBackground: '#f6f8fa',
+      emptyLineBackground: '#ffffff',
+      gutterColor: '#59636e',
+      addedGutterColor: '#1a7f37',
+      removedGutterColor: '#cf222e',
+      codeFoldContentColor: '#59636e',
+      diffViewerTitleBackground: '#f6f8fa',
+      diffViewerTitleColor: '#1f2328',
+      diffViewerTitleBorderColor: '#d1d9e0',
+    },
+  },
+  line: {
+    padding: '2px 8px',
+    fontSize: '12px',
+    fontFamily: "'Cascadia Code', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
+  },
+  gutter: {
+    padding: '2px 8px',
+    fontSize: '11px',
+    minWidth: '40px',
+  },
+  contentText: {
+    fontFamily: "'Cascadia Code', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace",
+    fontSize: '12px',
+  },
+};
+
 export default function DiffViewer({ original, recovered }: DiffViewerProps) {
+  const { isDark } = useTheme();
+
   return (
     <div style={{ height: '100%', overflow: 'auto' }}>
       <ReactDiffViewer
         oldValue={original}
         newValue={recovered}
         splitView={true}
-        useDarkTheme={true}
+        useDarkTheme={isDark}
         compareMethod={DiffMethod.LINES}
-        styles={darkStyles}
+        styles={isDark ? darkStyles : lightStyles}
         leftTitle="Original (Obfuscated)"
         rightTitle="Recovered (Deobfuscated)"
         showDiffOnly={false}

@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { RotateCcw, Download, Trash2, Save, Cpu, Eye, Zap } from 'lucide-react';
 import type { SampleDetail, AnalysisState } from '@/types';
 import ConfidenceGauge from '@/components/common/ConfidenceGauge';
+import { useToast } from '@/components/common/Toast';
 import * as api from '@/services/api';
 
 interface RightPanelProps {
@@ -181,6 +182,7 @@ function getReadabilityColor(val: number): string {
 export default function RightPanel({ sample, analysisState, onRefresh }: RightPanelProps) {
   const [notes, setNotes] = useState(sample.analyst_notes ?? '');
   const [saved, setSaved] = useState(false);
+  const toast = useToast();
 
   useEffect(() => {
     setNotes(sample.analyst_notes ?? '');
@@ -188,10 +190,15 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
   }, [sample.id, sample.analyst_notes]);
 
   const handleSaveNotes = useCallback(async () => {
-    await api.saveNotes(sample.id, notes);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
-  }, [sample.id, notes]);
+    try {
+      await api.saveNotes(sample.id, notes);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+      toast.success('Notes saved');
+    } catch {
+      toast.error('Failed to save notes');
+    }
+  }, [sample.id, notes, toast]);
 
   const confidence = analysisState?.confidence ?? null;
   const overallConfidence = confidence ? Math.round(confidence.overall * 100) : null;
@@ -202,20 +209,30 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
   const suspiciousApis = analysisState?.suspicious_apis ?? [];
 
   const handleReanalyse = useCallback(async () => {
-    await api.startAnalysis(sample.id);
-    onRefresh();
-  }, [sample.id, onRefresh]);
+    try {
+      await api.startAnalysis(sample.id);
+      onRefresh();
+      toast.info('Re-analysis started');
+    } catch {
+      toast.error('Failed to start re-analysis');
+    }
+  }, [sample.id, onRefresh, toast]);
 
   const handleExport = useCallback(async () => {
-    const data = await api.exportJSON(sample.id);
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${sample.filename}-report.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }, [sample]);
+    try {
+      const data = await api.exportJSON(sample.id);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${sample.filename}-report.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success('Report exported');
+    } catch {
+      toast.error('Failed to export report');
+    }
+  }, [sample, toast]);
 
   return (
     <div style={s.root}>

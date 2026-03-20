@@ -13,32 +13,32 @@ const SEVERITY_CONFIG: Record<
   { color: string; bg: string; icon: React.ReactNode; label: string }
 > = {
   critical: {
-    color: '#f85149',
-    bg: '#4a1c1c',
+    color: 'var(--severity-critical)',
+    bg: 'var(--severity-critical-bg)',
     icon: <AlertOctagon size={12} />,
     label: 'CRITICAL',
   },
   high: {
-    color: '#f0883e',
-    bg: '#3d2200',
+    color: 'var(--severity-high)',
+    bg: 'var(--severity-high-bg)',
     icon: <AlertTriangle size={12} />,
     label: 'HIGH',
   },
   medium: {
-    color: '#d29922',
-    bg: '#3d2e00',
+    color: 'var(--severity-medium)',
+    bg: 'var(--severity-medium-bg)',
     icon: <ShieldAlert size={12} />,
     label: 'MEDIUM',
   },
   low: {
-    color: '#58a6ff',
-    bg: '#1f3a5c',
+    color: 'var(--severity-low)',
+    bg: 'var(--severity-low-bg)',
     icon: <ShieldCheck size={12} />,
     label: 'LOW',
   },
   info: {
-    color: '#8b949e',
-    bg: '#21262d',
+    color: 'var(--severity-info)',
+    bg: 'var(--severity-info-bg)',
     icon: <Info size={12} />,
     label: 'INFO',
   },

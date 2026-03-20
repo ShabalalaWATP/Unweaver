@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import type { AnalysisState } from '@/types';
-import { useSample, useAnalysisStatus } from '@/hooks/useApi';
+import { useSample, useAnalysisStatus, loadPersistedState, savePersistedState } from '@/hooks/useApi';
+import { useToast } from '@/components/common/Toast';
 import * as api from '@/services/api';
 import Sidebar from '@/components/layout/Sidebar';
 import TopBar from '@/components/layout/TopBar';
@@ -104,10 +105,24 @@ const styles = {
 };
 
 export default function App() {
-  const [view, setView] = useState<View>('workspace');
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-  const [selectedSampleId, setSelectedSampleId] = useState<string | null>(null);
+  // ── Restore persisted state ────────────────────────────────────────
+  const persisted = useRef(loadPersistedState());
+
+  const [view, setView] = useState<View>(
+    (persisted.current.view as View) ?? 'workspace',
+  );
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
+    persisted.current.selectedProjectId,
+  );
+  const [selectedSampleId, setSelectedSampleId] = useState<string | null>(
+    persisted.current.selectedSampleId,
+  );
+  const [activeTab, setActiveTab] = useState<string>(
+    persisted.current.activeTab ?? 'original',
+  );
   const [analysisState, setAnalysisState] = useState<AnalysisState | null>(null);
+
+  const toast = useToast();
 
   // Local flag: set to true immediately when user clicks "Analyse"
   // so polling starts before the sample refetch completes.
@@ -121,6 +136,33 @@ export default function App() {
     sample?.status === 'pending' ||
     analysisActive;
   const analysisStatus = useAnalysisStatus(selectedSampleId, isRunning);
+
+  // ── Persist state changes to localStorage ──────────────────────────
+  useEffect(() => {
+    savePersistedState({ selectedProjectId });
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    savePersistedState({ selectedSampleId });
+  }, [selectedSampleId]);
+
+  useEffect(() => {
+    savePersistedState({ activeTab });
+  }, [activeTab]);
+
+  useEffect(() => {
+    savePersistedState({ view });
+  }, [view]);
+
+  // ── Load analysis state for persisted sample on first mount ────────
+  const initialLoadDone = useRef(false);
+  useEffect(() => {
+    if (initialLoadDone.current) return;
+    if (selectedSampleId && sample) {
+      initialLoadDone.current = true;
+      api.getAnalysisState(selectedSampleId).then(setAnalysisState).catch(() => {});
+    }
+  }, [selectedSampleId, sample]);
 
   const handleSelectProject = useCallback((id: string) => {
     setSelectedProjectId(id);
@@ -148,21 +190,25 @@ export default function App() {
       setAnalysisActive(true);
       await api.startAnalysis(selectedSampleId);
       refetchSample();
+      toast.info('Analysis started');
     } catch (err) {
       console.error('Failed to start analysis:', err);
       setAnalysisActive(false);
+      toast.error('Failed to start analysis');
     }
-  }, [selectedSampleId, refetchSample]);
+  }, [selectedSampleId, refetchSample, toast]);
 
   const handleStopAnalysis = useCallback(async () => {
     if (!selectedSampleId) return;
     try {
       await api.stopAnalysis(selectedSampleId);
       refetchSample();
+      toast.warning('Analysis stop requested');
     } catch (err) {
       console.error('Failed to stop analysis:', err);
+      toast.error('Failed to stop analysis');
     }
-  }, [selectedSampleId, refetchSample]);
+  }, [selectedSampleId, refetchSample, toast]);
 
   const handleAnalysisComplete = useCallback(async () => {
     setAnalysisActive(false);
@@ -171,14 +217,14 @@ export default function App() {
       try {
         const state = await api.getAnalysisState(selectedSampleId);
         setAnalysisState(state);
+        toast.success('Analysis completed');
       } catch {
         // State may not be available
       }
     }
-  }, [refetchSample, selectedSampleId]);
+  }, [refetchSample, selectedSampleId, toast]);
 
   // ── Detect analysis completion via polling status transitions ──────
-  // Track the previous polling status so we fire exactly once on transition.
   const prevAnalysisStatusRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -186,7 +232,6 @@ export default function App() {
     const prevStatus = prevAnalysisStatusRef.current;
     prevAnalysisStatusRef.current = currentStatus;
 
-    // Detect transition from active (running/pending) to terminal state
     if (
       prevStatus &&
       (prevStatus === 'running' || prevStatus === 'pending') &&
@@ -199,7 +244,6 @@ export default function App() {
   }, [analysisStatus?.status, handleAnalysisComplete]);
 
   // ── Periodically refresh sample data while analysis is active ──────
-  // This keeps the sample status badge and TopBar in sync with reality.
   useEffect(() => {
     if (!isRunning) return;
     const timer = setInterval(() => {
@@ -207,6 +251,22 @@ export default function App() {
     }, 5000);
     return () => clearInterval(timer);
   }, [isRunning, refetchSample]);
+
+  // ── Callbacks for sidebar delete actions ────────────────────────────
+  const handleDeleteProject = useCallback((id: string) => {
+    if (selectedProjectId === id) {
+      setSelectedProjectId(null);
+      setSelectedSampleId(null);
+      setAnalysisState(null);
+    }
+  }, [selectedProjectId]);
+
+  const handleDeleteSample = useCallback((id: string) => {
+    if (selectedSampleId === id) {
+      setSelectedSampleId(null);
+      setAnalysisState(null);
+    }
+  }, [selectedSampleId]);
 
   return (
     <div style={styles.container}>
@@ -216,6 +276,8 @@ export default function App() {
         onSelectProject={handleSelectProject}
         onSelectSample={handleSelectSample}
         onOpenSettings={() => setView('settings')}
+        onDeleteProject={handleDeleteProject}
+        onDeleteSample={handleDeleteSample}
       />
       <div style={styles.main}>
         {view === 'settings' ? (
@@ -235,6 +297,8 @@ export default function App() {
                   <WorkspaceTabs
                     sample={sample}
                     analysisState={analysisState}
+                    activeTab={activeTab}
+                    onTabChange={setActiveTab}
                   />
                 ) : (
                   <div style={styles.emptyState}>

@@ -29,7 +29,7 @@ const s = {
   overlay: {
     position: 'fixed',
     inset: 0,
-    background: 'rgba(0, 0, 0, 0.7)',
+    background: 'var(--overlay-bg)',
     backdropFilter: 'blur(4px)',
     display: 'flex',
     alignItems: 'center',

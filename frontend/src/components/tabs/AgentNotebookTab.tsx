@@ -115,7 +115,7 @@ function getDecisionColor(action: string): string {
   if (lower.includes('decode') || lower.includes('base64') || lower.includes('hex'))
     return 'var(--success)';
   if (lower.includes('deobfuscate') || lower.includes('unpack')) return 'var(--warning)';
-  if (lower.includes('string') || lower.includes('extract')) return '#d2a8ff';
+  if (lower.includes('string') || lower.includes('extract')) return 'var(--purple)';
   return 'var(--text-secondary)';
 }
 
@@ -131,8 +131,14 @@ export default function AgentNotebookTab({ analysisState }: AgentNotebookTabProp
     );
   }
 
-  const transforms = analysisState.transform_history;
-  const iterState = analysisState.iteration_state;
+  const transforms = analysisState.transform_history ?? [];
+  const suggestions = analysisState.llm_suggestions ?? [];
+  const iterState = analysisState.iteration_state ?? {
+    current_iteration: 0,
+    stall_counter: 0,
+    last_confidence: 0,
+    stopped: false,
+  };
 
   return (
     <div style={s.root}>
@@ -172,10 +178,10 @@ export default function AgentNotebookTab({ analysisState }: AgentNotebookTabProp
       </div>
 
       {/* LLM suggestions */}
-      {analysisState.llm_suggestions.length > 0 && (
+      {suggestions.length > 0 && (
         <div style={s.summary}>
           <div style={s.summaryTitle}>LLM Suggestions</div>
-          {analysisState.llm_suggestions.map((sug, i) => (
+          {suggestions.map((sug, i) => (
             <div
               key={i}
               style={{

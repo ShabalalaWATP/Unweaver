@@ -1,4 +1,5 @@
 import Editor from '@monaco-editor/react';
+import { useTheme } from '@/contexts/ThemeContext';
 
 interface CodeViewerProps {
   value: string;
@@ -56,13 +57,15 @@ export default function CodeViewer({
   height = '100%',
   onChange,
 }: CodeViewerProps) {
+  const { isDark } = useTheme();
+
   return (
     <Editor
       height={height}
       defaultLanguage={resolveLanguage(language)}
       language={resolveLanguage(language)}
       value={value}
-      theme="vs-dark"
+      theme={isDark ? 'vs-dark' : 'light'}
       onChange={onChange}
       options={{
         readOnly,

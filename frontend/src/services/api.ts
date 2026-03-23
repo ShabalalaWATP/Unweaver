@@ -94,6 +94,60 @@ async function request<T>(
   return res.text() as unknown as T;
 }
 
+function parseDownloadFilename(header: string | null): string | null {
+  if (!header) return null;
+  const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1]);
+  }
+  const plainMatch = header.match(/filename="([^"]+)"/i) ?? header.match(/filename=([^;]+)/i);
+  return plainMatch?.[1]?.trim() ?? null;
+}
+
+async function download(
+  path: string,
+  options: RequestInit = {},
+  timeoutMs = 120_000,
+): Promise<{ blob: Blob; filename: string | null }> {
+  const url = `${BASE_URL}${path}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new ApiError(`Request timed out after ${timeoutMs}ms: ${path}`, 0, null);
+    }
+    throw err;
+  }
+  clearTimeout(timer);
+
+  if (!res.ok) {
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      body = await res.text();
+    }
+    throw new ApiError(
+      `API ${options.method ?? 'GET'} ${path} failed (${res.status})`,
+      res.status,
+      body,
+    );
+  }
+
+  return {
+    blob: await res.blob(),
+    filename: parseDownloadFilename(res.headers.get('Content-Disposition')),
+  };
+}
+
 // ════════════════════════════════════════════════════════════════════════
 //  Projects
 // ════════════════════════════════════════════════════════════════════════
@@ -346,8 +400,10 @@ export async function exportJSON(sampleId: string): Promise<unknown> {
   return request<unknown>(`/samples/${sampleId}/export/json`);
 }
 
-export async function exportDeobfuscated(sampleId: string): Promise<string> {
-  return request<string>(`/samples/${sampleId}/export/deobfuscated`);
+export async function exportDeobfuscated(
+  sampleId: string,
+): Promise<{ blob: Blob; filename: string | null }> {
+  return download(`/samples/${sampleId}/export/deobfuscated`);
 }
 
 // ════════════════════════════════════════════════════════════════════════

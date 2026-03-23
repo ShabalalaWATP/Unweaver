@@ -19,6 +19,7 @@ from app.services.analysis.action_queue import (
     ActionStatus,
     QueuedAction,
 )
+from app.services.analysis.orchestrator import Planner
 from app.services.analysis.state_manager import StateManager
 
 
@@ -104,6 +105,21 @@ class TestActionQueue:
 
         # Third attempt should be rejected
         assert q.enqueue("flaky_action", confidence=0.5, max_attempts=2) is False
+
+    def test_success_resets_failure_streak(self):
+        """A later success should clear the retry cap for subsequent passes."""
+        q = ActionQueue()
+
+        q.enqueue("retryable_action", confidence=0.5, max_attempts=2)
+        q.dequeue()
+        q.mark_failed("retryable_action")
+
+        q.enqueue("retryable_action", confidence=0.5, max_attempts=2)
+        q.dequeue()
+        q.mark_succeeded("retryable_action")
+
+        assert q.failure_streak("retryable_action") == 0
+        assert q.enqueue("retryable_action", confidence=0.5, max_attempts=2) is True
 
     def test_global_attempt_cap(self):
         """After _max_global_attempts total attempts, action is blocked."""
@@ -355,6 +371,45 @@ class TestActionSelection:
         assert q.success_count("transform_a") == 1
         assert q.failure_count("transform_a") == 1
         assert q.total_attempts("transform_a") == 2
+
+
+class TestPlannerWorkspaceBundles:
+    def test_skips_detect_language_for_workspace_bundles(self):
+        code = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 2\n"
+            "omitted_files: 0\n"
+            "languages: typescript=2\n"
+            "entry_points: apps/web/src/main.tsx\n"
+            "suspicious_files: packages/api/src/decode.ts\n"
+            "manifest_files: package.json\n"
+            "root_dirs: apps | packages\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="apps/web/src/main.tsx" language="typescript" priority="entrypoint" size=42>>>\n'
+            "const payload = atob('aGVsbG8=');\n"
+            "<<<END FILE>>>\n"
+        )
+        sm = StateManager("bundle-test", code, language="workspace")
+        q = ActionQueue()
+        planner = Planner(
+            available_actions={
+                "profile_workspace",
+                "detect_language",
+                "fingerprint_obfuscation",
+                "extract_strings",
+                "analyze_entropy",
+                "llm_deobfuscate",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "profile_workspace" in names
+        assert "detect_language" not in names
+        assert "fingerprint_obfuscation" in names
+
 
 
 # ════════════════════════════════════════════════════════════════════════

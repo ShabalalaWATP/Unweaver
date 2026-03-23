@@ -207,6 +207,8 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
     : 0;
   const techniques = analysisState?.detected_techniques ?? [];
   const suspiciousApis = analysisState?.suspicious_apis ?? [];
+  const workspaceContext = analysisState?.workspace_context;
+  const languageLabel = sample.language === 'workspace' ? 'Workspace Bundle' : (sample.language ?? 'Unknown');
 
   const handleReanalyse = useCallback(async () => {
     try {
@@ -244,7 +246,7 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
             Language
           </div>
           <span style={{ ...s.badge, ...s.langBadge }}>
-            {sample.language ?? 'Unknown'}
+            {languageLabel}
           </span>
         </div>
 
@@ -311,6 +313,26 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
                 </span>
               ))}
             </div>
+          </div>
+        )}
+
+        {sample.language === 'workspace' && workspaceContext && (
+          <div className="unweaver-card" style={s.card}>
+            <div style={s.sectionTitle}>Workspace</div>
+            <div style={s.statRow}>
+              <span>Included files</span>
+              <span style={s.statValue}>{workspaceContext.included_files ?? 0}</span>
+            </div>
+            {!!workspaceContext.entry_points?.length && (
+              <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--text-secondary)' }}>
+                Entrypoints: {workspaceContext.entry_points.slice(0, 4).join(', ')}
+              </div>
+            )}
+            {!!workspaceContext.suspicious_files?.length && (
+              <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--danger)' }}>
+                Suspicious: {workspaceContext.suspicious_files.slice(0, 3).join(', ')}
+              </div>
+            )}
           </div>
         )}
 

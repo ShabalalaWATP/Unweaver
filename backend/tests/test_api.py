@@ -12,9 +12,13 @@ Uses httpx AsyncClient with the FastAPI test app to exercise:
 from __future__ import annotations
 
 import io
+import zipfile
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.db_models import Sample
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -210,6 +214,113 @@ class TestSampleUpload:
             files={"file": ("test.txt", io.BytesIO(b"code"), "text/plain")},
         )
         assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_upload_codebase_archive_bundles_workspace(self, client: AsyncClient):
+        """Archive uploads should be converted into a bounded workspace bundle."""
+        proj_resp = await client.post(
+            "/api/projects",
+            json={"name": "Archive Upload Test"},
+        )
+        project_id = proj_resp.json()["id"]
+
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, mode="w") as archive:
+            archive.writestr(
+                "apps/web/src/main.tsx",
+                'const payload = atob("aGVsbG8=");\nconsole.log(payload);\n',
+            )
+            archive.writestr(
+                "packages/api/src/decode.ts",
+                "export function decode(x: string) { return eval(x); }\n",
+            )
+            archive.writestr(
+                "package.json",
+                '{"name":"repo","workspaces":["apps/*","packages/*"]}',
+            )
+            archive.writestr(
+                "node_modules/ignored/index.js",
+                "console.log('should be ignored');",
+            )
+
+        response = await client.post(
+            f"/api/projects/{project_id}/samples/upload",
+            files={"file": ("repo.zip", io.BytesIO(archive_bytes.getvalue()), "application/zip")},
+        )
+        assert response.status_code == 201
+        sample_id = response.json()["id"]
+        assert response.json()["language"] == "workspace"
+
+        detail = await client.get(f"/api/samples/{sample_id}")
+        assert detail.status_code == 200
+        payload = detail.json()
+        assert payload["original_text"].startswith("UNWEAVER_WORKSPACE_BUNDLE v1")
+        assert '<<<FILE path="apps/web/src/main.tsx"' in payload["original_text"]
+        assert '<<<FILE path="packages/api/src/decode.ts"' in payload["original_text"]
+        assert "node_modules/ignored/index.js" not in payload["original_text"]
+
+    @pytest.mark.asyncio
+    async def test_export_deobfuscated_workspace_returns_zip(self, client: AsyncClient):
+        """Workspace samples should export a reconstructed zip archive."""
+        proj_resp = await client.post("/api/projects", json={"name": "Workspace Export Test"})
+        project_id = proj_resp.json()["id"]
+
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, mode="w") as archive:
+            archive.writestr("apps/web/src/main.tsx", "console.log('hello');\n")
+            archive.writestr("packages/api/src/index.ts", "export const ok = true;\n")
+
+        upload = await client.post(
+            f"/api/projects/{project_id}/samples/upload",
+            files={"file": ("repo.zip", io.BytesIO(archive_bytes.getvalue()), "application/zip")},
+        )
+        sample_id = upload.json()["id"]
+
+        response = await client.get(f"/api/samples/{sample_id}/export/deobfuscated")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/zip"
+        assert "deobfuscated_repo.zip" in response.headers["content-disposition"]
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            assert "apps/web/src/main.tsx" in archive.namelist()
+            assert "packages/api/src/index.ts" in archive.namelist()
+
+    @pytest.mark.asyncio
+    async def test_export_workspace_falls_back_to_original_when_recovered_is_invalid(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+    ):
+        """Malformed recovered workspace text should not break archive export."""
+        proj_resp = await client.post("/api/projects", json={"name": "Workspace Fallback Test"})
+        project_id = proj_resp.json()["id"]
+
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, mode="w") as archive:
+            archive.writestr("apps/web/src/main.tsx", "console.log('hello');\n")
+            archive.writestr("packages/api/src/index.ts", "export const ok = true;\n")
+
+        upload = await client.post(
+            f"/api/projects/{project_id}/samples/upload",
+            files={"file": ("repo.zip", io.BytesIO(archive_bytes.getvalue()), "application/zip")},
+        )
+        sample_id = upload.json()["id"]
+
+        sample = await db_session.get(Sample, sample_id)
+        assert sample is not None
+        sample.recovered_text = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 2\n"
+            "omitted_files: 0\n"
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/samples/{sample_id}/export/deobfuscated")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            assert "apps/web/src/main.tsx" in archive.namelist()
+            assert "packages/api/src/index.ts" in archive.namelist()
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -17,6 +17,7 @@ confidence scores, and improvement metrics to make decisions.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -34,6 +35,11 @@ from app.models.schemas import (
     Severity,
     StringEntry,
     TransformRecord,
+)
+from app.services.ingest.workspace_bundle import (
+    extract_workspace_context,
+    truncate_workspace_bundle,
+    workspace_context_prompt,
 )
 from app.services.analysis.action_queue import ActionQueue, QueuedAction
 from app.services.analysis.findings_generator import FindingsGenerator
@@ -1263,7 +1269,7 @@ class Verifier:
         Never raises — returns 0.0 on any internal error.
         """
         try:
-            return self._verify_inner(code_before, code_after, result)
+            return self._verify_inner(code_before, code_after, result, state_manager)
         except Exception:
             logger.exception("Verifier encountered an internal error")
             return 0.0
@@ -1273,18 +1279,26 @@ class Verifier:
         code_before: str,
         code_after: str,
         result: TransformResult,
+        state_manager: StateManager,
     ) -> float:
         if code_before == code_after and not result.details:
             return 0.0
 
         scores: List[Tuple[float, float]] = []  # (weight, score)
         details = result.details or {}
+        language = (state_manager.state.language or "").lower()
 
         # 1. Readability delta.
         read_before = StateManager._estimate_readability(code_before)
         read_after = StateManager._estimate_readability(code_after)
         read_delta = read_after - read_before
         scores.append((0.20, read_delta))
+
+        # 1b. Structural validity delta. LLM transforms can otherwise score
+        # well on readability while still returning broken code.
+        syntax_score = self._syntax_delta(language, code_before, code_after)
+        if syntax_score != 0.0:
+            scores.append((0.15, syntax_score))
 
         # 2. Length change (shorter is usually better for deobfuscation).
         if len(code_before) > 0:
@@ -1350,8 +1364,101 @@ class Verifier:
         # Regression check: code became less readable AND no new intelligence
         if read_after < read_before * 0.8 and not string_count:
             improvement = min(improvement, -0.1)
+        if syntax_score < 0:
+            improvement = min(improvement, syntax_score)
 
         return max(-1.0, min(1.0, improvement))
+
+    @classmethod
+    def _syntax_delta(cls, language: str, before: str, after: str) -> float:
+        before_ok = cls._is_syntax_healthy(language, before)
+        after_ok = cls._is_syntax_healthy(language, after)
+        if before_ok and not after_ok:
+            return -0.35
+        if not before_ok and after_ok:
+            return 0.2
+        return 0.0
+
+    @classmethod
+    def _is_syntax_healthy(cls, language: str, code: str) -> bool:
+        lang = (language or "").lower()
+        if lang in {"python", "py"}:
+            try:
+                ast.parse(code)
+                return True
+            except SyntaxError:
+                return False
+        if lang == "json":
+            try:
+                json.loads(code)
+                return True
+            except (json.JSONDecodeError, TypeError):
+                return False
+        return cls._balanced_delimiters(code)
+
+    @staticmethod
+    def _balanced_delimiters(code: str) -> bool:
+        pairs = {"(": ")", "{": "}", "[": "]"}
+        closing = {value: key for key, value in pairs.items()}
+        stack: List[str] = []
+        quote: Optional[str] = None
+        in_line_comment = False
+        in_block_comment = False
+        i = 0
+
+        while i < len(code):
+            ch = code[i]
+            nxt = code[i + 1] if i + 1 < len(code) else ""
+
+            if in_line_comment:
+                if ch == "\n":
+                    in_line_comment = False
+                i += 1
+                continue
+
+            if in_block_comment:
+                if ch == "*" and nxt == "/":
+                    in_block_comment = False
+                    i += 2
+                else:
+                    i += 1
+                continue
+
+            if quote is not None:
+                if ch == "\\":
+                    i += 2
+                    continue
+                if ch == quote:
+                    quote = None
+                i += 1
+                continue
+
+            if ch == "/" and nxt == "/":
+                in_line_comment = True
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                i += 2
+                continue
+            if ch == "#":
+                in_line_comment = True
+                i += 1
+                continue
+            if ch in {"'", '"', "`"}:
+                quote = ch
+                i += 1
+                continue
+
+            if ch in pairs:
+                stack.append(ch)
+            elif ch in closing:
+                if not stack or stack[-1] != closing[ch]:
+                    return False
+                stack.pop()
+            i += 1
+
+        return not stack and quote is None and not in_block_comment
 
     @staticmethod
     def _entropy_delta(before: str, after: str) -> float:
@@ -1447,6 +1554,7 @@ class Planner:
 
     # Ordered plan templates by analysis phase.
     _PHASE_INITIAL: List[str] = [
+        "profile_workspace",
         "detect_language",
         "fingerprint_obfuscation",
         "extract_strings",
@@ -1501,6 +1609,89 @@ class Planner:
         # than we've fingerprinted (roughly: new modifications since last scan).
         return modifying_successes >= fingerprint_count
 
+    @staticmethod
+    def _planner_code_excerpt(code: str, max_chars: int = 4000) -> str:
+        if extract_workspace_context(code):
+            return truncate_workspace_bundle(code, max_chars)
+        if len(code) <= max_chars:
+            return code
+        segment = max(max_chars // 3, 1)
+        middle_start = max((len(code) // 2) - (segment // 2), 0)
+        middle_end = middle_start + segment
+        return (
+            code[:segment]
+            + f"\n\n... [{len(code) - (segment * 3)} chars omitted] ...\n\n"
+            + code[middle_start:middle_end]
+            + "\n\n... [tail excerpt] ...\n\n"
+            + code[-segment:]
+        )
+
+    @staticmethod
+    def _planner_state_context(state_manager: StateManager) -> str:
+        state = state_manager.state
+        parts: List[str] = []
+        workspace = workspace_context_prompt(state_manager.current_code)
+        stored_workspace = state.workspace_context if hasattr(state, "workspace_context") else {}
+
+        if workspace:
+            parts.append(workspace)
+        elif isinstance(stored_workspace, dict) and stored_workspace:
+            entry_points = stored_workspace.get("entry_points", [])
+            suspicious_files = stored_workspace.get("suspicious_files", [])
+            included = stored_workspace.get("included_files")
+            archive_name = stored_workspace.get("archive_name")
+            summary_parts = []
+            if archive_name:
+                summary_parts.append(f"Workspace bundle: {archive_name}")
+            if included:
+                summary_parts.append(f"Included files: {included}")
+            if entry_points:
+                summary_parts.append(
+                    "Entry points: " + " | ".join(str(item) for item in entry_points[:6])
+                )
+            if suspicious_files:
+                summary_parts.append(
+                    "Suspicious files: "
+                    + " | ".join(str(item) for item in suspicious_files[:6])
+                )
+            if summary_parts:
+                parts.append("\n".join(summary_parts))
+
+        if state.detected_techniques:
+            parts.append(
+                "Detected techniques: " + ", ".join(state.detected_techniques[:12])
+            )
+        if state.suspicious_apis:
+            parts.append(
+                "Suspicious APIs: " + ", ".join(state.suspicious_apis[:10])
+            )
+        if state.imports:
+            parts.append("Imports: " + " | ".join(state.imports[:10]))
+        if state.functions:
+            parts.append("Functions: " + " | ".join(state.functions[:10]))
+        if state.recovered_literals:
+            parts.append(
+                "Recovered literals: "
+                + " | ".join(v[:80] for v in state.recovered_literals[:8])
+            )
+        if state.strings:
+            sample_strings = [s.value[:80] for s in state.strings[:8] if s.value]
+            if sample_strings:
+                parts.append("String sample: " + " | ".join(sample_strings))
+        if state.transform_history:
+            recent = [
+                f"{item.action}:{'ok' if item.success else 'fail'}"
+                for item in state.transform_history[-6:]
+            ]
+            parts.append("Recent transforms: " + " -> ".join(recent))
+
+        parts.append(f"Overall confidence: {state_manager.overall_confidence:.2f}")
+        readability_hist = state_manager.readability_history
+        if readability_hist:
+            parts.append(f"Current readability: {readability_hist[-1]:.2f}")
+
+        return "\n".join(parts)
+
     async def plan_with_llm(
         self,
         state_manager: StateManager,
@@ -1544,14 +1735,15 @@ class Planner:
             readability_hist = state_manager.readability_history
             readability = readability_hist[-1] if readability_hist else 0.0
 
-            code_snippet = code[:3000]
+            code_snippet = self._planner_code_excerpt(code)
+            state_context = self._planner_state_context(state_manager)
 
             prompt = (
                 "You are an expert code deobfuscation planner. Analyze the "
                 "following obfuscated code and recommend the next "
                 "deobfuscation actions to take.\n\n"
-                f"Current code (first 3000 chars):\n{code_snippet}\n\n"
-                f"Detected obfuscation techniques: {techniques}\n"
+                f"Current code excerpt:\n{code_snippet}\n\n"
+                f"State summary:\n{state_context}\n\n"
                 f"Available actions: {actions_list}\n"
                 f"Already tried (successes): {successes}\n"
                 f"Already tried (failures): {failures}\n"
@@ -1568,7 +1760,10 @@ class Planner:
                 "  ]\n"
                 "}\n\n"
                 "Only recommend actions from the available actions list. "
-                "Prioritize actions that haven't been tried yet."
+                "Prioritize actions that haven't been tried yet, avoid actions "
+                "that have repeatedly failed without new evidence, and prefer "
+                "deterministic decoders before broad LLM rewrites when the "
+                "state already points to a specific layer."
             )
 
             messages = [{"role": "user", "content": prompt}]
@@ -1654,17 +1849,28 @@ class Planner:
         iteration = state_manager.current_iteration
         code = state_manager.current_code
         language = (state.language or "").lower()
+        workspace_mode = (
+            extract_workspace_context(code) is not None
+            or bool(getattr(state, "workspace_context", {}))
+        )
 
         recommendations: List[PlannedAction] = []
 
         # ── Phase 1: Initial reconnaissance ──────────────────────────
         if iteration <= 1:
             for i, action in enumerate(self._PHASE_INITIAL):
+                if workspace_mode and action == "detect_language":
+                    continue
+                if not workspace_mode and action == "profile_workspace":
+                    continue
                 if action in self._available_actions and not action_queue.has_been_tried(action):
                     recommendations.append(PlannedAction(
                         action_name=action,
                         confidence=0.95,
-                        reason="Initial reconnaissance phase.",
+                        reason=(
+                            "Initial workspace reconnaissance phase."
+                            if workspace_mode else "Initial reconnaissance phase."
+                        ),
                         priority=float(i),
                     ))
 
@@ -1942,9 +2148,12 @@ class Planner:
             if iteration >= 2 and not action_queue.success_count("llm_deobfuscate"):
                 recommendations.append(PlannedAction(
                     action_name="llm_deobfuscate",
-                    confidence=0.8,
-                    reason="LLM-assisted deep deobfuscation.",
-                    priority=13.0,
+                    confidence=0.85 if workspace_mode else 0.8,
+                    reason=(
+                        "LLM-assisted bundle-aware deobfuscation across prioritized files."
+                        if workspace_mode else "LLM-assisted deep deobfuscation."
+                    ),
+                    priority=12.6 if workspace_mode else 13.0,
                 ))
 
             # LLM multi-layer unwrapper — if we detected multiple encoding
@@ -1958,9 +2167,13 @@ class Planner:
                 if not action_queue.success_count("llm_multilayer_unwrap"):
                     recommendations.append(PlannedAction(
                         action_name="llm_multilayer_unwrap",
-                        confidence=0.75,
-                        reason="Multiple encoding layers detected; LLM multi-layer unwrap.",
-                        priority=13.5,
+                        confidence=0.8 if workspace_mode else 0.75,
+                        reason=(
+                            "Workspace bundle may hide layered obfuscation across file boundaries."
+                            if workspace_mode else
+                            "Multiple encoding layers detected; LLM multi-layer unwrap."
+                        ),
+                        priority=13.2 if workspace_mode else 13.5,
                     ))
 
             # LLM renaming — schedule after deterministic renaming has run.
@@ -2377,6 +2590,31 @@ class StateReconciler:
         if techniques:
             sm.add_detected_techniques(techniques)
 
+        direct_apis = details.get("suspicious_apis", [])
+        if direct_apis:
+            sm.add_suspicious_apis([str(item)[:160] for item in direct_apis[:30]])
+
+        imports = details.get("imports", [])
+        if imports:
+            sm.add_imports([str(item)[:160] for item in imports[:80]])
+
+        functions = details.get("functions", [])
+        if functions:
+            sm.add_functions([str(item)[:160] for item in functions[:80]])
+
+        evidence_references = details.get("evidence_references", [])
+        if evidence_references:
+            existing_refs = set(sm.state.evidence_references)
+            for ref in evidence_references[:80]:
+                ref_str = str(ref)[:200]
+                if ref_str and ref_str not in existing_refs:
+                    sm.state.evidence_references.append(ref_str)
+                    existing_refs.add(ref_str)
+
+        workspace_context = details.get("workspace_context")
+        if isinstance(workspace_context, dict):
+            sm.merge_workspace_context(workspace_context)
+
         # Strings.
         raw_strings = details.get("strings", [])
         if raw_strings:
@@ -2535,6 +2773,12 @@ class StateReconciler:
             if payload_strings:
                 sm.add_recovered_literals(payload_strings)
 
+        decoded_artifacts = details.get("decoded_artifacts", [])
+        if decoded_artifacts:
+            sm.add_recovered_literals(
+                [str(item)[:500] for item in decoded_artifacts[:10]]
+            )
+
         # LLM analysis metadata (capabilities, risk factors, etc.).
         capabilities = details.get("capabilities", [])
         if capabilities:
@@ -2550,6 +2794,19 @@ class StateReconciler:
         if recommended_actions:
             sm.state.llm_suggestions.extend(
                 f"Action: {a}" for a in recommended_actions[:10]
+            )
+        uncertainties = details.get("remaining_uncertainties", [])
+        if uncertainties:
+            sm.state.llm_suggestions.extend(
+                f"Uncertainty: {u}" for u in uncertainties[:10]
+            )
+
+        summary = details.get("summary")
+        if summary:
+            intent = details.get("intent", "unknown")
+            severity = details.get("severity", "info")
+            sm.set_summary(
+                f"{summary} Intent={intent}; severity={severity}."
             )
 
         # LLM layers info (from multi-layer unwrapper).
@@ -2578,6 +2835,7 @@ def _build_action_space(llm_client: Optional[Any] = None) -> Dict[str, BaseTrans
     """
     # Mapping of action name -> (module_path, class_name).
     _EXTERNAL_MAP: Dict[str, Tuple[str, str]] = {
+        "profile_workspace": ("app.services.transforms.workspace_profiler", "WorkspaceProfiler"),
         "detect_language": ("app.services.transforms.language_detector", "LanguageDetector"),
         "fingerprint_obfuscation": ("app.services.transforms.obfuscation_fingerprinter", "ObfuscationFingerprinter"),
         "extract_strings": ("app.services.transforms.string_extraction", "StringExtractor"),

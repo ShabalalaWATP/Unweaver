@@ -196,6 +196,7 @@ class AnalysisState(BaseModel):
 
     transform_history: List[TransformRecord] = Field(default_factory=list)
     evidence_references: List[str] = Field(default_factory=list)
+    workspace_context: Dict[str, Any] = Field(default_factory=dict)
 
     confidence: Dict[str, float] = Field(
         default_factory=lambda: {

@@ -206,12 +206,11 @@ export default function TopBar({
     if (!sample) return;
     setExporting(true);
     try {
-      const code = await api.exportDeobfuscated(sample.id);
-      const blob = new Blob([code], { type: 'text/plain' });
+      const { blob, filename } = await api.exportDeobfuscated(sample.id);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `deobfuscated_${sample.filename}`;
+      a.download = filename ?? `deobfuscated_${sample.filename}`;
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
@@ -231,10 +230,12 @@ export default function TopBar({
     );
   }
 
+  const languageLabel = sample.language === 'workspace' ? 'bundle' : sample.language;
+
   return (
     <div className="unweaver-glass-bar" style={s.root}>
       <span style={s.title}>{sample.filename}</span>
-      {sample.language && <span style={s.lang}>{sample.language}</span>}
+      {languageLabel && <span style={s.lang}>{languageLabel}</span>}
       <StatusBadge status={sample.status} />
 
       {/* Progress indicator during analysis */}

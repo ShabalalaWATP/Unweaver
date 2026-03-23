@@ -30,8 +30,18 @@ Rules:
 - Flatten unnecessarily nested control flow.
 - Remove dead code and junk no-op statements.
 - Add short inline comments explaining non-obvious operations.
-- Output ONLY the cleaned code inside a single markdown code fence.
-- Do NOT include explanations outside the code fence.
+- Return JSON with exactly these fields:
+  {
+    "cleaned_code": "the rewritten code",
+    "decoded_artifacts": ["decoded strings, URLs, commands, or payload fragments"],
+    "renames": {"oldName": "newName"},
+    "remaining_uncertainties": ["anything still ambiguous or unresolved"],
+    "confidence": 0.0 to 1.0
+  }
+- The cleaned_code field must contain the full rewritten code, not a summary.
+- Do not omit code just because parts remain unclear; preserve those sections.
+- If the input is a workspace bundle with <<<FILE ...>>> markers, preserve the
+  file markers and keep edits scoped to the relevant file blocks.
 """
 
 
@@ -48,18 +58,9 @@ class LLMDeobfuscator(LLMTransform):
         self, code: str, language: str, state: dict
     ) -> List[Dict[str, str]]:
         truncated = self.truncate_code(code)
-
-        # Include context from prior analysis if available.
-        context_parts: List[str] = []
-        techniques = state.get("detected_techniques", [])
-        if techniques:
-            context_parts.append(
-                f"Detected obfuscation techniques: {', '.join(techniques[:10])}"
-            )
         lang = language or state.get("language", "unknown")
-        context_parts.append(f"Language: {lang}")
-
-        context = "\n".join(context_parts)
+        context = self.build_state_context(state)
+        workspace = self.build_workspace_context(code)
 
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -67,8 +68,12 @@ class LLMDeobfuscator(LLMTransform):
                 "role": "user",
                 "content": (
                     f"Deobfuscate the following code.\n\n"
+                    f"Declared language: {lang}\n"
                     f"Context:\n{context}\n\n"
+                    + (f"Workspace context:\n{workspace}\n\n" if workspace else "")
+                    + (
                     f"```\n{truncated}\n```"
+                    )
                 ),
             },
         ]
@@ -76,7 +81,34 @@ class LLMDeobfuscator(LLMTransform):
     def parse_response(
         self, reply: str, code: str, language: str, state: dict
     ) -> TransformResult:
-        cleaned = self.extract_code_block(reply)
+        data = self.extract_json(reply)
+        decoded_artifacts: List[str] = []
+        renames: Dict[str, str] = {}
+        remaining_uncertainties: List[str] = []
+        confidence = 0.75
+
+        if isinstance(data, dict):
+            cleaned = str(data.get("cleaned_code", "")).strip()
+            decoded_artifacts = [
+                str(item)[:500] for item in data.get("decoded_artifacts", [])[:20]
+            ]
+            raw_renames = data.get("renames", {})
+            if isinstance(raw_renames, dict):
+                renames = {
+                    str(old): str(new)
+                    for old, new in list(raw_renames.items())[:30]
+                    if isinstance(old, str) and isinstance(new, str)
+                }
+            remaining_uncertainties = [
+                str(item)[:200]
+                for item in data.get("remaining_uncertainties", [])[:10]
+            ]
+            raw_confidence = data.get("confidence", confidence)
+            if isinstance(raw_confidence, (int, float)):
+                confidence = float(raw_confidence)
+        else:
+            cleaned = self.extract_code_block(reply)
+
         if not cleaned or len(cleaned.strip()) < 10:
             return TransformResult(
                 success=False,
@@ -101,14 +133,34 @@ class LLMDeobfuscator(LLMTransform):
                 details={"len_ratio": len_ratio},
             )
 
+        validation = self.validate_candidate_code(code, cleaned, language)
+        if not validation["accepted"]:
+            return TransformResult(
+                success=False,
+                output=code,
+                confidence=0.1,
+                description=(
+                    "LLM deobfuscation produced structurally unsafe output; "
+                    "discarding candidate."
+                ),
+                details={
+                    "len_ratio": len_ratio,
+                    "validation": validation,
+                },
+            )
+
         return TransformResult(
             success=True,
             output=cleaned,
-            confidence=0.75,
+            confidence=min(max(confidence, 0.3), 0.9),
             description="LLM deobfuscation applied successfully.",
             details={
                 "original_length": len(code),
                 "cleaned_length": len(cleaned),
                 "len_ratio": round(len_ratio, 2),
+                "decoded_artifacts": decoded_artifacts,
+                "renames": renames,
+                "remaining_uncertainties": remaining_uncertainties,
+                "validation": validation,
             },
         )

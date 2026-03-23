@@ -12,6 +12,12 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from app.services.ingest.workspace_bundle import (
+    extract_workspace_context,
+    pick_workspace_bundle_text,
+    workspace_files_preview,
+)
+
 
 def generate_json_report(
     *,
@@ -124,5 +130,13 @@ def generate_json_report(
         "recovered_text": recovered_text or "",
         "iteration_count": len(iteration_states),
     }
+
+    bundle_text = pick_workspace_bundle_text(recovered_text, original_text)
+    workspace_context = extract_workspace_context(bundle_text or "")
+    if workspace_context:
+        report["workspace"] = {
+            **workspace_context,
+            "files_preview": workspace_files_preview(bundle_text or "", max_files=16),
+        }
 
     return report

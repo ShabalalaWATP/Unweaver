@@ -349,7 +349,7 @@ export default function Sidebar({
       dragCounter.current = 0;
 
       if (!selectedProjectId) {
-        toast.warning('Select a project first to upload files');
+        toast.warning('Select a project first to upload files or archives');
         return;
       }
 
@@ -381,7 +381,7 @@ export default function Sidebar({
       {dragOver && (
         <div style={s.dropOverlay as React.CSSProperties}>
           <Upload size={16} style={{ marginRight: '6px' }} />
-          Drop files to upload
+          Drop files or archives to upload
         </div>
       )}
 
@@ -634,7 +634,7 @@ export default function Sidebar({
             ))}
             {samples.length === 0 && (
               <div style={{ ...s.item, color: 'var(--text-muted)', cursor: 'default', opacity: 0.6 }}>
-                {dragOver ? 'Drop files here' : 'No samples'}
+                {dragOver ? 'Drop files or archives here' : 'No samples'}
               </div>
             )}
           </div>

@@ -10,9 +10,19 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
+from app.services.ingest.workspace_bundle import (
+    ParsedWorkspaceFile,
+    parse_workspace_bundle,
+    rebuild_workspace_bundle,
+)
 from app.services.transforms.base import TransformResult
+from app.services.transforms.deterministic_renamer import (
+    KEYWORDS,
+    _build_string_mask,
+    _safe_rename,
+)
 from app.services.transforms.llm_base import LLMTransform
 
 logger = logging.getLogger(__name__)
@@ -29,6 +39,8 @@ Rules:
 - Return your answer as a JSON object mapping old names to new names.
 - Only include identifiers you are confident about (≥70% sure).
 - Maximum 30 renames per response.
+- If the input is a workspace bundle with <<<FILE ...>>> markers, preserve the
+  markers and only rename identifiers inside the relevant file blocks.
 
 Example output:
 ```json
@@ -56,15 +68,21 @@ class LLMRenamer(LLMTransform):
     ) -> List[Dict[str, str]]:
         truncated = self.truncate_code(code)
         lang = language or state.get("language", "unknown")
+        context = self.build_state_context(state)
+        workspace = self.build_workspace_context(code)
 
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
-                    f"Language: {lang}\n\n"
+                    f"Language: {lang}\n"
+                    f"Context:\n{context}\n\n"
+                    + (f"Workspace context:\n{workspace}\n\n" if workspace else "")
+                    + (
                     f"```\n{truncated}\n```\n\n"
                     "Return the rename mapping as JSON."
+                    )
                 ),
             },
         ]
@@ -73,6 +91,8 @@ class LLMRenamer(LLMTransform):
         self, reply: str, code: str, language: str, state: dict
     ) -> TransformResult:
         mapping = self.extract_json(reply)
+        if isinstance(mapping, dict) and "renames" in mapping and isinstance(mapping["renames"], dict):
+            mapping = mapping["renames"]
         if not mapping or not isinstance(mapping, dict):
             return TransformResult(
                 success=False,
@@ -90,6 +110,7 @@ class LLMRenamer(LLMTransform):
                 and isinstance(new, str)
                 and old in code
                 and re.match(r"^[a-zA-Z_]\w*$", new)
+                and new not in KEYWORDS
                 and old != new
             ):
                 valid_renames[old] = new
@@ -103,16 +124,42 @@ class LLMRenamer(LLMTransform):
                 details={"raw_mapping_size": len(mapping)},
             )
 
-        # Apply renames using word-boundary-safe replacement.
-        new_code = code
-        applied = 0
-        for old, new in valid_renames.items():
-            # Use word boundary regex so we don't replace partial matches.
-            pattern = re.compile(r"\b" + re.escape(old) + r"\b")
-            replaced = pattern.sub(new, new_code)
-            if replaced != new_code:
-                new_code = replaced
-                applied += 1
+        # Apply renames using the same string/comment-aware replacement logic
+        # as the deterministic renamer so semantic renames do not corrupt
+        # literals, comments, or embedded payloads.
+        workspace_files = parse_workspace_bundle(code)
+        if workspace_files:
+            new_code, applied_names = self._apply_workspace_renames(
+                code,
+                workspace_files,
+                valid_renames,
+            )
+        else:
+            new_code, applied_names = self._apply_text_renames(code, valid_renames)
+
+        applied = len(applied_names)
+
+        validation: Dict[str, Any] = {
+            "accepted": False,
+            "issues": [],
+            "delimiter_balance_ok": False,
+            "syntax_ok": None,
+            "workspace_validation": None,
+        }
+        if applied > 0:
+            validation = self.validate_candidate_code(code, new_code, language)
+            if not validation["accepted"]:
+                return TransformResult(
+                    success=False,
+                    output=code,
+                    confidence=0.2,
+                    description="LLM renamer produced structurally unsafe output.",
+                    details={
+                        "renames_suggested": len(valid_renames),
+                        "suggestions": valid_renames,
+                        "validation": validation,
+                    },
+                )
 
         return TransformResult(
             success=applied > 0,
@@ -123,5 +170,47 @@ class LLMRenamer(LLMTransform):
                 "renames_applied": applied,
                 "renames_suggested": len(valid_renames),
                 "suggestions": valid_renames,
+                "validation": validation,
             },
         )
+
+    @staticmethod
+    def _apply_text_renames(
+        code: str,
+        valid_renames: Dict[str, str],
+    ) -> Tuple[str, set[str]]:
+        new_code = code
+        applied_names: set[str] = set()
+        for old in sorted(valid_renames, key=len, reverse=True):
+            new = valid_renames[old]
+            protected_spans = _build_string_mask(new_code)
+            replaced = _safe_rename(new_code, old, new, protected_spans)
+            if replaced != new_code:
+                new_code = replaced
+                applied_names.add(old)
+        return new_code, applied_names
+
+    @classmethod
+    def _apply_workspace_renames(
+        cls,
+        bundle_text: str,
+        workspace_files: List[ParsedWorkspaceFile],
+        valid_renames: Dict[str, str],
+    ) -> Tuple[str, set[str]]:
+        rewritten_files: List[ParsedWorkspaceFile] = []
+        applied_names: set[str] = set()
+
+        for item in workspace_files:
+            new_text, file_applied_names = cls._apply_text_renames(item.text, valid_renames)
+            applied_names.update(file_applied_names)
+            rewritten_files.append(
+                ParsedWorkspaceFile(
+                    path=item.path,
+                    language=item.language,
+                    priority=item.priority,
+                    size_bytes=item.size_bytes,
+                    text=new_text,
+                )
+            )
+
+        return rebuild_workspace_bundle(bundle_text, rewritten_files), applied_names

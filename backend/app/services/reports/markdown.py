@@ -12,6 +12,12 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from app.services.ingest.workspace_bundle import (
+    extract_workspace_context,
+    pick_workspace_bundle_text,
+    workspace_files_preview,
+)
+
 
 def generate_markdown_report(
     *,
@@ -42,6 +48,30 @@ def generate_markdown_report(
     lines.append(f"**Status:** {status}  ")
     lines.append(f"**Created:** {created_at.isoformat()}  ")
     lines.append("")
+
+    bundle_text = pick_workspace_bundle_text(recovered_text, original_text)
+    workspace_context = extract_workspace_context(bundle_text or "")
+    if workspace_context:
+        lines.append("## Workspace Context")
+        lines.append("")
+        lines.append(f"- Archive: `{workspace_context.get('archive_name') or filename}`")
+        lines.append(f"- Included files: {workspace_context.get('included_files') or 0}")
+        lines.append(f"- Omitted files: {workspace_context.get('omitted_files') or 0}")
+        if workspace_context.get("entry_points"):
+            lines.append("- Entry points: " + ", ".join(workspace_context["entry_points"][:8]))
+        if workspace_context.get("suspicious_files"):
+            lines.append("- Suspicious files: " + ", ".join(workspace_context["suspicious_files"][:8]))
+        preview = workspace_files_preview(bundle_text or "", max_files=12)
+        if preview:
+            lines.append("")
+            lines.append("### Prioritized Files")
+            lines.append("")
+            for item in preview:
+                priority = ",".join(item.get("priority", [])) or "normal"
+                lines.append(
+                    f"- `{item.get('path')}` ({item.get('language')}, {priority}, {item.get('size_bytes')} bytes)"
+                )
+        lines.append("")
 
     # ── Techniques detected ──────────────────────────────────────────
     # Gather techniques from iteration states

@@ -126,6 +126,21 @@ export interface AnalysisState {
   recovered_literals: string[];
   transform_history: TransformRecord[];
   evidence_references: string[];
+  workspace_context?: {
+    archive_name?: string;
+    included_files?: number;
+    omitted_files?: number;
+    entry_points?: string[];
+    suspicious_files?: string[];
+    manifest_files?: string[];
+    root_dirs?: string[];
+    files_preview?: Array<{
+      path: string;
+      language: string;
+      priority: string[];
+      size_bytes: number;
+    }>;
+  };
   confidence: {
     overall: number;
     naming: number;

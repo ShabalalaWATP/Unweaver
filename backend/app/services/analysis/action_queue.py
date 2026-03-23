@@ -57,6 +57,7 @@ class ActionQueue:
     # Actions considered deterministic and safe to auto-approve above the
     # configured threshold.
     DETERMINISTIC_ACTIONS: Set[str] = {
+        "profile_workspace",
         "detect_language",
         "fingerprint_obfuscation",
         "extract_strings",
@@ -113,6 +114,21 @@ class ActionQueue:
             if s == ActionStatus.FAILED
         )
 
+    def failure_streak(self, action_name: str) -> int:
+        """Return the trailing run of failed attempts for *action_name*.
+
+        This is more useful than total historical failures when deciding
+        whether an action should be retried later after other transforms
+        have changed the code shape.
+        """
+        streak = 0
+        for status in reversed(self._ledger.get(action_name, [])):
+            if status == ActionStatus.FAILED:
+                streak += 1
+                continue
+            break
+        return streak
+
     def success_count(self, action_name: str) -> int:
         return sum(
             1 for s in self._ledger.get(action_name, [])
@@ -129,7 +145,7 @@ class ActionQueue:
         """Return True if the action has hit its global attempt or failure cap."""
         if self.total_attempts(action_name) >= self._max_global_attempts:
             return True
-        if self.failure_count(action_name) >= 2:  # default max_attempts
+        if self.failure_streak(action_name) >= 2:  # default max_attempts
             return True
         return False
 
@@ -157,8 +173,9 @@ class ActionQueue:
         if self.total_attempts(action_name) >= self._max_global_attempts:
             return False
 
-        # Consecutive-failure cap.
-        if self.failure_count(action_name) >= max_attempts:
+        # Consecutive-failure cap. Historical failures should not permanently
+        # suppress an action after a later success or code-shape change.
+        if self.failure_streak(action_name) >= max_attempts:
             return False
 
         # Duplicate-pending guard.

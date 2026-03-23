@@ -221,6 +221,17 @@ class StateManager:
     def set_summary(self, summary: str) -> None:
         self.state.analysis_summary = summary
 
+    def merge_workspace_context(self, context: Dict[str, Any]) -> None:
+        """Merge structured workspace metadata into analysis state."""
+        if not context:
+            return
+        merged = dict(self.state.workspace_context)
+        for key, value in context.items():
+            if value in (None, "", [], {}):
+                continue
+            merged[key] = value
+        self.state.workspace_context = merged
+
     # ------------------------------------------------------------------
     #  Snapshot & rollback
     # ------------------------------------------------------------------

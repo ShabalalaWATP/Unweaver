@@ -1,8 +1,9 @@
 """
 Export endpoints.
 
-Generate downloadable reports in Markdown or JSON format for a sample's
-analysis results.
+Generate downloadable reports and recovered artifacts for a sample's
+analysis results. Workspace bundle samples can be exported as reconstructed
+zip archives.
 """
 
 from __future__ import annotations
@@ -20,6 +21,10 @@ from app.models.db_models import (
     Sample,
     StringRecord,
     TransformHistory,
+)
+from app.services.ingest.workspace_bundle import (
+    build_workspace_archive,
+    pick_workspace_bundle_text,
 )
 from app.services.reports.json_report import generate_json_report
 from app.services.reports.markdown import generate_markdown_report
@@ -136,19 +141,46 @@ async def _gather_report_data(
     }
 
 
+def _pick_workspace_bundle_text(sample: Sample) -> str | None:
+    """Choose the best bundle text available for workspace export."""
+    return pick_workspace_bundle_text(sample.recovered_text, sample.original_text)
+
+
 # ── GET /api/samples/{id}/export/deobfuscated ───────────────────────
 @router.get("/samples/{sample_id}/export/deobfuscated")
 async def export_deobfuscated(
     sample_id: str,
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Download the deobfuscated / recovered code as a standalone file."""
+    """Download the deobfuscated / recovered code as text or a workspace zip."""
     sample = await db.get(Sample, sample_id)
     if sample is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Sample {sample_id} not found",
         )
+    original_name = sample.filename or "sample.txt"
+    if sample.language == "workspace":
+        bundle_text = _pick_workspace_bundle_text(sample)
+        if not bundle_text:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No reconstructed workspace bundle available for export.",
+            )
+        archive_bytes = build_workspace_archive(bundle_text)
+        if original_name.lower().endswith(".zip"):
+            download_name = f"deobfuscated_{original_name}"
+        else:
+            stem = original_name.rsplit(".", 1)[0]
+            download_name = f"deobfuscated_{stem}.zip"
+        return Response(
+            content=archive_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{download_name}"',
+            },
+        )
+
     recovered = sample.recovered_text
     if not recovered:
         raise HTTPException(
@@ -156,10 +188,7 @@ async def export_deobfuscated(
             detail="No deobfuscated output available — run analysis first.",
         )
 
-    # Build a filename: prefix "deobfuscated_" to the original filename.
-    original_name = sample.filename or "sample.txt"
     download_name = f"deobfuscated_{original_name}"
-
     return Response(
         content=recovered,
         media_type="text/plain; charset=utf-8",

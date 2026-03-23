@@ -2,7 +2,8 @@
 Sample management endpoints.
 
 Samples are individual obfuscated code files or text snippets that live
-inside a project.  They can be uploaded as files or pasted directly.
+inside a project. They can be uploaded as single files, codebase archives,
+or pasted directly.
 """
 
 from __future__ import annotations
@@ -37,6 +38,14 @@ from app.models.schemas import (
     SampleDetail,
     SampleResponse,
 )
+from app.services.ingest.workspace_bundle import (
+    WorkspaceBundleError,
+    build_workspace_bundle,
+    extract_workspace_context,
+    is_archive_upload,
+    truncate_workspace_bundle,
+    workspace_context_prompt,
+)
 from app.services.llm.client import LLMClient, _MAX_TOKENS_MAP
 
 logger = logging.getLogger(__name__)
@@ -52,8 +61,8 @@ class _PasteBody(BaseModel):
 
 router = APIRouter(tags=["samples"])
 
-# Maximum file size (5 MB)
 _MAX_FILE_SIZE = settings.MAX_FILE_SIZE
+_MAX_ARCHIVE_FILE_SIZE = settings.MAX_ARCHIVE_FILE_SIZE
 
 # Characters allowed in sanitised filenames
 _SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9._-]")
@@ -83,7 +92,7 @@ async def upload_sample(
     language: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
 ) -> Sample:
-    """Upload an obfuscated code file as a new sample."""
+    """Upload a code file or codebase archive as a new sample."""
     # Verify project exists
     project = await db.get(Project, project_id)
     if project is None:
@@ -92,33 +101,53 @@ async def upload_sample(
             detail=f"Project {project_id} not found",
         )
 
-    # Read file with size check
+    # Read file once, then branch based on whether this is a code archive.
     content_bytes = await file.read()
-    if len(content_bytes) > _MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File exceeds maximum size of {_MAX_FILE_SIZE // (1024 * 1024)} MB",
-        )
-
     if len(content_bytes) == 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Uploaded file is empty",
         )
 
-    # Decode to text
-    try:
-        original_text = content_bytes.decode("utf-8")
-    except UnicodeDecodeError:
+    safe_name = _sanitize_filename(file.filename or "upload.txt")
+    archive_upload = is_archive_upload(safe_name, content_bytes)
+    size_limit = _MAX_ARCHIVE_FILE_SIZE if archive_upload else _MAX_FILE_SIZE
+    if len(content_bytes) > size_limit:
+        limit_mb = size_limit // (1024 * 1024)
+        kind = "Archive" if archive_upload else "File"
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"{kind} exceeds maximum size of {limit_mb} MB",
+        )
+
+    sample_language = language
+    if archive_upload:
         try:
-            original_text = content_bytes.decode("latin-1")
-        except UnicodeDecodeError:
+            bundle = build_workspace_bundle(
+                filename=safe_name,
+                content_bytes=content_bytes,
+                max_bundle_chars=settings.MAX_BUNDLED_SOURCE_SIZE,
+                max_member_bytes=settings.MAX_ARCHIVE_MEMBER_SIZE,
+                max_files=settings.MAX_ARCHIVE_FILES,
+            )
+        except WorkspaceBundleError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="File could not be decoded as UTF-8 or Latin-1 text",
+                detail=str(exc),
             )
-
-    safe_name = _sanitize_filename(file.filename or "upload.txt")
+        original_text = bundle.bundle_text
+        sample_language = bundle.language
+    else:
+        try:
+            original_text = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                original_text = content_bytes.decode("latin-1")
+            except UnicodeDecodeError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="File could not be decoded as UTF-8 or Latin-1 text",
+                )
 
     # Optionally persist the raw file to disk
     upload_dir = settings.ensure_upload_dir()
@@ -136,7 +165,7 @@ async def upload_sample(
         project_id=project_id,
         filename=safe_name,
         original_text=original_text,
-        language=language,
+        language=sample_language,
     )
     db.add(sample)
     await db.flush()
@@ -593,14 +622,21 @@ async def generate_summary(
     failed_transforms = [t for t in transforms if not t.success]
     reverted_transforms = [t for t in transforms if t.retry_revert]
 
-    original_snippet = (sample.original_text or "")[:2000]
-    recovered_snippet = (sample.recovered_text or "")[:2000]
+    original_text = sample.original_text or ""
+    recovered_text = sample.recovered_text or ""
+    original_snippet = truncate_workspace_bundle(original_text, 2000)
+    recovered_snippet = truncate_workspace_bundle(recovered_text, 2000)
+    workspace_summary = workspace_context_prompt(original_text)
+    workspace_context_section = (
+        f"Workspace context:\n{workspace_summary}\n\n" if workspace_summary else ""
+    )
 
     context = (
         f"Filename: {sample.filename}\n"
         f"Language: {sample.language or 'unknown'}\n"
-        f"Original code length: {len(sample.original_text or '')} chars\n"
-        f"Recovered code length: {len(sample.recovered_text or '')} chars\n\n"
+        f"Original code length: {len(original_text)} chars\n"
+        f"Recovered code length: {len(recovered_text)} chars\n\n"
+        f"{workspace_context_section}"
         f"Detected obfuscation techniques: {detected_techniques}\n\n"
         f"Transform results: {len(success_transforms)} successful, "
         f"{len(reverted_transforms)} reverted, {len(failed_transforms)} failed\n"
@@ -630,11 +666,17 @@ async def generate_summary(
 
     if provider is None:
         # No LLM available — generate a basic summary from data
+        workspace_context = extract_workspace_context(original_text)
         summary_parts = [
             f"Analysis of {sample.filename} ({sample.language or 'unknown'} code).",
             f"\nDeobfuscation applied {len(success_transforms)} successful transform(s) "
             f"across {len(transforms)} total attempt(s).",
         ]
+        if workspace_context:
+            summary_parts.append(
+                f"\nWorkspace bundle included {workspace_context.get('included_files') or 0} "
+                f"prioritized file(s) from {workspace_context.get('archive_name') or sample.filename}."
+            )
         if detected_techniques:
             summary_parts.append(
                 f"\nDetected techniques: {', '.join(detected_techniques)}."

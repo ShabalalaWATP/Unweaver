@@ -5,9 +5,18 @@ interface FileUploadProps {
   onUpload: (file: File) => void | Promise<void>;
   onClose: () => void;
   maxSizeMB?: number;
+  maxArchiveSizeMB?: number;
 }
 
-const MAX_SIZE_DEFAULT = 5; // 5 MB
+const MAX_SIZE_DEFAULT = 5; // 5 MB for single files
+const MAX_ARCHIVE_SIZE_DEFAULT = 25; // 25 MB for compressed archives
+const ACCEPTED_FILE_TYPES = [
+  '.zip', '.tar', '.tgz', '.gz',
+  '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+  '.py', '.ps1', '.psm1', '.psd1',
+  '.vbs', '.vb', '.cs', '.java', '.php', '.rb', '.go', '.rs',
+  '.sh', '.bat', '.cmd', '.json', '.yaml', '.yml', '.xml', '.txt',
+].join(',');
 
 const s = {
   overlay: {
@@ -155,10 +164,22 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function isArchiveFile(file: File): boolean {
+  const name = file.name.toLowerCase();
+  return (
+    name.endsWith('.zip')
+    || name.endsWith('.tar')
+    || name.endsWith('.tgz')
+    || name.endsWith('.tar.gz')
+    || name.endsWith('.gz')
+  );
+}
+
 export default function FileUpload({
   onUpload,
   onClose,
   maxSizeMB = MAX_SIZE_DEFAULT,
+  maxArchiveSizeMB = MAX_ARCHIVE_SIZE_DEFAULT,
 }: FileUploadProps) {
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -167,15 +188,19 @@ export default function FileUpload({
 
   const validateFile = useCallback(
     (f: File): boolean => {
-      const maxBytes = maxSizeMB * 1024 * 1024;
+      const archive = isArchiveFile(f);
+      const allowedMb = archive ? maxArchiveSizeMB : maxSizeMB;
+      const maxBytes = allowedMb * 1024 * 1024;
       if (f.size > maxBytes) {
-        setError(`File too large. Maximum size is ${maxSizeMB} MB.`);
+        setError(
+          `${archive ? 'Archive' : 'File'} too large. Maximum size is ${allowedMb} MB.`,
+        );
         return false;
       }
       setError(null);
       return true;
     },
-    [maxSizeMB],
+    [maxArchiveSizeMB, maxSizeMB],
   );
 
   const handleDrop = useCallback(
@@ -218,7 +243,7 @@ export default function FileUpload({
     <div style={s.overlay} onClick={onClose}>
       <div style={s.modal} onClick={(e) => e.stopPropagation()}>
         <div style={s.header}>
-          <span style={s.title}>Upload Sample</span>
+          <span style={s.title}>Upload Sample or Codebase</span>
           <button style={s.closeBtn} onClick={onClose}>
             <X size={16} />
           </button>
@@ -236,13 +261,16 @@ export default function FileUpload({
           >
             <Upload size={28} style={s.icon} />
             <div style={s.instruction}>
-              {dragging ? 'Drop file here' : 'Drag & drop a file or click to browse'}
+              {dragging ? 'Drop file or archive here' : 'Drag & drop a file or archive'}
             </div>
-            <div style={s.hint}>Max {maxSizeMB} MB</div>
+            <div style={s.hint}>
+              Code files up to {maxSizeMB} MB, archives up to {maxArchiveSizeMB} MB
+            </div>
           </div>
           <input
             ref={inputRef}
             type="file"
+            accept={ACCEPTED_FILE_TYPES}
             style={{ display: 'none' }}
             onChange={handleFileSelect}
           />

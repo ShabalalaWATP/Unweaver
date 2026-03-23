@@ -33,6 +33,10 @@ class Settings(BaseSettings):
         "uploads",
     )
     MAX_FILE_SIZE: int = 5 * 1024 * 1024  # 5 MB
+    MAX_ARCHIVE_FILE_SIZE: int = 25 * 1024 * 1024  # 25 MB compressed upload
+    MAX_ARCHIVE_MEMBER_SIZE: int = 768 * 1024  # 768 KB per extracted text file
+    MAX_BUNDLED_SOURCE_SIZE: int = 8 * 1024 * 1024  # 8 MB synthetic workspace text
+    MAX_ARCHIVE_FILES: int = 80
 
     # ── Iterative analysis loop ─────────────────────────────────────────
     MAX_ITERATIONS: int = 20

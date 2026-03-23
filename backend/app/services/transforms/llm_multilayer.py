@@ -47,6 +47,8 @@ Return your answer as JSON:
 ```
 
 If you cannot fully unwrap, provide as much partial progress as possible.
+- If the input is a workspace bundle with <<<FILE ...>>> markers, preserve the
+  file markers and focus on the most suspicious file blocks first.
 """
 
 
@@ -64,11 +66,8 @@ class LLMMultiLayerUnwrapper(LLMTransform):
     ) -> List[Dict[str, str]]:
         truncated = self.truncate_code(code)
         lang = language or state.get("language", "unknown")
-
-        techniques = state.get("detected_techniques", [])
-        context = f"Language: {lang}"
-        if techniques:
-            context += f"\nKnown techniques: {', '.join(techniques[:10])}"
+        context = self.build_state_context(state)
+        workspace = self.build_workspace_context(code)
 
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -76,8 +75,12 @@ class LLMMultiLayerUnwrapper(LLMTransform):
                 "role": "user",
                 "content": (
                     f"Detect and unwrap any layered obfuscation.\n\n"
+                    f"Declared language: {lang}\n"
                     f"{context}\n\n"
+                    + (f"Workspace context:\n{workspace}\n\n" if workspace else "")
+                    + (
                     f"```\n{truncated}\n```"
+                    )
                 ),
             },
         ]
@@ -104,10 +107,17 @@ class LLMMultiLayerUnwrapper(LLMTransform):
 
         # Use the unwrapped code if it looks valid.
         use_unwrapped = False
+        validation: Dict[str, Any] = {
+            "accepted": False,
+            "issues": [],
+            "delimiter_balance_ok": False,
+            "syntax_ok": None,
+        }
         if unwrapped and len(unwrapped.strip()) >= 10:
             # Sanity check: unwrapped should be different from input.
             if unwrapped.strip() != code.strip():
-                use_unwrapped = True
+                validation = self.validate_candidate_code(code, unwrapped, language)
+                use_unwrapped = validation["accepted"]
 
         # Extract techniques from layers for the state.
         detected_techniques = [
@@ -135,6 +145,7 @@ class LLMMultiLayerUnwrapper(LLMTransform):
                 "detected_techniques": detected_techniques,
                 "fully_unwrapped": use_unwrapped,
                 "notes": notes[:500],
+                "validation": validation,
                 "decoded_strings": [
                     {"encoded": "layered", "decoded": p[:500]}
                     for p in hidden_payloads[:5]

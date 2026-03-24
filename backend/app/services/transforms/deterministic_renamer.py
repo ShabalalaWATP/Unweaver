@@ -55,7 +55,31 @@ KEYWORDS: frozenset[str] = frozenset({
 
 _CONVENTIONAL_SHORT: frozenset[str] = frozenset({
     "i", "j", "k", "x", "y", "z", "n", "e", "f", "m", "s", "t", "w", "h",
+    "a", "b", "c", "d", "p", "q", "r", "v",
     "_",
+})
+
+# ---------------------------------------------------------------------------
+# Common abbreviations that should NOT be renamed
+# These are legitimate short variable/function names used by real developers
+# ---------------------------------------------------------------------------
+
+_COMMON_ABBREVIATIONS: frozenset[str] = frozenset({
+    # Standard library / builtins
+    "str", "int", "len", "max", "min", "abs", "sum", "map", "err",
+    "buf", "ptr", "idx", "ctx", "obj", "arg", "val", "key", "src",
+    "dst", "tmp", "msg", "cmd", "req", "res", "ret", "ref", "fmt",
+    "cfg", "env", "pos", "dir", "fn", "cb", "fd", "fs", "db", "io",
+    # Common C/system names
+    "strlen", "strcmp", "strcpy", "strcat", "memcpy", "malloc", "free",
+    "printf", "sprintf", "fprintf", "scanf", "fopen", "fclose", "fread",
+    # Common web / JS names
+    "xhr", "dom", "url", "uri", "api", "img", "svg", "div", "btn",
+    "nav", "css", "html", "jsx", "tsx", "doc", "win", "nav",
+    # Common Python names
+    "cls", "pkg", "sys", "pid", "uid", "gid", "cwd",
+    # PowerShell
+    "wmi", "adsi", "cli",
 })
 
 # ---------------------------------------------------------------------------
@@ -301,6 +325,10 @@ class DeterministicRenamer(BaseTransform):
                         continue
 
                 if name in KEYWORDS:
+                    continue
+
+                # Skip common abbreviations (legitimate short names)
+                if name.lower() in _COMMON_ABBREVIATIONS:
                     continue
 
                 # Minimum-occurrence gate (applies to all patterns)

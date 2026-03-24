@@ -108,12 +108,62 @@ class ReflectionResolver(BaseTransform):
             or _PS_SCRIPTBLOCK_RE.search(code)
             or _PY_GETATTR_IMPORT_RE.search(code)
             or _PY_GLOBALS_CALL_RE.search(code)
+            # Also detect concatenated string arguments in reflection calls
+            or re.search(
+                r"""(?:GetMethod|GetType|CreateInstance|__import__|getattr)\s*\(\s*['"][^'"]*['"]\s*\+""",
+                code, re.IGNORECASE,
+            )
+            # String.Concat / [string]::Concat
+            or re.search(
+                r"""(?:\[string\]::|\bString\.)Concat\s*\(""",
+                code, re.IGNORECASE,
+            )
         )
 
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
         resolutions: List[Dict[str, Any]] = []
         new_code = code
         techniques: List[str] = []
+
+        # Pre-process: resolve concatenated string arguments in reflection calls
+        # Pattern: GetMethod("Down" + "load" + "String") → GetMethod("DownloadString")
+        concat_in_call = re.compile(
+            r"""(GetMethod|GetType|CreateInstance|__import__|getattr)\s*\(\s*"""
+            r"""((?:['"][^'"]*['"]\s*\+\s*)*['"][^'"]*['"])\s*\)""",
+            re.IGNORECASE,
+        )
+        for m in concat_in_call.finditer(new_code):
+            concat_expr = m.group(2)
+            # Extract and join all string parts
+            parts = re.findall(r"""['"]([^'"]*)['"]""", concat_expr)
+            if len(parts) > 1:
+                joined = "".join(parts)
+                original = m.group(0)
+                resolved = f'{m.group(1)}("{joined}")'
+                new_code = new_code.replace(original, resolved)
+                resolutions.append({
+                    "pattern": "concatenated_string",
+                    "original": original[:120],
+                    "resolved": resolved[:200],
+                })
+                techniques.append("string_concatenation")
+
+        # Also handle: [string]::Concat("Down","load") or String.Concat(...)
+        string_concat_re = re.compile(
+            r"""(?:\[string\]::|\bString\.)Concat\s*\(\s*"""
+            r"""((?:['"][^'"]*['"]\s*,\s*)*['"][^'"]*['"])\s*\)""",
+            re.IGNORECASE,
+        )
+        for m in string_concat_re.finditer(new_code):
+            parts = re.findall(r"""['"]([^'"]*)['"]""", m.group(1))
+            if parts:
+                joined = "".join(parts)
+                new_code = new_code.replace(m.group(0), f'"{joined}"')
+                resolutions.append({
+                    "pattern": "String.Concat",
+                    "resolved": joined[:200],
+                })
+                techniques.append("string_concatenation")
 
         # .NET: Type.GetMethod("M").Invoke(...)
         for m in _GETMETHOD_INVOKE_RE.finditer(new_code):

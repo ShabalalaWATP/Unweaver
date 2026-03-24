@@ -442,17 +442,45 @@ class StringDecryptor(BaseTransform):
                 "lang": "py",
             })
 
-        # Filter to likely decryption functions
+        # Filter to likely decryption functions with stricter false-positive prevention
+        # Common utility function names that should NOT be treated as decryptors
+        _UTILITY_NAMES = frozenset({
+            "format", "replace", "trim", "strip", "join", "split", "concat",
+            "toString", "valueOf", "stringify", "parse", "encode", "log",
+            "print", "render", "display", "show", "hide", "toggle",
+            "init", "setup", "configure", "validate", "sanitize", "escape",
+            "serialize", "deserialize", "transform", "convert", "normalize",
+            "sort", "filter", "reduce", "find", "indexOf", "includes",
+            "startsWith", "endsWith", "slice", "splice", "push", "pop",
+            "shift", "unshift", "map", "forEach", "keys", "values",
+        })
+
         decrypt_funcs: list[dict[str, Any]] = []
         for cand in candidates:
             body_lower = cand["body"].lower()
-            has_keyword = any(kw in body_lower for kw in _DECRYPT_BODY_KEYWORDS)
+
+            # Skip common utility function names
+            if cand["name"] in _UTILITY_NAMES:
+                continue
+
+            keyword_count = sum(1 for kw in _DECRYPT_BODY_KEYWORDS if kw in body_lower)
             has_xor = bool(_XOR_IN_BODY.search(cand["body"]))
             call_count = _count_literal_calls(code, cand["name"])
             name_looks_obfuscated = bool(_OBFUSCATED_NAME.match(cand["name"]))
 
-            # Must have at least one decrypt-like indicator
-            if not (has_keyword or has_xor):
+            # Require MULTIPLE indicators to reduce false positives:
+            # - At least 2 decrypt keywords, OR 1 keyword + XOR, OR obfuscated name + keyword
+            indicators = 0
+            if keyword_count >= 2:
+                indicators += 1
+            if has_xor:
+                indicators += 1
+            if name_looks_obfuscated:
+                indicators += 1
+            if keyword_count >= 1 and (has_xor or name_looks_obfuscated):
+                indicators += 1
+
+            if indicators < 1:
                 continue
 
             # Must be called frequently OR have an obfuscated name
@@ -461,8 +489,12 @@ class StringDecryptor(BaseTransform):
 
             patterns = _classify_body(cand["body"])
             if not patterns:
-                # Body has keywords but we can't classify -- still track it
-                patterns = ["unknown"]
+                # Body has keywords but we can't classify — only flag if
+                # the function name is obfuscated (strong signal)
+                if name_looks_obfuscated:
+                    patterns = ["unknown"]
+                else:
+                    continue
 
             cand["patterns"] = patterns
             cand["call_count"] = call_count

@@ -93,10 +93,31 @@ def _extract_bytes_from_string(text: str) -> bytes:
 
 
 def _printable_score(data: bytes) -> float:
-    """Fraction of bytes that are printable ASCII (0x20-0x7E) or common
-    whitespace."""
+    """Score bytes for human-readability, supporting both ASCII and UTF-8.
+
+    First tries to decode as UTF-8. If successful and the result contains
+    printable Unicode characters (Latin, CJK, Cyrillic, Arabic, etc.),
+    scores based on Unicode category. Falls back to ASCII-only scoring.
+    """
     if not data:
         return 0.0
+
+    # Try UTF-8 first for non-ASCII text (Chinese, Arabic, Cyrillic, etc.)
+    try:
+        text = data.decode("utf-8")
+        import unicodedata
+        printable = sum(
+            1 for c in text
+            if unicodedata.category(c)[0] in ("L", "N", "P", "S", "Z")
+            or c in "\n\r\t"
+        )
+        utf8_score = printable / max(len(text), 1)
+        if utf8_score > 0.5 and len(text) > 0:
+            return utf8_score
+    except (UnicodeDecodeError, ValueError):
+        pass
+
+    # Fallback: ASCII scoring
     printable = sum(
         1 for b in data
         if 0x20 <= b <= 0x7E or b in (0x09, 0x0A, 0x0D)

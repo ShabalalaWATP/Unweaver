@@ -131,22 +131,35 @@ def _extract_brace_block(code: str, start: int) -> tuple[str, int] | None:
     """Starting from *start* (which should point at an opening '{'),
     return (contents_between_braces, end_index_after_closing_brace).
 
+    String-aware: skips braces inside string literals to prevent
+    ``if(false) { var s = "}"; }`` from terminating on the wrong brace.
+
     Returns None if no balanced block is found.
     """
     if start >= len(code) or code[start] != "{":
         return None
-    depth = 0
-    i = start
-    while i < len(code):
+    depth = 1
+    i = start + 1
+    in_string: str | None = None
+    while i < len(code) and depth > 0:
         ch = code[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                # contents between the braces (exclusive)
-                return code[start + 1 : i], i + 1
+        if in_string:
+            # Inside a string — skip escaped characters
+            if ch == "\\" and i + 1 < len(code):
+                i += 2
+                continue
+            if ch == in_string:
+                in_string = None
+        else:
+            if ch in ('"', "'", "`"):
+                in_string = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
         i += 1
+    if depth == 0:
+        return code[start + 1 : i - 1], i
     return None
 
 

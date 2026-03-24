@@ -105,12 +105,32 @@ class JavaScriptArrayResolver(BaseTransform):
         output = code
         replacements: list[dict[str, Any]] = []
 
-        # 1. Find all array declarations
+        # 1. Find all array declarations — filter to obfuscation-like arrays only
         arrays: dict[str, list[str]] = {}
         for m in _ARRAY_DECL.finditer(code):
             var_name = m.group(1)
             strings = _extract_strings(m.group(2))
-            arrays[var_name] = strings
+
+            # Only target arrays that look like obfuscation tables:
+            # - Variable name matches obfuscated pattern (_0x..., _a, short etc.)
+            # - OR array has 5+ elements (obfuscation tables are large)
+            # - OR array is referenced by a rotation function
+            is_obfuscated_name = bool(re.match(
+                r"^(?:_0x[0-9a-fA-F]+|_[a-zA-Z0-9]{1,4}|[a-zA-Z]{1,2}\d+)$",
+                var_name,
+            ))
+            is_large_table = len(strings) >= 5
+            has_rotation_ref = bool(re.search(
+                r"\.push\s*\(\s*" + re.escape(var_name) + r"\.shift",
+                code,
+            ))
+            has_wrapper_ref = bool(re.search(
+                r"return\s+" + re.escape(var_name) + r"\s*\[",
+                code,
+            ))
+
+            if is_obfuscated_name or is_large_table or has_rotation_ref or has_wrapper_ref:
+                arrays[var_name] = strings
 
         if not arrays:
             return TransformResult(
@@ -120,14 +140,19 @@ class JavaScriptArrayResolver(BaseTransform):
                 description="No array-based obfuscation patterns found.",
             )
 
-        # 2. Check for rotation functions
+        # 2. Check for rotation functions (handle chained/multiple rotations)
+        rotation_applied: dict[str, int] = {}  # track total rotation per array
         for m in _ROTATION_FUNC.finditer(code):
             target_arr = m.group(3)
             rotation_count = _parse_int(m.group(4))
             if target_arr in arrays:
-                arrays[target_arr] = _rotate_array(
-                    arrays[target_arr], rotation_count
-                )
+                total = rotation_applied.get(target_arr, 0) + rotation_count
+                rotation_applied[target_arr] = total
+
+        # Apply cumulative rotations
+        for arr_name, total_rotation in rotation_applied.items():
+            if arr_name in arrays:
+                arrays[arr_name] = _rotate_array(arrays[arr_name], total_rotation)
 
         # 3. Find wrapper functions
         wrappers: dict[str, tuple[str, int]] = {}  # func_name -> (array_name, offset)

@@ -186,27 +186,74 @@ def _try_rc4_decrypt(key: bytes, data: bytes) -> Optional[str]:
 
 
 def _extract_keys(code: str) -> List[Tuple[str, bytes]]:
-    """Extract potential encryption keys from code."""
+    """Extract potential encryption keys from code.
+
+    Now also tries:
+    - Cross-variable assembly: key = part1 + part2
+    - Passphrase-based derivation: SHA-256/MD5 hash of a password string
+    - Raw string keys (password-based encryption)
+    """
     keys: List[Tuple[str, bytes]] = []
     seen: set = set()
 
+    # Direct hex key literals
     for m in _HEX_KEY_RE.finditer(code):
         raw = _hex_to_bytes(m.group(1))
         if raw not in seen and len(raw) in (16, 24, 32):
             keys.append(("hex", raw))
             seen.add(raw)
 
+    # Byte array keys
     for m in _BYTE_KEY_RE.finditer(code):
         raw = _byte_array_to_bytes(m.group(1))
         if raw not in seen and len(raw) in (16, 24, 32):
             keys.append(("byte_array", raw))
             seen.add(raw)
 
+    # Base64 key literals
     for m in _B64_KEY_RE.finditer(code):
         raw = _b64_to_bytes(m.group(1))
         if raw and raw not in seen and len(raw) in (16, 24, 32):
             keys.append(("base64", raw))
             seen.add(raw)
+
+    # Cross-variable hex key assembly: key = "1234" + "5678" + ...
+    concat_key_re = re.compile(
+        r"""(?:key|secret|password|aes_?key)\s*[=:]\s*"""
+        r"""["']([0-9a-fA-F]+)["']\s*\+\s*["']([0-9a-fA-F]+)["']"""
+        r"""(?:\s*\+\s*["']([0-9a-fA-F]+)["'])?"""
+        r"""(?:\s*\+\s*["']([0-9a-fA-F]+)["'])?""",
+        re.IGNORECASE,
+    )
+    for m in concat_key_re.finditer(code):
+        combined = "".join(g for g in m.groups() if g)
+        if len(combined) in (32, 48, 64):  # 16, 24, or 32 bytes
+            raw = _hex_to_bytes(combined)
+            if raw not in seen:
+                keys.append(("concat_hex", raw))
+                seen.add(raw)
+
+    # Passphrase-based key derivation: derive keys from password strings
+    # Common pattern: key = hashlib.sha256(password).digest()[:16]
+    pass_re = re.compile(
+        r"""(?:password|passphrase|secret|passwd)\s*[=:]\s*["']([^'"]{4,64})["']""",
+        re.IGNORECASE,
+    )
+    for m in pass_re.finditer(code):
+        passphrase = m.group(1).encode("utf-8")
+        import hashlib
+        # Try SHA-256 truncated to 16/32 bytes (most common)
+        sha256 = hashlib.sha256(passphrase).digest()
+        for key_len in (16, 32):
+            derived = sha256[:key_len]
+            if derived not in seen:
+                keys.append(("sha256_derived", derived))
+                seen.add(derived)
+        # Try MD5 (16 bytes, common in older malware)
+        md5 = hashlib.md5(passphrase).digest()
+        if md5 not in seen:
+            keys.append(("md5_derived", md5))
+            seen.add(md5)
 
     return keys
 
@@ -232,10 +279,16 @@ class CryptoDecryptor(BaseTransform):
     def can_apply(self, code: str, language: str, state: dict) -> bool:
         if not code or len(code) < 20:
             return False
-        return bool(
-            _CRYPTO_CONTEXT_RE.search(code)
-            and (_HEX_KEY_RE.search(code) or _BYTE_KEY_RE.search(code) or _B64_KEY_RE.search(code))
+        if not _CRYPTO_CONTEXT_RE.search(code):
+            return False
+        # Check for any key source: hex, byte array, base64, or passphrase
+        has_key = bool(
+            _HEX_KEY_RE.search(code)
+            or _BYTE_KEY_RE.search(code)
+            or _B64_KEY_RE.search(code)
+            or re.search(r'(?:password|passphrase|secret|passwd)\s*[=:]\s*["\']', code, re.IGNORECASE)
         )
+        return has_key
 
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
         keys = _extract_keys(code)

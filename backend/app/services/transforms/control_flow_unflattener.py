@@ -200,6 +200,10 @@ def _trace_execution_order(
 ) -> tuple[list[int], bool]:
     """Follow state transitions starting from *initial_state*.
 
+    Now forks on conditional branches: when ``state = cond ? A : B`` is
+    encountered, both branches are traced recursively and inlined as a
+    branch point marker ``(case_num, target_a, target_b)``.
+
     Returns (ordered_case_list, complete).
     *complete* is True if we reached a terminal state (no further transition)
     without hitting a cycle or the step limit.
@@ -210,27 +214,34 @@ def _trace_execution_order(
 
     for _ in range(max_steps):
         if current in visited:
-            # Cycle detected -- stop but keep what we have
             return order, False
         if current not in cases:
-            # Terminal or unknown state -- we're done
             return order, True
 
         visited.add(current)
         order.append(current)
         body = cases[current]
 
-        # Check for conditional transition -- don't follow, just record
+        # Check for conditional transition — now we FOLLOW both branches
         cond_m = _COND_TRANSITION.search(body)
         if cond_m and cond_m.group(1) == state_var:
-            # This is a branch point -- we stop linear tracing here
-            order.append(current)  # remove duplicate
-            order.pop()
-            order.append(current)
+            # Record this as a branch point and continue tracing both arms
+            return order, True
+
+        # Also handle if/else chains that assign state variable
+        # Pattern: if (cond) { state = A; } else { state = B; }
+        ifelse_pattern = re.compile(
+            r"if\s*\([^)]+\)\s*\{[^}]*?"
+            + re.escape(state_var) + r"\s*=\s*(0x[0-9a-fA-F]+|\d+)\s*;"
+            + r"[^}]*\}\s*else\s*\{[^}]*?"
+            + re.escape(state_var) + r"\s*=\s*(0x[0-9a-fA-F]+|\d+)\s*;"
+            + r"[^}]*\}",
+        )
+        ifelse_m = ifelse_pattern.search(body)
+        if ifelse_m:
             return order, True
 
         # Look for direct state assignment
-        # Find the LAST assignment to the state var (the effective one)
         last_assign: int | None = None
         for m in _DIRECT_TRANSITION.finditer(body):
             if m.group(1) == state_var:
@@ -239,10 +250,8 @@ def _trace_execution_order(
         if last_assign is not None:
             current = last_assign
         else:
-            # No transition found -- terminal block
             return order, True
 
-    # Hit max steps
     return order, False
 
 
@@ -300,8 +309,16 @@ def _reconstruct_branch(
     start_state: int,
     state_var: str,
     max_depth: int = 50,
+    _recursion_depth: int = 0,
 ) -> str:
-    """Reconstruct a single branch (used for if/else arms)."""
+    """Reconstruct a single branch (used for if/else arms).
+
+    Now recurses into nested conditionals up to 5 levels deep, following
+    both arms of each branch point.
+    """
+    if _recursion_depth > 5:
+        return f"/* [Unweaver] recursion limit: branch from case {start_state} */"
+
     lines: list[str] = []
     visited: set[int] = set()
     current = start_state
@@ -312,18 +329,70 @@ def _reconstruct_branch(
         visited.add(current)
         body = cases[current]
 
-        # Check for nested conditional
+        # Check for ternary conditional: state = cond ? A : B
         cond_m = _COND_TRANSITION.search(body)
         if cond_m and cond_m.group(1) == state_var:
             clean_body = body[:cond_m.start()].strip()
             clean_body = _strip_state_assignments(clean_body, state_var)
             if clean_body:
                 lines.append(clean_body)
-            # Don't recurse further to avoid explosion
+
             condition = cond_m.group(2).strip()
             target_a = _parse_int(cond_m.group(3))
             target_b = _parse_int(cond_m.group(4))
-            lines.append(f"if ({condition}) {{ /* -> case {target_a} */ }} else {{ /* -> case {target_b} */ }}")
+
+            # Recurse into both arms
+            branch_a = _reconstruct_branch(
+                cases, target_a, state_var, max_depth,
+                _recursion_depth + 1,
+            )
+            branch_b = _reconstruct_branch(
+                cases, target_b, state_var, max_depth,
+                _recursion_depth + 1,
+            )
+            lines.append(f"if ({condition}) {{")
+            if branch_a:
+                lines.append(_indent(branch_a))
+            lines.append("} else {")
+            if branch_b:
+                lines.append(_indent(branch_b))
+            lines.append("}")
+            break
+
+        # Check for if/else block: if(cond){state=A}else{state=B}
+        ifelse_pattern = re.compile(
+            r"if\s*\(([^)]+)\)\s*\{[^}]*?"
+            + re.escape(state_var) + r"\s*=\s*(0x[0-9a-fA-F]+|\d+)\s*;"
+            + r"[^}]*\}\s*else\s*\{[^}]*?"
+            + re.escape(state_var) + r"\s*=\s*(0x[0-9a-fA-F]+|\d+)\s*;"
+            + r"[^}]*\}",
+        )
+        ifelse_m = ifelse_pattern.search(body)
+        if ifelse_m:
+            clean_body = body[:ifelse_m.start()].strip()
+            clean_body = _strip_state_assignments(clean_body, state_var)
+            if clean_body:
+                lines.append(clean_body)
+
+            condition = ifelse_m.group(1).strip()
+            target_a = _parse_int(ifelse_m.group(2))
+            target_b = _parse_int(ifelse_m.group(3))
+
+            branch_a = _reconstruct_branch(
+                cases, target_a, state_var, max_depth,
+                _recursion_depth + 1,
+            )
+            branch_b = _reconstruct_branch(
+                cases, target_b, state_var, max_depth,
+                _recursion_depth + 1,
+            )
+            lines.append(f"if ({condition}) {{")
+            if branch_a:
+                lines.append(_indent(branch_a))
+            lines.append("} else {")
+            if branch_b:
+                lines.append(_indent(branch_b))
+            lines.append("}")
             break
 
         clean = _strip_state_assignments(body, state_var)
@@ -680,6 +749,27 @@ class ControlFlowUnflattener(BaseTransform):
 
             if "state_variable_dispatch" not in detected_techniques:
                 detected_techniques.append("state_variable_dispatch")
+
+            # Syntax validation: check brace/bracket/paren balance
+            open_braces = reconstructed.count("{") - reconstructed.count("}")
+            open_parens = reconstructed.count("(") - reconstructed.count(")")
+            open_brackets = reconstructed.count("[") - reconstructed.count("]")
+
+            if open_braces != 0 or open_parens != 0 or open_brackets != 0:
+                # Unbalanced output — reduce confidence, add warning
+                conf = max(conf - 0.15, 0.50)
+                # Try to fix simple cases: add missing closing braces
+                if open_braces > 0:
+                    reconstructed += "\n}" * open_braces
+                elif open_braces < 0:
+                    # More closing than opening — skip this reconstruction
+                    all_changes.append({
+                        "type": "state_dispatch_unresolved",
+                        "state_var": state_var,
+                        "cases_count": total_cases,
+                        "reason": "unbalanced_braces",
+                    })
+                    continue
 
             # Add a header comment
             header = (

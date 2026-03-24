@@ -1,6 +1,6 @@
 # Unweaver
 
-An agentic code deobfuscation workbench for malware analysts and security researchers. Unweaver combines 28+ deterministic transforms with an LLM-assisted orchestration loop to iteratively recover readable source from obfuscated JavaScript, TypeScript, Python, PowerShell, and C#/.NET scripts.
+An agentic code deobfuscation workbench for malware analysts and security researchers. Unweaver combines 35+ deterministic transforms with an LLM-assisted orchestration loop to iteratively recover readable source from obfuscated JavaScript, TypeScript, Python, PowerShell, and C#/.NET scripts — including AES/RC4 decryption, rolling XOR recovery, Base32/Base85 decoding, reflection chain resolution, and multi-layer unwrapping (8+ nested encoding layers).
 
 Paste or upload hostile code, hit Analyse, and watch the multi-pass engine strip away obfuscation layers — without ever executing the code.
 
@@ -24,6 +24,7 @@ Paste or upload hostile code, hit Analyse, and watch the multi-pass engine strip
 - [API Reference](#api-reference)
 - [Demo Samples](#demo-samples)
 - [Testing](#testing)
+- [Air-Gapped Deployment](#air-gapped-deployment)
 - [Security Notes](#security-notes)
 - [Tech Stack](#tech-stack)
 
@@ -33,12 +34,14 @@ Paste or upload hostile code, hit Analyse, and watch the multi-pass engine strip
 
 Unweaver is a web application that takes obfuscated code (malware scripts, packed JS, encoded PowerShell, etc.) and automatically deobfuscates it through multiple passes. The engine:
 
-1. **Detects** the language and obfuscation techniques used (base64 encoding, hex encoding, string array rotation, control flow flattening, eval/exec wrapping, XOR encryption, junk code insertion, etc.)
-2. **Applies** deterministic transforms to decode, decrypt, and simplify the code — base64 decoding (up to 3 nested layers), hex decoding (5 formats), constant folding, control flow unflattening, junk code removal, XOR key recovery, variable renaming, and more
-3. **Uses AI** (optional) to plan which transforms to apply next, suggest variable names, and generate analysis summaries via any OpenAI-compatible LLM endpoint
-4. **Scores** each transform result — measuring readability, confidence, and string recovery — and automatically rolls back transforms that make the code worse
-5. **Extracts** IOCs (URLs, IPs, email addresses, file paths, registry keys, mutexes, hashes), strings, and security findings from the recovered code
-6. **Presents** results in a dark/light themed analyst workbench with a Monaco code editor, side-by-side diff viewer, AI-generated summary reports, and exportable Markdown/JSON reports
+1. **Detects** the language and obfuscation techniques used — fingerprints 10+ known obfuscator tools (javascript-obfuscator, JSFuck, JJEncode, PyArmor, Invoke-Obfuscation, ConfuserEx, SmartAssembly, etc.)
+2. **Decodes** multiple encoding layers — Base64 (8 nested layers, URL-safe), Base32, Base85/Ascii85, hex (5 formats), Unicode escapes, HTML entities, URL encoding, PowerShell EncodedCommand (UTF-16LE)
+3. **Decrypts** encrypted payloads — AES-CBC/ECB (128/192/256-bit), RC4, XOR (single-byte, multi-byte Kasiski, rolling/rotating, CBC-like chaining, crib-dragging with 12+ default cribs)
+4. **Simplifies** obfuscated code — constant folding, control flow unflattening (switch dispatcher + state machine tracing), junk code removal, JavaScript array resolver, .NET/PowerShell reflection chain resolution, Python pickle/marshal/zlib chain decoding
+5. **Uses AI** (optional) to classify obfuscation type, plan transform strategy with multi-turn refinement, select transforms intelligently, reflect on failures, assess confidence, rename variables semantically, and auto-generate analysis summaries
+6. **Scores** each result — blended heuristic + LLM confidence assessment (60/40), readability metrics, auto-rollback on regression, stall-resistant decode scheduling for multi-layer samples
+7. **Extracts** IOCs (URLs, IPs, emails, file paths, registry keys, mutexes, hashes), strings, and severity-ranked security findings with evidence linking
+8. **Presents** results in a dark/light analyst workbench — Monaco editor, per-file workspace browser with recovery summaries, per-file diffs, finding-to-code navigation, structured decision log, and auto-generated AI reports
 
 Everything happens statically — **no code is ever executed**.
 
@@ -61,8 +64,8 @@ Everything happens statically — **no code is ever executed**.
 +----------+-----------+-----------------------+
 | Transform|Orchestrator|   LLM Client         |
 | Pipeline | (agentic   |   (OpenAI-compatible) |
-| (28+     |  multi-    |   httpx async         |
-|  actions)|  pass)     |   auto max_tokens     |
+| (35+     |  multi-    |   context-window-aware|
+|  actions)|  pass)     |   dynamic budgeting   |
 +----------+-----------+-----------------------+
 |           SQLite (aiosqlite)                 |
 |   projects - samples - transforms - IOCs     |
@@ -74,14 +77,14 @@ Everything happens statically — **no code is ever executed**.
 
 Each iteration of the analysis engine runs through:
 
-1. **Planner** — surveys the code, detects language and obfuscation techniques, recommends prioritised actions (LLM-assisted when available, deterministic fallback)
-2. **Action Selector** — feeds recommendations into a priority queue, pops the best action (deterministic transforms get a priority bonus)
+1. **Planner** — surveys the code, detects language and obfuscation techniques, recommends prioritised actions. LLM-assisted when available (multi-turn planning with refinement on stalls), deterministic fallback. On iteration 1, runs LLM obfuscation classification to identify the tool/technique and recommend a strategy.
+2. **Action Selector** — feeds recommendations into a priority queue, pops the best action. When LLM is available and 3+ candidates exist, asks the LLM to choose the most promising transform given current state and history.
 3. **Pre-flight Validator** — checks preconditions: language compatibility, input size, retry cap, conflict detection
-4. **Executor** — runs the selected transform in a thread executor (non-blocking)
+4. **Executor** — runs the selected transform in a thread executor (deterministic) or awaits async (LLM). Dynamic response token budgeting based on input size and task type.
 5. **Post-processor** — normalises output: strips BOM, removes control characters, normalises line endings, collapses blank lines
 6. **Verifier** — measures improvement via readability heuristics, string recovery, IOC extraction, and confidence delta
-7. **State Reconciler** — merges extracted data into canonical state; updates confidence, readability, and transform history; auto-rollback on regression
-8. **Stop Decision** — checks 7 termination conditions (budget exhausted, stall, confidence regression, consecutive failures, queue empty, sufficiency, manual stop)
+7. **State Reconciler** — merges extracted data into canonical state; updates confidence (blended 60% heuristic + 40% LLM assessment), readability, and transform history; auto-rollback on regression. Decode transforms that succeed don't count as stalls (multi-layer aware). On failure with stalling, triggers LLM reflection ("why did this fail? what should we try instead?").
+8. **Stop Decision** — checks 11 termination conditions including LLM consultation on borderline cases, readability plateau detection, and multi-layer stall resistance
 
 ---
 
@@ -90,14 +93,17 @@ Each iteration of the analysis engine runs through:
 | Category | Capabilities |
 |----------|-------------|
 | **Languages** | JavaScript, TypeScript, Python, PowerShell, C#/.NET — extensible |
-| **Deterministic transforms** | Base64 decoding (nested, 3 layers), hex decoding (5 formats), constant folding (`String.fromCharCode`, `chr()` lists), junk code removal, eval/exec detection, JavaScript array resolver, PowerShell `-EncodedCommand` decoder, Python `exec`/`codecs` decoder, XOR key recovery, control flow unflattening, string decryption, safe expression evaluation, deterministic variable renaming |
-| **LLM transforms** | LLM-powered deobfuscation, variable/function renaming, code summarisation, multi-layer analysis planning |
+| **Encoding transforms** | Base64 (8 nested layers, URL-safe variant), Base32 (standard + hex), Base85/Ascii85, hex (5 formats), Unicode escapes, octal, HTML entities, URL percent-encoding |
+| **Crypto transforms** | AES-CBC/ECB decryption (128/192/256-bit keys), RC4 decryption, XOR recovery (single-byte brute force, multi-byte Kasiski, rolling/rotating XOR, CBC-like chaining, crib-dragging), string decryption (ROT13, Caesar, reverse, charcode offset) |
+| **Code transforms** | Constant folding (`String.fromCharCode`, `chr()`, `parseInt`, `Math.*`), junk code removal (opaque predicates, unreachable code, no-ops), control flow unflattening (switch dispatcher, string-split, state machine tracing), JavaScript array resolver, safe expression evaluation, deterministic variable renaming |
+| **Language-specific** | PowerShell (`-EncodedCommand`, backtick/caret escapes, format strings, `-replace` chains), Python (`exec`/`codecs`/`chr()` sequences, pickle/marshal/zlib chain detection and safe string extraction), .NET/PowerShell reflection chain resolution (`GetMethod`+`Invoke`, `Activator.CreateInstance`, `Assembly.Load` chains, `[scriptblock]::Create`) |
+| **LLM transforms** | LLM-powered deobfuscation, variable/function renaming, code summarisation, multi-layer unwrapping, obfuscation classification, transform selection, failure reflection, confidence assessment, multi-turn planning |
 | **IOC extraction** | URLs, IPs (v4/v6), emails, file paths, registry keys, mutexes, hashes (MD5, SHA1, SHA256), defanged indicator support |
-| **Analysis engine** | Priority queue with auto-approve, per-iteration state snapshots with rollback, confidence tracking, stall detection, readability scoring, progress reporting |
-| **LLM integration** | OpenAI-compatible (OpenAI, Azure, vLLM, Ollama, LM Studio), auto-detects `max_tokens` vs `max_completion_tokens`, custom CA cert bundles, 128k/200k token presets, connection testing |
-| **UI** | Dark and light themes with smooth transitions, Monaco editor with syntax highlighting, side-by-side diff viewer, 9 workspace tabs, confidence gauge, transform timeline, analyst notes |
-| **AI Summary** | LLM-generated analysis reports covering obfuscation techniques, transforms applied, findings, and IOCs |
-| **Export** | Download deobfuscated code, Markdown reports, and JSON reports |
+| **Analysis engine** | Priority queue with auto-approve, per-iteration state snapshots with rollback, LLM-assessed confidence (60% heuristic / 40% LLM blend), stall-resistant decode scheduling, multi-layer re-decode (up to 5 re-runs per decoder), readability scoring, typed WebSocket events for real-time progress |
+| **LLM integration** | OpenAI-compatible (OpenAI, Azure, vLLM, Ollama, LM Studio), context-window-aware truncation (128K-200K), dynamic response token budgeting, `max_completion_tokens` default with `max_tokens` fallback, custom CA cert bundles, encrypted API key storage (Fernet AES-128-CBC + HMAC-SHA256) |
+| **UI** | Dark and light themes, Monaco editor with syntax highlighting, per-file workspace browser with recovery summaries, per-file diff viewer for workspace bundles, finding-to-code navigation, severity-filtered findings, structured decision log (Notebook tab), confidence gauge, analyst notes |
+| **AI Summary** | Auto-generated after analysis completes, few-shot calibrated prompts, structured sections (deobfuscation analysis, original intent, actual behavior, confidence assessment) |
+| **Export** | Download individual recovered files, full workspace as ZIP, Markdown reports, JSON reports |
 
 ---
 
@@ -320,6 +326,8 @@ All settings use the `UNWEAVER_` prefix. Place them in a `.env` file in the `bac
 | `UNWEAVER_DEBUG` | `false` | Enable debug mode |
 | `UNWEAVER_LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `UNWEAVER_DEFAULT_LLM_MAX_TOKENS` | `4096` | Default max tokens for LLM responses |
+| `UNWEAVER_CORS_ORIGINS` | `""` | Comma-separated CORS origins; `*` for allow-all; empty = localhost defaults |
+| `UNWEAVER_SECRET_KEY` | `""` | Fernet encryption key for API keys at rest; auto-generated if empty |
 
 Example `.env`:
 
@@ -451,7 +459,8 @@ All endpoints are under `/api`. Interactive docs at `/docs` (Swagger) and `/redo
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/samples/{id}/export/deobfuscated` | Download deobfuscated code |
+| `GET` | `/api/samples/{id}/export/deobfuscated` | Download deobfuscated code (text or ZIP for workspaces) |
+| `GET` | `/api/samples/{id}/export/file?path=...&source=recovered` | Download a single file from a workspace bundle |
 | `GET` | `/api/samples/{id}/export/markdown` | Download Markdown report |
 | `GET` | `/api/samples/{id}/export/json` | Download JSON report |
 
@@ -497,16 +506,200 @@ pytest -v
 pytest tests/test_transforms.py -v
 ```
 
-The suite covers 160+ tests across API endpoints, transform correctness, orchestrator logic, and LLM provider handling.
+The suite covers 198+ tests across API endpoints, transform correctness, orchestrator logic, and LLM provider handling.
+
+---
+
+## Air-Gapped Deployment
+
+Unweaver is designed to work in isolated, air-gapped environments with no internet access. All frontend assets (Monaco Editor, fonts, icons) are bundled locally with no CDN dependencies.
+
+### What works fully offline
+
+- All 30+ deterministic transforms (base64, hex, XOR, PowerShell, Python, constant folding, etc.)
+- File upload, paste, and workspace bundle analysis
+- IOC extraction, string extraction, findings generation
+- All 9 workspace tabs, diff viewer, export (JSON/Markdown)
+- SQLite database (zero external dependencies)
+- Dark/light theme, keyboard shortcuts
+
+### What requires a local LLM
+
+These features need an OpenAI-compatible API endpoint running on your network:
+
+- LLM-assisted deobfuscation transforms
+- LLM-assisted variable/function renaming
+- AI summary generation
+- LLM-driven stop decisions
+
+### Setting up a local LLM provider
+
+**Option 1: Ollama (recommended for simplicity)**
+
+```bash
+# On the air-gapped machine (pre-download the model on a connected machine first)
+ollama serve
+ollama run llama3.1:8b  # or any model you've transferred
+
+# In Unweaver settings, configure:
+#   Base URL: http://localhost:11434
+#   Model:    llama3.1:8b
+#   API Key:  (leave empty)
+```
+
+**Option 2: vLLM (recommended for performance)**
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model /path/to/model \
+  --port 8001
+
+# In Unweaver settings, configure:
+#   Base URL: http://localhost:8001
+#   Model:    (your model name)
+#   API Key:  (leave empty)
+```
+
+**Option 3: LM Studio**
+
+1. Download and install LM Studio on the air-gapped machine
+2. Load a model (GGUF format, transferred via USB/share)
+3. Start the local server (default port 1234)
+4. Configure in Unweaver: Base URL `http://localhost:1234`
+
+### Network and CORS configuration
+
+For air-gapped deployments where the server hostname is not `localhost`:
+
+```bash
+# Set CORS to allow all origins (safe on isolated networks)
+export UNWEAVER_CORS_ORIGINS="*"
+
+# Or specify your internal hostname
+export UNWEAVER_CORS_ORIGINS="http://analyst-workstation:3000,http://10.0.0.5:3000"
+```
+
+### API key encryption
+
+API keys are encrypted at rest using Fernet (AES-128-CBC + HMAC-SHA256). Set a persistent secret:
+
+```bash
+export UNWEAVER_SECRET_KEY="your-secret-key-here"
+```
+
+If no secret is set, a key is auto-generated and stored in `.unweaver_secret`.
+
+### Air-gapped setup WITHOUT Docker (pip + npm mirrors)
+
+When Docker is not available, transfer dependencies via USB/share:
+
+**Step 1: On a connected machine, download all dependencies**
+
+```bash
+# Clone the repo
+git clone https://github.com/ShabalalaWATP/Unweaver.git
+cd Unweaver
+
+# Download Python packages to a local directory
+cd backend
+pip download -r requirements.txt -d ./pip-packages/
+
+# Download npm packages (creates a tarball)
+cd ../frontend
+npm pack  # or use: npm install && tar czf node_modules.tar.gz node_modules/
+```
+
+**Step 2: Transfer to the air-gapped machine**
+
+Copy the entire `Unweaver/` directory including `backend/pip-packages/` and `frontend/node_modules.tar.gz` via USB, network share, or approved transfer media.
+
+**Step 3: Install on the air-gapped machine**
+
+```bash
+# Backend (Linux)
+cd backend
+python3 -m venv venv
+source venv/bin/activate
+pip install --no-index --find-links=./pip-packages/ -r requirements.txt
+
+# Backend (Windows)
+cd backend
+python -m venv venv
+.\venv\Scripts\Activate
+pip install --no-index --find-links=.\pip-packages\ -r requirements.txt
+
+# Frontend (both platforms)
+cd frontend
+tar xzf node_modules.tar.gz   # or copy node_modules/ directly
+npm run build                   # build production assets
+```
+
+**Step 4: Run**
+
+```bash
+# Backend
+cd backend
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# Frontend (serve production build)
+cd frontend
+npx serve dist -l 3000
+# Or use nginx to serve dist/ and proxy /api to :8000
+```
+
+### Using internal package mirrors
+
+If your air-gapped network has internal PyPI/npm mirrors:
+
+```bash
+# pip with internal mirror
+pip install -r requirements.txt --index-url https://pypi.internal.corp/simple/ --trusted-host pypi.internal.corp
+
+# npm with internal registry
+npm config set registry https://npm.internal.corp/
+npm install
+```
+
+### Docker deployment (air-gapped)
+
+Pre-build images on a connected machine, export, and transfer:
+
+```bash
+# On connected machine
+docker compose build
+docker save unweaver-backend unweaver-frontend | gzip > unweaver-images.tar.gz
+
+# On air-gapped machine
+docker load < unweaver-images.tar.gz
+UNWEAVER_CORS_ORIGINS="*" docker compose up
+```
+
+---
+
+## Supported Obfuscation Techniques
+
+| Category | Techniques | Max Layers |
+|----------|-----------|------------|
+| **Base64** | Standard, URL-safe (RFC 4648), nested, PowerShell UTF-16LE, wrapped (atob, b64decode, FromBase64String) | 8 per call, unlimited via re-decode |
+| **Base32/Base85** | Standard Base32, Hex Base32, Ascii85 (`<~ ~>`), Python b85/a85 | 8 |
+| **Hex** | `\x41`, `0x41,0x42`, `\u0041`, `%41`, hex streams, PS byte arrays | Unlimited |
+| **XOR** | Single-byte brute force (256 keys), multi-byte Kasiski (up to 16-byte keys), rolling/rotating (position XOR, increment, CBC-like), crib dragging (12+ cribs) | Unlimited |
+| **AES/RC4** | AES-CBC, AES-ECB (128/192/256-bit), RC4, CryptoJS patterns, .NET AesCryptoServiceProvider — keys extracted from hex literals, byte arrays, Base64 | 1 per call |
+| **String tricks** | String.fromCharCode, chr() lists, [char] concatenation, ROT13, Caesar, reverse, replace chains, backtick/caret escapes, format strings | Unlimited |
+| **Control flow** | Switch dispatcher (while+switch), string-split dispatch, state machine tracing (500 steps, 50 dispatchers), conditional branch resolution | 1 pass + re-run |
+| **Junk code** | Opaque predicates (always-true/false), unreachable code, no-ops, variable overwrites, empty blocks | Multi-pass |
+| **Reflection** | .NET GetMethod+Invoke, Assembly.Load chains, Activator.CreateInstance, PS GetType+Invoke, PS ScriptBlock.Create, Python getattr+__import__, globals() dict calls | 1 pass |
+| **Serialization** | Python pickle (safe string extraction without execution), marshal (detection), zlib+base64 chains (full decompression) | 1 pass |
+| **Tool signatures** | javascript-obfuscator, JJEncode, AAEncode, JSFuck, Dean Edwards Packer, PyArmor, Invoke-Obfuscation, ConfuserEx, SmartAssembly, Dotfuscator | Detection |
 
 ---
 
 ## Security Notes
 
 - **No code execution** — all analysis is static pattern matching, string decoding, and LLM inference
-- **API keys** are masked in all API responses (only last 4 characters visible)
+- **API keys** are encrypted at rest using Fernet symmetric encryption and masked in all API responses
 - **File uploads** are sanitised: filenames stripped of directory components, size capped at 5 MB
-- **CORS** is configured for local dev origins; restrict `allow_origins` in production
+- **CORS** is configurable via `UNWEAVER_CORS_ORIGINS` environment variable; defaults to localhost origins
 - **Custom CA certificates** supported for enterprise TLS inspection environments
 - **No secrets in logs** — API keys are masked in all log output
 
@@ -517,11 +710,12 @@ The suite covers 160+ tests across API endpoints, transform correctness, orchest
 | Layer | Technology |
 |-------|-----------|
 | Frontend | React 18, TypeScript, Vite, Monaco Editor, react-diff-viewer-continued, Lucide icons |
-| Backend | Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0 (async) |
+| Backend | Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0 (async), cryptography (Fernet + AES) |
 | Database | SQLite via aiosqlite (zero-config, single-file) |
-| LLM Client | httpx (async), OpenAI-compatible chat/completions protocol |
+| LLM Client | httpx (async), OpenAI-compatible chat/completions, context-window-aware, dynamic token budgeting |
+| Crypto | Fernet AES-128-CBC (API key encryption), AES-CBC/ECB + RC4 (payload decryption), pure-Python RC4 |
 | Styling | CSS custom properties with dark/light theme system |
-| Testing | pytest, pytest-asyncio, httpx AsyncClient |
+| Testing | pytest, pytest-asyncio, httpx AsyncClient (198+ tests) |
 | Containers | Docker, Docker Compose |
 
 ---

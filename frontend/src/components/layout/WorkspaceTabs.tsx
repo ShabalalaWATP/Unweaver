@@ -1,3 +1,4 @@
+import { useState, useCallback } from 'react';
 import {
   Code2, FileCheck, GitCompare, Type, Shield, History, AlertTriangle, BookOpen, FileText,
 } from 'lucide-react';
@@ -109,16 +110,26 @@ const s = {
 
 export default function WorkspaceTabs({ sample, analysisState, activeTab: activeTabProp, onTabChange }: WorkspaceTabsProps) {
   const activeTab = (activeTabProp ?? 'original') as TabId;
+  const [codeHighlight, setCodeHighlight] = useState<string | null>(null);
 
   const setActiveTab = (tab: TabId) => {
+    if (tab !== 'recovered') setCodeHighlight(null);
     onTabChange?.(tab);
   };
+
+  const handleNavigateToCode = useCallback((searchText: string) => {
+    setCodeHighlight(searchText);
+    setActiveTab('recovered');
+  }, []);
 
   // Count badges for data tabs
   const counts: Partial<Record<TabId, number>> = {};
   if (analysisState) {
     if (analysisState.strings?.length) counts.strings = analysisState.strings.length;
     if (analysisState.transform_history?.length) counts.transforms = analysisState.transform_history.length;
+  } else if (sample.saved_analysis) {
+    if (sample.saved_analysis.string_count) counts.strings = sample.saved_analysis.string_count;
+    if (sample.saved_analysis.transform_count) counts.transforms = sample.saved_analysis.transform_count;
   }
 
   const renderContent = () => {
@@ -128,7 +139,7 @@ export default function WorkspaceTabs({ sample, analysisState, activeTab: active
       case 'original':
         return <OriginalTab sample={sample} />;
       case 'recovered':
-        return <RecoveredTab sample={sample} />;
+        return <RecoveredTab sample={sample} highlightText={codeHighlight} />;
       case 'diff':
         return <DiffTab sample={sample} />;
       case 'strings':
@@ -138,7 +149,7 @@ export default function WorkspaceTabs({ sample, analysisState, activeTab: active
       case 'transforms':
         return <TransformHistoryTab sampleId={sample.id} analysisState={analysisState} />;
       case 'findings':
-        return <FindingsTab sampleId={sample.id} />;
+        return <FindingsTab sampleId={sample.id} onNavigateToCode={handleNavigateToCode} />;
       case 'notebook':
         return <AgentNotebookTab analysisState={analysisState} />;
       default:

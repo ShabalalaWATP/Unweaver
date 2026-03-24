@@ -1,0 +1,52 @@
+<svg width="1280" height="560" viewBox="0 0 1280 560" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="reportLine" x1="171" y1="98" x2="1096" y2="421" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#79BBFF"/>
+      <stop offset="0.6" stop-color="#58A6FF"/>
+      <stop offset="1" stop-color="#5EEAD4"/>
+    </linearGradient>
+    <linearGradient id="reportWarm" x1="674" y1="182" x2="930" y2="322" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD166"/>
+      <stop offset="1" stop-color="#F97316"/>
+    </linearGradient>
+    <radialGradient id="reportGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(924 198) rotate(126.182) scale(364.648 315.353)">
+      <stop stop-color="#58A6FF" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#58A6FF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1280" height="560" rx="40" fill="#09111A"/>
+  <rect x="56" y="48" width="1168" height="464" rx="30" fill="#0D1722" stroke="white" stroke-opacity="0.08"/>
+  <ellipse cx="926" cy="201" rx="254" ry="176" fill="url(#reportGlow)"/>
+  <g opacity="0.52">
+    <path d="M118 123H1161" stroke="white" stroke-opacity="0.08"/>
+    <path d="M118 192H1161" stroke="white" stroke-opacity="0.05"/>
+    <path d="M118 261H1161" stroke="white" stroke-opacity="0.05"/>
+    <path d="M118 330H1161" stroke="white" stroke-opacity="0.05"/>
+    <path d="M118 399H1161" stroke="white" stroke-opacity="0.05"/>
+    <path d="M118 468H1161" stroke="white" stroke-opacity="0.05"/>
+    <path d="M242 92V468" stroke="white" stroke-opacity="0.04"/>
+    <path d="M436 92V468" stroke="white" stroke-opacity="0.04"/>
+    <path d="M630 92V468" stroke="white" stroke-opacity="0.04"/>
+    <path d="M824 92V468" stroke="white" stroke-opacity="0.04"/>
+    <path d="M1018 92V468" stroke="white" stroke-opacity="0.04"/>
+  </g>
+  <rect x="142" y="138" width="296" height="216" rx="28" fill="#101B27"/>
+  <rect x="177" y="171" width="152" height="16" rx="8" fill="white" fill-opacity="0.09"/>
+  <rect x="177" y="205" width="208" height="14" rx="7" fill="#79BBFF" fill-opacity="0.22"/>
+  <rect x="177" y="236" width="176" height="12" rx="6" fill="white" fill-opacity="0.08"/>
+  <rect x="177" y="285" width="90" height="52" rx="16" fill="#162637"/>
+  <rect x="284" y="285" width="119" height="52" rx="16" fill="#162637"/>
+  <rect x="196" y="303" width="52" height="10" rx="5" fill="#5EEAD4" fill-opacity="0.32"/>
+  <rect x="303" y="303" width="66" height="10" rx="5" fill="#FFD166" fill-opacity="0.32"/>
+  <circle cx="919" cy="196" r="118" stroke="url(#reportLine)" stroke-width="2"/>
+  <circle cx="919" cy="196" r="76" stroke="white" stroke-opacity="0.12"/>
+  <circle cx="919" cy="196" r="10" fill="#79BBFF"/>
+  <circle cx="853" cy="132" r="10" fill="#5EEAD4"/>
+  <circle cx="1000" cy="162" r="9" fill="#FFD166"/>
+  <circle cx="978" cy="272" r="8" fill="#79BBFF"/>
+  <path d="M919 196L853 132" stroke="#5EEAD4" stroke-width="2" stroke-opacity="0.72"/>
+  <path d="M919 196L1000 162" stroke="#FFD166" stroke-width="2" stroke-opacity="0.72"/>
+  <path d="M919 196L978 272" stroke="#79BBFF" stroke-width="2" stroke-opacity="0.72"/>
+  <path d="M519 384C603 341 677 333 754 328C843 322 933 323 1060 271" stroke="url(#reportLine)" stroke-width="6" stroke-linecap="round"/>
+  <path d="M576 433C641 406 709 398 791 395C881 392 961 380 1092 328" stroke="url(#reportWarm)" stroke-width="5" stroke-linecap="round"/>
+</svg>

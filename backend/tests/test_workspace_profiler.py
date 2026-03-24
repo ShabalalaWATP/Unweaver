@@ -33,3 +33,20 @@ class TestWorkspaceProfiler:
         assert any("apps/web/src/main.tsx -> ../../packages/api/src/decode" in item for item in result.details["imports"])
         assert any("packages/api/src/decode.ts::decode" in item for item in result.details["functions"])
         assert result.details["workspace_context"]["entry_points"] == ["apps/web/src/main.tsx"]
+        assert result.details["workspace_context"]["local_dependency_count"] == 1
+        assert result.details["workspace_context"]["cross_file_call_count"] == 1
+        assert result.details["workspace_context"]["dependency_hotspots"][:2] == [
+            "packages/api/src/decode.ts",
+            "apps/web/src/main.tsx",
+        ]
+        assert result.details["workspace_context"]["symbol_hotspots"][:2] == [
+            "packages/api/src/decode.ts",
+            "apps/web/src/main.tsx",
+        ]
+        assert result.details["workspace_context"]["execution_paths"] == [
+            "apps/web/src/main.tsx -> packages/api/src/decode.ts::decode"
+        ]
+        assert result.details["workspace_context"]["prioritized_files"][0]["path"] == "packages/api/src/decode.ts"
+        assert result.details["workspace_context"]["prioritized_files"][0]["cross_file_call_in"] == 1
+        assert result.details["import_edges"][0]["kind"] == "local"
+        assert result.details["import_edges"][0]["resolved"] == "packages/api/src/decode.ts"

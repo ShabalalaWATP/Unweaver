@@ -443,12 +443,87 @@ def _inline_replace(
     return output
 
 
+# ---------------------------------------------------------------------------
+# Rolling / rotating XOR recovery
+# ---------------------------------------------------------------------------
+
+def _rolling_xor_variants(data: bytes, min_score: float = 0.75) -> list[dict[str, Any]]:
+    """Try common rolling XOR patterns where the key changes per byte.
+
+    Patterns tested:
+    1. key[i] = base_key ^ i  (position-dependent XOR)
+    2. key[i] = base_key + i  (incrementing key)
+    3. key[i] = base_key ^ (i & 0xFF)  (position XOR with wrap)
+    4. key[i] = data[i-1] ^ base_key  (CBC-like chaining)
+    """
+    candidates: list[dict[str, Any]] = []
+
+    for base_key in range(1, 256):
+        # Pattern 1: key XOR position
+        result1 = bytes(data[i] ^ ((base_key ^ i) & 0xFF) for i in range(len(data)))
+        score1 = _printable_score(result1)
+        if score1 >= min_score:
+            try:
+                text = result1.decode("utf-8", errors="replace")
+            except Exception:
+                text = result1.decode("latin-1")
+            candidates.append({
+                "key": base_key,
+                "key_hex": f"0x{base_key:02x}",
+                "key_bytes": bytes([base_key]),
+                "decoded": text,
+                "score": round(score1, 4),
+                "method": "rolling_xor_position",
+            })
+
+        # Pattern 2: incrementing key
+        result2 = bytes(data[i] ^ ((base_key + i) & 0xFF) for i in range(len(data)))
+        score2 = _printable_score(result2)
+        if score2 >= min_score:
+            try:
+                text = result2.decode("utf-8", errors="replace")
+            except Exception:
+                text = result2.decode("latin-1")
+            candidates.append({
+                "key": base_key,
+                "key_hex": f"0x{base_key:02x}",
+                "key_bytes": bytes([base_key]),
+                "decoded": text,
+                "score": round(score2, 4),
+                "method": "rolling_xor_increment",
+            })
+
+    # Pattern 4: CBC-like chaining (key[i] = prev_ciphertext ^ base)
+    for base_key in range(1, 256):
+        result = bytearray(len(data))
+        result[0] = data[0] ^ base_key
+        for i in range(1, len(data)):
+            result[i] = data[i] ^ ((data[i - 1] ^ base_key) & 0xFF)
+        score = _printable_score(bytes(result))
+        if score >= min_score:
+            try:
+                text = bytes(result).decode("utf-8", errors="replace")
+            except Exception:
+                text = bytes(result).decode("latin-1")
+            candidates.append({
+                "key": base_key,
+                "key_hex": f"0x{base_key:02x}",
+                "key_bytes": bytes([base_key]),
+                "decoded": text,
+                "score": round(score, 4),
+                "method": "rolling_xor_cbc",
+            })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[:10]
+
+
 class XorRecovery(BaseTransform):
     name = "xor_recovery"
     description = (
         "Detect XOR operations and recover plaintext using single-byte "
-        "brute-force, multi-byte key recovery, and known-plaintext "
-        "crib-dragging attacks"
+        "brute-force, multi-byte key recovery, rolling/rotating XOR, "
+        "and known-plaintext crib-dragging attacks"
     )
 
     def can_apply(self, code: str, language: str, state: dict) -> bool:
@@ -496,6 +571,12 @@ class XorRecovery(BaseTransform):
             if best_single_score < 0.90:
                 multi_candidates = _brute_force_multi_byte_xor(data)
                 blob_candidates.extend(multi_candidates)
+
+            # ---- Step 2.5: rolling/rotating XOR (if static keys weak) ----
+            best_so_far = max((c["score"] for c in blob_candidates), default=0.0)
+            if best_so_far < 0.90:
+                rolling_candidates = _rolling_xor_variants(data)
+                blob_candidates.extend(rolling_candidates)
 
             # ---- Step 3: crib dragging ----
             crib_candidates = _crib_drag(data)

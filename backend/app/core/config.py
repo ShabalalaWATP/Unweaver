@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
 
+    # ── CORS ─────────────────────────────────────────────────────────────
+    CORS_ORIGINS: str = ""  # comma-separated list; empty = default localhost set
+
     # ── LLM defaults (can be overridden per-provider in DB) ─────────────
     DEFAULT_LLM_MAX_TOKENS: int = 4096
 

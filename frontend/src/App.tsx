@@ -8,6 +8,7 @@ import TopBar from '@/components/layout/TopBar';
 import RightPanel from '@/components/layout/RightPanel';
 import WorkspaceTabs from '@/components/layout/WorkspaceTabs';
 import ProviderSettingsScreen from '@/components/settings/ProviderSettings';
+import traceAtlasGraphic from '@/assets/graphics/trace-atlas.svg';
 
 type View = 'workspace' | 'settings';
 
@@ -49,44 +50,78 @@ const styles = {
     alignItems: 'center',
     justifyContent: 'center',
     flex: 1,
-    flexDirection: 'column',
-    gap: '16px',
     animation: 'unweaver-fade-in 0.6s ease',
     position: 'relative',
+    padding: '40px',
+    overflow: 'hidden',
   } as React.CSSProperties,
   emptyGlow: {
     position: 'absolute',
-    width: '300px',
-    height: '300px',
+    width: '520px',
+    height: '520px',
     borderRadius: '50%',
-    background: 'radial-gradient(circle, rgba(88,166,255,0.06) 0%, transparent 70%)',
+    background: 'radial-gradient(circle, rgba(88,166,255,0.1) 0%, transparent 72%)',
     pointerEvents: 'none',
+    top: '-160px',
+    right: '-110px',
+  } as React.CSSProperties,
+  emptyLayout: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '42px',
+    width: '100%',
+    maxWidth: '1180px',
+    flexWrap: 'wrap-reverse',
+    position: 'relative',
+    zIndex: 1,
+  } as React.CSSProperties,
+  emptyCopy: {
+    flex: '1 1 320px',
+    minWidth: '280px',
+    maxWidth: '420px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '14px',
+  } as React.CSSProperties,
+  emptyEyebrow: {
+    fontSize: '10px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.18em',
+    color: 'var(--accent-bright)',
+    fontWeight: 700,
   } as React.CSSProperties,
   emptyLogo: {
     display: 'flex',
     alignItems: 'center',
     gap: '12px',
-    marginBottom: '4px',
   } as React.CSSProperties,
   emptyTerminal: {
-    fontFamily: 'var(--font-mono)',
-    fontSize: '28px',
+    fontFamily: 'var(--font-ui)',
+    fontSize: '56px',
     fontWeight: 700,
-    background: 'linear-gradient(135deg, var(--accent) 0%, var(--purple, #bc8cff) 50%, var(--accent-bright) 100%)',
+    lineHeight: 0.95,
+    background: 'linear-gradient(135deg, var(--accent-bright) 0%, var(--accent) 48%, #5eead4 100%)',
     backgroundSize: '200% 200%',
     animation: 'unweaver-gradient-flow 6s ease infinite',
     WebkitBackgroundClip: 'text',
     WebkitTextFillColor: 'transparent',
-    letterSpacing: '0.06em',
+    letterSpacing: '-0.04em',
   } as React.CSSProperties,
   emptyCursor: {
     display: 'inline-block',
     width: '2px',
-    height: '28px',
+    height: '52px',
     background: 'var(--accent)',
     animation: 'unweaver-cursor-blink 1s step-end infinite',
     marginLeft: '2px',
     borderRadius: '1px',
+  } as React.CSSProperties,
+  emptyLead: {
+    fontSize: '16px',
+    lineHeight: 1.45,
+    color: 'var(--text-secondary)',
+    maxWidth: '34ch',
   } as React.CSSProperties,
   emptySubtitle: {
     fontSize: '13px',
@@ -95,7 +130,8 @@ const styles = {
   } as React.CSSProperties,
   emptyHint: {
     display: 'flex',
-    gap: '24px',
+    gap: '12px',
+    flexWrap: 'wrap',
     marginTop: '12px',
   } as React.CSSProperties,
   emptyHintItem: {
@@ -108,6 +144,28 @@ const styles = {
     borderRadius: 'var(--radius-lg)',
     background: 'var(--bg-secondary)',
     border: '1px solid var(--border)',
+  } as React.CSSProperties,
+  emptyArtWrap: {
+    flex: '1 1 500px',
+    minWidth: '320px',
+    display: 'flex',
+    justifyContent: 'center',
+    position: 'relative',
+  } as React.CSSProperties,
+  emptyArtFrame: {
+    width: '100%',
+    maxWidth: '700px',
+    padding: '18px',
+    borderRadius: '34px',
+    background: 'linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01))',
+    border: '1px solid rgba(255,255,255,0.08)',
+    boxShadow: '0 30px 80px rgba(0, 0, 0, 0.35)',
+  } as React.CSSProperties,
+  emptyArt: {
+    width: '100%',
+    height: 'auto',
+    display: 'block',
+    filter: 'drop-shadow(0 22px 34px rgba(0, 0, 0, 0.28))',
   } as React.CSSProperties,
 };
 
@@ -329,17 +387,42 @@ export default function App() {
                 ) : (
                   <div style={styles.emptyState}>
                     <div style={styles.emptyGlow} />
-                    <div style={styles.emptyLogo}>
-                      <span style={styles.emptyTerminal}>UNWEAVER</span>
-                      <span style={styles.emptyCursor} />
-                    </div>
-                    <div style={styles.emptySubtitle}>
-                      Agentic code deobfuscation workbench
-                    </div>
-                    <div style={styles.emptyHint}>
-                      <span style={styles.emptyHintItem}>
-                        Upload a file or paste code to begin
-                      </span>
+                    <div style={styles.emptyLayout}>
+                      <div style={styles.emptyCopy}>
+                        <span style={styles.emptyEyebrow}>Obfuscated Code Deobfuscation</span>
+                        <div style={styles.emptyLogo}>
+                          <span style={styles.emptyTerminal}>UNWEAVER</span>
+                          <span style={styles.emptyCursor} />
+                        </div>
+                        <div style={styles.emptyLead}>
+                          Deobfuscate obfuscated scripts, packed loaders, and hostile workspace
+                          bundles in one analysis surface built for live forensic work.
+                        </div>
+                        <div style={styles.emptySubtitle}>
+                          Upload an obfuscated file, drop a codebase, or paste suspicious code to start deobfuscation.
+                        </div>
+                        <div style={styles.emptyHint}>
+                          <span style={styles.emptyHintItem}>
+                            Folder and multi-file ingest
+                          </span>
+                          <span style={styles.emptyHintItem}>
+                            Live transform history and findings
+                          </span>
+                          <span style={styles.emptyHintItem}>
+                            Local workspace export after recovery
+                          </span>
+                        </div>
+                      </div>
+                      <div style={styles.emptyArtWrap}>
+                        <div className="unweaver-empty-art-frame" style={styles.emptyArtFrame}>
+                          <img
+                            className="unweaver-empty-art"
+                            src={traceAtlasGraphic}
+                            alt="Abstract deobfuscation trace atlas"
+                            style={styles.emptyArt}
+                          />
+                        </div>
+                      </div>
                     </div>
                   </div>
                 )}

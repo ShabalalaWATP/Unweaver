@@ -31,6 +31,7 @@ class LLMClient:
         api_key: str = "",
         model: str = "gpt-3.5-turbo",
         max_tokens: int = 4096,
+        context_window: int = 131_072,
         cert_bundle: Optional[str] = None,
         use_system_trust: bool = True,
     ) -> None:
@@ -38,6 +39,7 @@ class LLMClient:
         self.api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
+        self.context_window = context_window
         self.cert_bundle = cert_bundle
         self.use_system_trust = use_system_trust
 
@@ -140,6 +142,17 @@ class LLMClient:
             httpx.HTTPStatusError: If the remote API returns an error status.
             httpx.TimeoutException: If the request exceeds timeout limits.
         """
+        return await self._chat_inner(messages, temperature, max_tokens, _retrying_token_param=False)
+
+    async def _chat_inner(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: Optional[int],
+        *,
+        _retrying_token_param: bool = False,
+    ) -> str:
+        """Internal implementation of chat with call-level retry guard."""
         effective_max = max_tokens or self.max_tokens
 
         # Use the modern 'max_completion_tokens' or legacy 'max_tokens'
@@ -191,18 +204,15 @@ class LLMClient:
                     ("max_tokens" in err_msg and "max_completion_tokens" in err_msg)
                     or ("unsupported parameter" in err_msg and "max_tokens" in err_msg)
                 )
-                if needs_swap and not getattr(self, "_token_param_retried", False):
-                    self._token_param_retried = True
+                if needs_swap and not _retrying_token_param:
                     self._use_max_completion_tokens = not self._use_max_completion_tokens
                     alt_key = "max_completion_tokens" if self._use_max_completion_tokens else "max_tokens"
                     logger.info(
                         "Switching token parameter from '%s' to '%s' and retrying",
                         token_key, alt_key,
                     )
-                    # Retry with swapped parameter (recursion depth = 1)
-                    result = await self.chat(messages, temperature, max_tokens)
-                    self._token_param_retried = False
-                    return result
+                    # Retry with swapped parameter (call-level guard prevents infinite recursion)
+                    return await self._chat_inner(messages, temperature, max_tokens, _retrying_token_param=True)
 
             logger.error(
                 "LLM HTTP error %d from %s", exc.response.status_code, url

@@ -18,6 +18,7 @@ Usage::
         EntropyAnalyzer,
         UnicodeNormalizer,
         StringDecryptor,
+        LiteralPropagator,
         ControlFlowUnflattener,
         DeterministicRenamer,
         JavaScriptArrayResolver,
@@ -49,6 +50,8 @@ from .entropy_analyzer import EntropyAnalyzer
 from .ioc_extractor import IOCExtractor
 from .readability_scorer import ReadabilityScorer, compute_readability_score
 from .rename_suggester import RenameSuggester
+from .workspace_profiler import WorkspaceProfiler
+from .workspace_file_deobfuscator import WorkspaceFileDeobfuscator
 
 # Decoding transforms
 from .base64_decoder import Base64Decoder
@@ -57,6 +60,7 @@ from .xor_recovery import XorRecovery
 from .constant_folder import ConstantFolder
 from .unicode_normalizer import UnicodeNormalizer
 from .string_decryptor import StringDecryptor
+from .literal_propagator import LiteralPropagator
 
 # Language-specific decoders
 from .js_resolvers import JavaScriptArrayResolver
@@ -66,6 +70,12 @@ from .python_decoder import PythonDecoder
 # Structural transforms
 from .control_flow_unflattener import ControlFlowUnflattener
 from .deterministic_renamer import DeterministicRenamer
+
+# Extended decoders
+from .base32_base85_decoder import Base32Base85Decoder
+from .crypto_decryptor import CryptoDecryptor
+from .reflection_resolver import ReflectionResolver
+from .python_serialization_decoder import PythonSerializationDecoder
 
 # Cleanup transforms
 from .junk_code import JunkCodeRemover
@@ -84,6 +94,8 @@ __all__ = [
     "ReadabilityScorer",
     "compute_readability_score",
     "RenameSuggester",
+    "WorkspaceProfiler",
+    "WorkspaceFileDeobfuscator",
     # Decoding
     "Base64Decoder",
     "HexDecoder",
@@ -91,6 +103,7 @@ __all__ = [
     "ConstantFolder",
     "UnicodeNormalizer",
     "StringDecryptor",
+    "LiteralPropagator",
     # Language-specific
     "JavaScriptArrayResolver",
     "PowerShellDecoder",
@@ -98,6 +111,11 @@ __all__ = [
     # Structural
     "ControlFlowUnflattener",
     "DeterministicRenamer",
+    # Extended decoders
+    "Base32Base85Decoder",
+    "CryptoDecryptor",
+    "ReflectionResolver",
+    "PythonSerializationDecoder",
     # Cleanup
     "JunkCodeRemover",
 ]
@@ -118,11 +136,18 @@ DEFAULT_PIPELINE = [
     PythonDecoder,
     JavaScriptArrayResolver,
     ConstantFolder,
+    LiteralPropagator,
     XorRecovery,
+    Base32Base85Decoder,
+    CryptoDecryptor,
+    ReflectionResolver,
+    PythonSerializationDecoder,
     ControlFlowUnflattener,
     JunkCodeRemover,
     DeterministicRenamer,
     IOCExtractor,
     RenameSuggester,
+    WorkspaceProfiler,
+    WorkspaceFileDeobfuscator,
     ReadabilityScorer,  # re-score after transforms
 ]

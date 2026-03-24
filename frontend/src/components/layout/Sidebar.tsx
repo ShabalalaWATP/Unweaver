@@ -6,6 +6,7 @@ import { useTheme } from '@/contexts/ThemeContext';
 import FileUpload from '@/components/common/FileUpload';
 import PasteInput from '@/components/common/PasteInput';
 import { formatDate, truncate } from '@/utils/format';
+import controlRailGraphic from '@/assets/graphics/control-rail.svg';
 
 interface SidebarProps {
   selectedProjectId: string | null;
@@ -17,6 +18,12 @@ interface SidebarProps {
   onDeleteSample?: (id: string) => void;
 }
 
+type WorkspaceArchiveFile = File & {
+  unweaverUploadKind?: 'folder-archive';
+  unweaverSourceName?: string;
+  unweaverSourceFileCount?: number;
+};
+
 const s = {
   root: {
     width: 260,
@@ -27,17 +34,36 @@ const s = {
     flexDirection: 'column',
     height: '100%',
     overflow: 'hidden',
+    position: 'relative',
+  } as React.CSSProperties,
+  ambientGraphic: {
+    position: 'absolute',
+    top: 72,
+    left: -68,
+    width: 360,
+    opacity: 0.18,
+    pointerEvents: 'none',
+    mixBlendMode: 'screen',
+    filter: 'saturate(1.1)',
   } as React.CSSProperties,
   header: {
-    padding: '16px 16px',
+    padding: '16px 16px 14px',
     borderBottom: '1px solid var(--border)',
     display: 'flex',
-    alignItems: 'center',
-    gap: '10px',
+    flexDirection: 'column',
+    alignItems: 'stretch',
+    gap: '12px',
     userSelect: 'none',
     background: 'rgba(17,21,28,0.6)',
     backdropFilter: 'blur(16px) saturate(1.3)',
     WebkitBackdropFilter: 'blur(16px) saturate(1.3)',
+    position: 'relative',
+    zIndex: 1,
+  } as React.CSSProperties,
+  brandRow: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
   } as React.CSSProperties,
   logoMark: {
     display: 'flex',
@@ -64,6 +90,54 @@ const s = {
     color: 'var(--text-muted)',
     marginLeft: 'auto',
     letterSpacing: '0.03em',
+  } as React.CSSProperties,
+  brandMeta: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px',
+    minWidth: 0,
+  } as React.CSSProperties,
+  brandSubline: {
+    fontSize: '10px',
+    color: 'var(--text-muted)',
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase',
+  } as React.CSSProperties,
+  brandPanel: {
+    padding: '12px',
+    borderRadius: '18px',
+    background: 'linear-gradient(165deg, rgba(88,166,255,0.12) 0%, rgba(17,21,28,0.58) 100%)',
+    border: '1px solid rgba(88,166,255,0.14)',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  } as React.CSSProperties,
+  brandPanelTitle: {
+    fontSize: '14px',
+    fontWeight: 700,
+    lineHeight: 1.15,
+    color: 'var(--text-primary)',
+    maxWidth: '16ch',
+  } as React.CSSProperties,
+  brandPanelBody: {
+    fontSize: '11px',
+    lineHeight: 1.5,
+    color: 'var(--text-secondary)',
+    maxWidth: '20ch',
+  } as React.CSSProperties,
+  brandPanelStrip: {
+    display: 'flex',
+    gap: '6px',
+    flexWrap: 'wrap',
+  } as React.CSSProperties,
+  brandPanelChip: {
+    padding: '3px 8px',
+    borderRadius: '999px',
+    border: '1px solid rgba(255,255,255,0.08)',
+    background: 'rgba(255,255,255,0.04)',
+    color: 'var(--text-secondary)',
+    fontSize: '10px',
+    fontFamily: 'var(--font-mono)',
   } as React.CSSProperties,
   section: {
     padding: '10px 0 6px',
@@ -220,12 +294,17 @@ const s = {
 };
 
 const statusColors: Record<string, string> = {
+  ready: 'var(--warning)',
   pending: 'var(--text-muted)',
   running: 'var(--accent)',
   completed: 'var(--success)',
   failed: 'var(--danger)',
   stopped: 'var(--warning)',
 };
+
+function isWorkspaceArchiveFile(file: File): file is WorkspaceArchiveFile {
+  return (file as WorkspaceArchiveFile).unweaverUploadKind === 'folder-archive';
+}
 
 export default function Sidebar({
   selectedProjectId,
@@ -262,15 +341,50 @@ export default function Sidebar({
   }, [newProjectName, create, onSelectProject, toast]);
 
   const handleUpload = useCallback(
-    async (file: File) => {
-      try {
-        const sample = await upload(file);
-        setShowUpload(false);
-        onSelectSample(sample.id);
-        toast.success(`Uploaded "${file.name}"`);
-      } catch (err) {
-        toast.error('Failed to upload file');
+    async (files: File[]) => {
+      const uploadedSamples = [];
+      const failedFiles: string[] = [];
+
+      for (const file of files) {
+        try {
+          const sample = await upload(file);
+          uploadedSamples.push(sample);
+        } catch (err) {
+          failedFiles.push(file.name);
+        }
       }
+
+      if (uploadedSamples.length > 0) {
+        setShowUpload(false);
+        onSelectSample(uploadedSamples[uploadedSamples.length - 1].id);
+      }
+
+      if (failedFiles.length === 0 && uploadedSamples.length > 0) {
+        if (uploadedSamples.length === 1) {
+          if (isWorkspaceArchiveFile(files[0])) {
+            toast.success(
+              `Uploaded ${files[0].unweaverSourceName} as a codebase bundle. Open the workspace tabs to browse the bundled files.`,
+            );
+          } else {
+            toast.success(`Uploaded "${files[0].name}"`);
+          }
+        } else {
+          toast.success(`Uploaded ${uploadedSamples.length} items`);
+        }
+        return;
+      }
+
+      if (uploadedSamples.length > 0) {
+        toast.warning(`Uploaded ${uploadedSamples.length} item(s), failed ${failedFiles.length}.`);
+        return;
+      }
+
+      toast.error(files.length === 1 ? `Failed to upload "${files[0].name}"` : 'Failed to upload selected files');
+      throw new Error(
+        failedFiles.length > 0
+          ? `Upload failed for: ${failedFiles.slice(0, 4).join(', ')}`
+          : 'Upload failed. Please try again.',
+      );
     },
     [upload, onSelectSample, toast],
   );
@@ -377,6 +491,12 @@ export default function Sidebar({
       onDragOver={handleDragOver}
       onDrop={handleDrop}
     >
+      <img
+        className="unweaver-sidebar-atlas"
+        src={controlRailGraphic}
+        alt="Decorative control rail"
+        style={s.ambientGraphic}
+      />
       {/* Drag overlay */}
       {dragOver && (
         <div style={s.dropOverlay as React.CSSProperties}>
@@ -387,11 +507,27 @@ export default function Sidebar({
 
       {/* Logo header */}
       <div className="unweaver-glass-header" style={s.header}>
-        <div style={s.logoMark}>
-          <Sparkles size={14} />
+        <div style={s.brandRow}>
+          <div style={s.logoMark}>
+            <Sparkles size={14} />
+          </div>
+          <div style={s.brandMeta}>
+            <span style={s.logoText}>UNWEAVER</span>
+            <span style={s.brandSubline}>Obfuscated code deobfuscation</span>
+          </div>
+          <span style={s.logoVersion}>v1.0</span>
         </div>
-        <span style={s.logoText}>UNWEAVER</span>
-        <span style={s.logoVersion}>v1.0</span>
+        <div className="unweaver-sidebar-brand-panel" style={s.brandPanel}>
+          <div style={s.brandPanelTitle}>Professional deobfuscation workspace.</div>
+          <div style={s.brandPanelBody}>
+            Intake suspicious scripts, inspect transform history, and export reconstructed code with analyst-grade context.
+          </div>
+          <div style={s.brandPanelStrip}>
+            <span style={s.brandPanelChip}>files</span>
+            <span style={s.brandPanelChip}>folders</span>
+            <span style={s.brandPanelChip}>workspace bundles</span>
+          </div>
+        </div>
       </div>
 
       {/* Projects */}
@@ -627,7 +763,10 @@ export default function Sidebar({
                     >
                       <Trash2 size={11} />
                     </button>
-                    <span style={s.sampleMeta}>{formatDate(sm.created_at).split(',')[0]}</span>
+                    <span style={s.sampleMeta}>
+                      {sm.language === 'workspace' ? 'bundle' : formatDate(sm.created_at).split(',')[0]}
+                      {sm.saved_analysis_at ? ' · saved' : ''}
+                    </span>
                   </>
                 )}
               </div>

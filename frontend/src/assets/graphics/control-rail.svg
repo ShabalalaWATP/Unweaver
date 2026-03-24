@@ -1,0 +1,48 @@
+<svg width="640" height="920" viewBox="0 0 640 920" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="railLine" x1="108" y1="163" x2="479" y2="711" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#79BBFF"/>
+      <stop offset="0.58" stop-color="#58A6FF"/>
+      <stop offset="1" stop-color="#5EEAD4"/>
+    </linearGradient>
+    <radialGradient id="railGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(410 286) rotate(112.129) scale(266.818 255.225)">
+      <stop stop-color="#58A6FF" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#58A6FF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="640" height="920" rx="40" fill="#09111A"/>
+  <rect x="42" y="38" width="556" height="844" rx="28" fill="#0E1823" stroke="white" stroke-opacity="0.08"/>
+  <ellipse cx="412" cy="292" rx="182" ry="152" fill="url(#railGlow)"/>
+  <g opacity="0.52">
+    <path d="M105 145H538" stroke="white" stroke-opacity="0.08"/>
+    <path d="M105 216H538" stroke="white" stroke-opacity="0.05"/>
+    <path d="M105 287H538" stroke="white" stroke-opacity="0.05"/>
+    <path d="M105 358H538" stroke="white" stroke-opacity="0.05"/>
+    <path d="M105 429H538" stroke="white" stroke-opacity="0.05"/>
+    <path d="M105 500H538" stroke="white" stroke-opacity="0.05"/>
+    <path d="M105 571H538" stroke="white" stroke-opacity="0.05"/>
+    <path d="M105 642H538" stroke="white" stroke-opacity="0.05"/>
+    <path d="M105 713H538" stroke="white" stroke-opacity="0.05"/>
+    <path d="M172 108V804" stroke="white" stroke-opacity="0.04"/>
+    <path d="M281 108V804" stroke="white" stroke-opacity="0.04"/>
+    <path d="M390 108V804" stroke="white" stroke-opacity="0.04"/>
+    <path d="M499 108V804" stroke="white" stroke-opacity="0.04"/>
+  </g>
+  <path d="M150 618C226 554 281 526 337 520C391 514 441 524 497 490" stroke="url(#railLine)" stroke-width="6" stroke-linecap="round"/>
+  <path d="M166 679C234 635 284 618 350 620C398 622 445 614 494 583" stroke="white" stroke-opacity="0.12" stroke-width="2" stroke-dasharray="8 12"/>
+  <circle cx="423" cy="285" r="96" stroke="url(#railLine)" stroke-width="2"/>
+  <circle cx="423" cy="285" r="61" stroke="white" stroke-opacity="0.12"/>
+  <circle cx="423" cy="285" r="8" fill="#79BBFF"/>
+  <circle cx="357" cy="228" r="9" fill="#5EEAD4"/>
+  <circle cx="493" cy="239" r="8" fill="#FFD166"/>
+  <circle cx="478" cy="349" r="7" fill="#79BBFF"/>
+  <path d="M423 285L357 228" stroke="#5EEAD4" stroke-opacity="0.72" stroke-width="2"/>
+  <path d="M423 285L493 239" stroke="#FFD166" stroke-opacity="0.72" stroke-width="2"/>
+  <path d="M423 285L478 349" stroke="#79BBFF" stroke-opacity="0.72" stroke-width="2"/>
+  <rect x="126" y="171" width="123" height="16" rx="8" fill="white" fill-opacity="0.08"/>
+  <rect x="126" y="205" width="91" height="13" rx="6.5" fill="#79BBFF" fill-opacity="0.28"/>
+  <rect x="126" y="234" width="140" height="12" rx="6" fill="white" fill-opacity="0.08"/>
+  <rect x="364" y="691" width="144" height="84" rx="22" fill="#101B27"/>
+  <rect x="389" y="719" width="84" height="10" rx="5" fill="#79BBFF" fill-opacity="0.32"/>
+  <rect x="389" y="740" width="57" height="8" rx="4" fill="white" fill-opacity="0.12"/>
+</svg>

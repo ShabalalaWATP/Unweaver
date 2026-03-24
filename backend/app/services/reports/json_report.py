@@ -19,6 +19,22 @@ from app.services.ingest.workspace_bundle import (
 )
 
 
+def _latest_workspace_context(iteration_states: List[Dict[str, Any]]) -> Dict[str, Any]:
+    for state in reversed(iteration_states):
+        state_data = state if isinstance(state, dict) else {}
+        state_json_str = state_data.get("state_json", "{}")
+        if not isinstance(state_json_str, str):
+            continue
+        try:
+            parsed = json.loads(state_json_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        workspace_context = parsed.get("workspace_context", {})
+        if isinstance(workspace_context, dict) and workspace_context:
+            return workspace_context
+    return {}
+
+
 def generate_json_report(
     *,
     sample_id: str,
@@ -132,11 +148,15 @@ def generate_json_report(
     }
 
     bundle_text = pick_workspace_bundle_text(recovered_text, original_text)
-    workspace_context = extract_workspace_context(bundle_text or "")
+    workspace_context = {
+        **(extract_workspace_context(bundle_text or "") or {}),
+        **_latest_workspace_context(iteration_states),
+    }
     if workspace_context:
         report["workspace"] = {
             **workspace_context,
-            "files_preview": workspace_files_preview(bundle_text or "", max_files=16),
+            "files_preview": workspace_context.get("files_preview")
+            or workspace_files_preview(bundle_text or "", max_files=16),
         }
 
     return report

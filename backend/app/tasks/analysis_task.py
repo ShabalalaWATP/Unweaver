@@ -15,9 +15,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.crypto import decrypt_value
 from app.core.database import async_session
 from app.models.db_models import (
     FindingRecord,
@@ -28,6 +30,7 @@ from app.models.db_models import (
     TransformHistory,
 )
 from app.models.schemas import SampleStatus
+from app.services.reports.saved_analysis import persist_saved_analysis_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +59,42 @@ def is_running(sample_id: str) -> bool:
     return status is not None and status.get("status") == "running"
 
 
+def is_active(sample_id: str) -> bool:
+    """Check whether an analysis is queued or currently running."""
+    status = _running_analyses.get(sample_id)
+    return status is not None and status.get("status") in {"pending", "running"}
+
+
+def queue_analysis(sample_id: str, total_iterations: int) -> None:
+    """Seed tracker state before the background task starts running."""
+    _running_analyses[sample_id] = {
+        "status": "pending",
+        "current_iteration": 0,
+        "total_iterations": total_iterations,
+        "current_action": "queued",
+        "progress_pct": 0.0,
+        "stop_requested": False,
+        "error": None,
+    }
+
+
 def clear_tracker(sample_id: str) -> None:
     """Remove the in-memory tracker for a sample (cleanup after stale state)."""
     _running_analyses.pop(sample_id, None)
+
+
+def emit_event(sample_id: str, event_type: str, data: dict | None = None) -> None:
+    """Push a typed event into the tracker's event queue for WebSocket consumers.
+
+    Event types: ``classification``, ``transform_start``, ``transform_end``,
+    ``reflection``, ``planning``, ``confidence_update``, ``error``.
+    Events are append-only; the WebSocket handler drains them on each tick.
+    """
+    tracker = _running_analyses.get(sample_id)
+    if tracker is None:
+        return
+    events = tracker.setdefault("events", [])
+    events.append({"event": event_type, **(data or {})})
 
 
 async def run_analysis(sample_id: str) -> None:
@@ -67,15 +103,36 @@ async def run_analysis(sample_id: str) -> None:
     Designed to be called as a FastAPI BackgroundTask.
     Manages its own database session and error handling.
     """
-    _running_analyses[sample_id] = {
-        "status": "running",
-        "current_iteration": 0,
-        "total_iterations": settings.MAX_ITERATIONS,
-        "current_action": "initialising",
-        "progress_pct": 0.0,
-        "stop_requested": False,
-        "error": None,
-    }
+    tracker = _running_analyses.setdefault(
+        sample_id,
+        {
+            "status": "pending",
+            "current_iteration": 0,
+            "total_iterations": settings.MAX_ITERATIONS,
+            "current_action": "queued",
+            "progress_pct": 0.0,
+            "stop_requested": False,
+            "error": None,
+            "events": [],  # typed events for WebSocket consumers
+        },
+    )
+
+    if tracker.get("stop_requested"):
+        tracker["status"] = "stopped"
+        tracker["current_action"] = "cancelled before start"
+        try:
+            async with async_session() as db:
+                sample = await db.get(Sample, sample_id)
+                if sample:
+                    sample.status = SampleStatus.STOPPED.value
+                    await db.commit()
+        except Exception:
+            logger.exception("Failed to mark sample %s as stopped before start", sample_id)
+        return
+
+    tracker["status"] = "running"
+    tracker["current_action"] = "initialising"
+    tracker["progress_pct"] = 0.0
 
     try:
         async with async_session() as db:
@@ -118,6 +175,10 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         return
 
     sample.status = SampleStatus.RUNNING.value
+    sample.recovered_text = None
+    sample.saved_analysis = None
+    sample.saved_analysis_at = None
+    await _clear_previous_analysis_data(db, sample_id)
     await _safe_commit(db, "mark sample as running")
 
     from app.services.analysis.orchestrator import Orchestrator
@@ -145,6 +206,10 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         tracker["current_action"] = action
         tracker["progress_pct"] = pct
 
+    # Event callback: pushes typed events into the tracker for WebSocket consumers.
+    def _on_event(event_type: str, data: dict) -> None:
+        emit_event(sample_id, event_type, data)
+
     # Run the full multi-pass analysis loop.
     result = await orchestrator.run(
         auto_approve_threshold=settings.AUTO_APPROVE_THRESHOLD,
@@ -152,11 +217,18 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         max_iterations=settings.MAX_ITERATIONS,
         stall_limit=settings.STALL_THRESHOLD,
         progress_callback=_on_progress,
+        stop_requested=lambda: bool(tracker.get("stop_requested")),
+        event_callback=_on_event,
     )
 
     tracker["current_iteration"] = result.iterations
     tracker["progress_pct"] = 100.0
-    tracker["current_action"] = f"completed: {result.stop_reason}"
+    tracker["current_action"] = (
+        f"stopped: {result.stop_reason}"
+        if result.was_stopped else
+        f"completed: {result.stop_reason}"
+    )
+    tracker["status"] = "stopped" if result.was_stopped else "completed"
 
     # ── Persist results in isolated batches ─────────────────────────
     # Re-fetch sample in case the session state drifted during the long
@@ -169,7 +241,11 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
 
     sample.recovered_text = result.deobfuscated_code
     sample.language = result.language or sample.language
-    sample.status = SampleStatus.COMPLETED.value
+    sample.status = (
+        SampleStatus.STOPPED.value
+        if result.was_stopped else
+        SampleStatus.COMPLETED.value
+    )
     await _safe_commit(db, "persist recovered text and status")
 
     # Transform history
@@ -251,8 +327,41 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         except Exception:
             logger.exception("Failed to persist final iteration state")
 
-    tracker["status"] = "completed"
-    tracker["current_action"] = "analysis complete"
+    try:
+        sample = await db.get(Sample, sample_id)
+        if sample is None:
+            logger.warning("Sample %s deleted during analysis — skipping snapshot", sample_id)
+            tracker["status"] = "failed"
+            tracker["error"] = "Sample was deleted during result persistence"
+            return
+        await persist_saved_analysis_snapshot(
+            db,
+            sample,
+            keep_existing_ai_summary=False,
+        )
+        await _safe_commit(db, "persist saved analysis snapshot")
+    except Exception:
+        logger.exception("Failed to persist saved analysis snapshot")
+
+    # ── Auto-generate AI summary if LLM available ──────────────────
+    if llm_client is not None and sample is not None:
+        tracker["current_action"] = "generating AI summary"
+        emit_event(sample_id, "planning", {"detail": "Auto-generating AI summary..."})
+        try:
+            from app.api.samples import generate_summary as _gen_summary
+            # Call the endpoint function directly with the DB session
+            # (FastAPI's Depends is only used when called via HTTP)
+            await _gen_summary(sample_id, db)
+            logger.info("Auto-generated AI summary for sample %s", sample_id)
+        except Exception:
+            logger.debug("Auto-summary generation failed (non-critical)", exc_info=True)
+
+    tracker["status"] = "stopped" if result.was_stopped else "completed"
+    tracker["current_action"] = (
+        "analysis stopped"
+        if result.was_stopped else
+        "analysis complete"
+    )
 
 
 async def _load_llm_client(db: AsyncSession):
@@ -287,12 +396,13 @@ async def _load_llm_client(db: AsyncSession):
             logger.info("No LLM provider configured; running in deterministic mode")
             return None
 
-        max_tokens = _MAX_TOKENS_MAP.get(provider.max_tokens_preset, 4096)
+        context_window = _MAX_TOKENS_MAP.get(provider.max_tokens_preset, 131_072)
         client = LLMClient(
             base_url=provider.base_url,
-            api_key=provider.api_key_encrypted,
+            api_key=decrypt_value(provider.api_key_encrypted),
             model=provider.model_name,
-            max_tokens=max_tokens,
+            max_tokens=4096,
+            context_window=context_window,
             cert_bundle=provider.cert_bundle_path,
             use_system_trust=provider.use_system_trust,
         )
@@ -305,6 +415,18 @@ async def _load_llm_client(db: AsyncSession):
     except Exception:
         logger.exception("Failed to load LLM provider; continuing without LLM")
         return None
+
+
+async def _clear_previous_analysis_data(db: AsyncSession, sample_id: str) -> None:
+    """Replace prior persisted artifacts when a sample is analysed again."""
+    for model in (
+        TransformHistory,
+        StringRecord,
+        FindingRecord,
+        IOCRecord,
+        IterationState,
+    ):
+        await db.execute(delete(model).where(model.sample_id == sample_id))
 
 
 async def _safe_commit(db: AsyncSession, context: str) -> bool:

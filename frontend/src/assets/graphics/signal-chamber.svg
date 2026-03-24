@@ -1,0 +1,65 @@
+<svg width="760" height="520" viewBox="0 0 760 520" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="signalLine" x1="140" y1="117" x2="620" y2="390" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#79BBFF"/>
+      <stop offset="0.6" stop-color="#58A6FF"/>
+      <stop offset="1" stop-color="#5EEAD4"/>
+    </linearGradient>
+    <linearGradient id="signalWarm" x1="356" y1="206" x2="500" y2="329" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD166"/>
+      <stop offset="1" stop-color="#F97316"/>
+    </linearGradient>
+    <radialGradient id="signalGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(431 258) rotate(90) scale(184 208)">
+      <stop stop-color="#58A6FF" stop-opacity="0.36"/>
+      <stop offset="1" stop-color="#58A6FF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="760" height="520" rx="36" fill="#09111A"/>
+  <rect x="46" y="42" width="668" height="436" rx="28" fill="#0E1823" stroke="white" stroke-opacity="0.08"/>
+  <ellipse cx="433" cy="258" rx="184" ry="168" fill="url(#signalGlow)"/>
+
+  <g opacity="0.62">
+    <path d="M115 129H645" stroke="white" stroke-opacity="0.08"/>
+    <path d="M115 198H645" stroke="white" stroke-opacity="0.05"/>
+    <path d="M115 267H645" stroke="white" stroke-opacity="0.05"/>
+    <path d="M115 336H645" stroke="white" stroke-opacity="0.05"/>
+    <path d="M115 405H645" stroke="white" stroke-opacity="0.05"/>
+    <path d="M184 104V426" stroke="white" stroke-opacity="0.04"/>
+    <path d="M305 104V426" stroke="white" stroke-opacity="0.04"/>
+    <path d="M426 104V426" stroke="white" stroke-opacity="0.04"/>
+    <path d="M547 104V426" stroke="white" stroke-opacity="0.04"/>
+  </g>
+
+  <circle cx="431" cy="259" r="118" stroke="url(#signalLine)" stroke-width="2"/>
+  <circle cx="431" cy="259" r="78" stroke="white" stroke-opacity="0.12"/>
+  <circle cx="431" cy="259" r="30" fill="#12263A" stroke="#79BBFF" stroke-opacity="0.45"/>
+  <circle cx="431" cy="259" r="7" fill="#79BBFF"/>
+
+  <circle cx="344" cy="192" r="10" fill="#5EEAD4"/>
+  <circle cx="531" cy="183" r="9" fill="#FFD166"/>
+  <circle cx="558" cy="302" r="8" fill="#79BBFF"/>
+  <circle cx="327" cy="337" r="8" fill="#5EEAD4"/>
+
+  <path d="M431 259L344 192" stroke="#5EEAD4" stroke-width="2" stroke-opacity="0.7"/>
+  <path d="M431 259L531 183" stroke="#FFD166" stroke-width="2" stroke-opacity="0.78"/>
+  <path d="M431 259L558 302" stroke="#79BBFF" stroke-width="2" stroke-opacity="0.76"/>
+  <path d="M431 259L327 337" stroke="#5EEAD4" stroke-width="2" stroke-opacity="0.62"/>
+
+  <path d="M177 350C223 330 250 298 273 258C294 221 317 182 365 157" stroke="url(#signalLine)" stroke-width="6" stroke-linecap="round"/>
+  <path d="M503 373C553 340 586 319 610 266" stroke="url(#signalWarm)" stroke-width="5" stroke-linecap="round"/>
+
+  <rect x="128" y="132" width="126" height="18" rx="9" fill="white" fill-opacity="0.08"/>
+  <rect x="128" y="167" width="95" height="14" rx="7" fill="#79BBFF" fill-opacity="0.24"/>
+  <rect x="128" y="195" width="132" height="12" rx="6" fill="white" fill-opacity="0.08"/>
+
+  <rect x="508" y="356" width="140" height="78" rx="20" fill="#101B27"/>
+  <rect x="531" y="382" width="82" height="10" rx="5" fill="#79BBFF" fill-opacity="0.32"/>
+  <rect x="531" y="403" width="54" height="8" rx="4" fill="white" fill-opacity="0.12"/>
+
+  <g opacity="0.68">
+    <circle cx="165" cy="392" r="4" fill="#79BBFF"/>
+    <circle cx="248" cy="383" r="3" fill="#FFD166"/>
+    <circle cx="615" cy="151" r="4" fill="#5EEAD4"/>
+  </g>
+</svg>

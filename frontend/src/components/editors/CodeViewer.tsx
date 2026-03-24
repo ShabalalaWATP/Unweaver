@@ -1,4 +1,5 @@
-import Editor from '@monaco-editor/react';
+import { useRef, useEffect } from 'react';
+import Editor, { type OnMount } from '@monaco-editor/react';
 import { useTheme } from '@/contexts/ThemeContext';
 
 interface CodeViewerProps {
@@ -8,6 +9,8 @@ interface CodeViewerProps {
   wordWrap?: boolean;
   height?: string;
   onChange?: (value: string | undefined) => void;
+  /** When set, scroll to and highlight the first occurrence of this text. */
+  highlightText?: string | null;
 }
 
 const LANG_MAP: Record<string, string> = {
@@ -56,8 +59,63 @@ export default function CodeViewer({
   wordWrap = true,
   height = '100%',
   onChange,
+  highlightText,
 }: CodeViewerProps) {
   const { isDark } = useTheme();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const editorRef = useRef<any>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const decorationsRef = useRef<any>(null);
+
+  const handleMount: OnMount = (editor) => {
+    editorRef.current = editor;
+  };
+
+  // When highlightText changes, find and scroll to it.
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || !highlightText) return;
+
+    const model = editor.getModel();
+    if (!model) return;
+
+    const matches = model.findMatches(
+      highlightText,
+      true,   // searchOnlyEditableRange = false (search all)
+      false,  // isRegex
+      false,  // matchCase
+      null,   // wordSeparators
+      false,  // captureMatches
+      1,      // limitResultCount
+    );
+
+    if (matches.length > 0) {
+      const range = matches[0].range;
+      editor.revealLineInCenter(range.startLineNumber);
+      editor.setSelection(range);
+
+      // Add highlight decoration
+      decorationsRef.current = editor.deltaDecorations(
+        decorationsRef.current ?? [],
+        [{
+          range,
+          options: {
+            isWholeLine: true,
+            className: 'unweaver-finding-highlight',
+            overviewRuler: { color: 'var(--accent)', position: 1 },
+          },
+        }],
+      );
+
+      // Clear highlight after 4 seconds
+      setTimeout(() => {
+        if (editorRef.current && decorationsRef.current) {
+          editorRef.current.deltaDecorations(decorationsRef.current, []);
+          decorationsRef.current = null;
+        }
+      }, 4000);
+    }
+  }, [highlightText]);
 
   return (
     <Editor
@@ -67,6 +125,7 @@ export default function CodeViewer({
       value={value}
       theme={isDark ? 'vs-dark' : 'light'}
       onChange={onChange}
+      onMount={handleMount}
       options={{
         readOnly,
         wordWrap: wordWrap ? 'on' : 'off',

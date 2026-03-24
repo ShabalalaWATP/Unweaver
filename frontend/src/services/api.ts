@@ -9,6 +9,8 @@ import type {
   IOC,
   TransformRecord,
   AnalysisStatus,
+  AISummaryReport,
+  SavedAnalysisSnapshot,
   ProviderSettings,
   ProviderSettingsCreate,
   AnalysisState,
@@ -319,11 +321,10 @@ export async function saveNotes(
 //  AI Summary
 // ════════════════════════════════════════════════════════════════════════
 
-export async function generateSummary(sampleId: string): Promise<string> {
-  const resp = await request<{ summary: string }>(`/samples/${sampleId}/summary`, {
+export async function generateSummary(sampleId: string): Promise<AISummaryReport> {
+  return request<AISummaryReport>(`/samples/${sampleId}/summary`, {
     method: 'POST',
   });
-  return resp.summary;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -344,6 +345,14 @@ export async function getAnalysisStatus(
 
 export async function stopAnalysis(sampleId: string): Promise<void> {
   return request<void>(`/samples/${sampleId}/analysis/stop`, {
+    method: 'POST',
+  });
+}
+
+export async function saveAnalysisSnapshot(
+  sampleId: string,
+): Promise<SavedAnalysisSnapshot> {
+  return request<SavedAnalysisSnapshot>(`/samples/${sampleId}/analysis/save`, {
     method: 'POST',
   });
 }
@@ -404,6 +413,16 @@ export async function exportDeobfuscated(
   sampleId: string,
 ): Promise<{ blob: Blob; filename: string | null }> {
   return download(`/samples/${sampleId}/export/deobfuscated`);
+}
+
+export async function exportSingleFile(
+  sampleId: string,
+  filePath: string,
+  source: 'recovered' | 'original' = 'recovered',
+): Promise<{ blob: Blob; filename: string | null }> {
+  return download(
+    `/samples/${sampleId}/export/file?path=${encodeURIComponent(filePath)}&source=${source}`,
+  );
 }
 
 // ════════════════════════════════════════════════════════════════════════

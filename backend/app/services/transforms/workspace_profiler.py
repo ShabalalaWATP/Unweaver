@@ -9,10 +9,12 @@ can reason about a workspace as a set of files instead of a flat blob.
 from __future__ import annotations
 
 import re
-from collections import Counter
-from typing import Dict, List, Sequence, Tuple
+from collections import Counter, defaultdict
+from pathlib import PurePosixPath
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from app.services.ingest.workspace_bundle import (
+    ParsedWorkspaceFile,
     extract_workspace_context,
     parse_workspace_bundle,
     workspace_files_preview,
@@ -22,6 +24,7 @@ from app.services.transforms.base import BaseTransform, TransformResult
 _IMPORT_PATTERNS: Dict[str, Sequence[re.Pattern[str]]] = {
     "javascript": (
         re.compile(r'import\s+.+?\s+from\s+["\']([^"\']+)["\']'),
+        re.compile(r'import\s*\(\s*["\']([^"\']+)["\']\s*\)'),
         re.compile(r'require\s*\(\s*["\']([^"\']+)["\']\s*\)'),
     ),
     "typescript": (
@@ -71,6 +74,68 @@ _FUNCTION_PATTERNS: Dict[str, Sequence[re.Pattern[str]]] = {
         re.compile(r'type\s+([A-Za-z_]\w*)\s+struct\b'),
     ),
 }
+_JS_NAMED_IMPORT = re.compile(
+    r'import\s*{\s*(?P<bindings>[^}]+)\s*}\s*from\s*["\'](?P<target>[^"\']+)["\']',
+    re.MULTILINE,
+)
+_JS_DEFAULT_IMPORT = re.compile(
+    r'import\s+(?P<binding>[A-Za-z_]\w*)\s*(?:,\s*{[^}]+})?\s*from\s*["\'](?P<target>[^"\']+)["\']',
+    re.MULTILINE,
+)
+_JS_NAMESPACE_IMPORT = re.compile(
+    r'import\s+\*\s+as\s+(?P<binding>[A-Za-z_]\w*)\s+from\s*["\'](?P<target>[^"\']+)["\']',
+    re.MULTILINE,
+)
+_JS_REQUIRE_BINDING = re.compile(
+    r'(?:const|let|var)\s+(?P<binding>[A-Za-z_]\w*)\s*=\s*require\(\s*["\'](?P<target>[^"\']+)["\']\s*\)',
+    re.MULTILINE,
+)
+_JS_REQUIRE_DESTRUCT = re.compile(
+    r'(?:const|let|var)\s*{\s*(?P<bindings>[^}]+)\s*}\s*=\s*require\(\s*["\'](?P<target>[^"\']+)["\']\s*\)',
+    re.MULTILINE,
+)
+_PY_FROM_IMPORT = re.compile(
+    r'^\s*from\s+(?P<target>[.a-zA-Z0-9_]+)\s+import\s+(?P<bindings>[a-zA-Z0-9_., ]+)',
+    re.MULTILINE,
+)
+_PY_IMPORT = re.compile(
+    r'^\s*import\s+(?P<bindings>[a-zA-Z0-9_., ]+)',
+    re.MULTILINE,
+)
+_JS_EXPORT_PATTERNS: Dict[str, Sequence[re.Pattern[str]]] = {
+    "javascript": (
+        re.compile(r'export\s+(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\('),
+        re.compile(r'export\s+(?:const|let|var|class)\s+([A-Za-z_]\w*)\b'),
+        re.compile(r'exports\.([A-Za-z_]\w*)\s*='),
+    ),
+    "typescript": (
+        re.compile(r'export\s+(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\('),
+        re.compile(r'export\s+(?:const|let|var|class|interface|type)\s+([A-Za-z_]\w*)\b'),
+        re.compile(r'exports\.([A-Za-z_]\w*)\s*='),
+    ),
+}
+_JS_MODULE_EXPORT_OBJECT = re.compile(
+    r'module\.exports\s*=\s*{(?P<bindings>[^}]+)}',
+    re.DOTALL,
+)
+_CALL_NAME_PATTERN = re.compile(r'(?<![\w.])([A-Za-z_]\w*)\s*\(')
+_QUALIFIED_CALL_PATTERN = re.compile(r'(?<![\w.])([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(')
+_CALL_EXCLUDE = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "function",
+    "return",
+    "typeof",
+    "require",
+    "import",
+    "class",
+    "def",
+    "lambda",
+    "new",
+}
 _SUSPICIOUS_API_PATTERNS: Sequence[Tuple[re.Pattern[str], str]] = (
     (re.compile(r'\beval\s*\(', re.IGNORECASE), "eval"),
     (re.compile(r'\bexec\s*\(', re.IGNORECASE), "exec"),
@@ -81,6 +146,544 @@ _SUSPICIOUS_API_PATTERNS: Sequence[Tuple[re.Pattern[str], str]] = (
     (re.compile(r'\bsubprocess\.(?:Popen|run|call)\b', re.IGNORECASE), "subprocess"),
     (re.compile(r'\brequests\.(?:get|post)\b', re.IGNORECASE), "requests"),
 )
+_OBFUSCATION_SIGNAL_PATTERNS: Sequence[Tuple[re.Pattern[str], str]] = (
+    (re.compile(r'\b_0x[a-fA-F0-9]{3,}\b'), "_0x_identifiers"),
+    (re.compile(r'String\.fromCharCode', re.IGNORECASE), "charcode_builder"),
+    (re.compile(r'\b(?:atob|btoa)\s*\(', re.IGNORECASE), "base64_runtime"),
+    (re.compile(r'(?:\\x[0-9a-fA-F]{2}){4,}'), "hex_escapes"),
+    (re.compile(r'[A-Za-z0-9+/]{48,}={0,2}'), "base64_blob"),
+    (re.compile(r'\b(?:decrypt|decode|unwrap|unpack|xor)\w*\b', re.IGNORECASE), "decoder_terms"),
+    (re.compile(r'\b(?:EncodedCommand|enc)\b', re.IGNORECASE), "powershell_encoded_command"),
+    (re.compile(r'\bmarshal\.loads\b', re.IGNORECASE), "python_marshal"),
+)
+_JS_TS_EXTENSIONS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+
+
+def _clean_import_target(raw: str) -> str:
+    value = str(raw).strip().strip("'\"")
+    value = value.split("?", 1)[0]
+    value = value.split("#", 1)[0]
+    return value.strip()
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen = set()
+    ordered: List[str] = []
+    for item in items:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _build_python_module_index(files: Sequence[ParsedWorkspaceFile]) -> Dict[str, str]:
+    index: Dict[str, str] = {}
+    for file in files:
+        if file.language != "python":
+            continue
+        path = PurePosixPath(file.path)
+        if path.name == "__init__.py":
+            module_name = ".".join(path.parent.parts)
+        else:
+            module_name = ".".join(path.with_suffix("").parts)
+        if module_name:
+            index[module_name] = file.path
+    return index
+
+
+def _candidate_js_paths(source_path: str, raw_import: str) -> List[str]:
+    base_value = raw_import.lstrip("/")
+    if raw_import.startswith("."):
+        base = PurePosixPath(source_path).parent.joinpath(raw_import)
+    else:
+        base = PurePosixPath(base_value)
+
+    base_candidates = [base.as_posix()]
+    trimmed_relative = re.sub(r"^(?:\.\./)+", "", raw_import).lstrip("./")
+    if trimmed_relative:
+        base_candidates.append(PurePosixPath(trimmed_relative).as_posix())
+
+    candidates: List[str] = []
+    for base_path in base_candidates:
+        candidates.append(base_path)
+        if PurePosixPath(base_path).suffix:
+            continue
+        for ext in _JS_TS_EXTENSIONS:
+            candidates.append(f"{base_path}{ext}")
+        for ext in _JS_TS_EXTENSIONS:
+            candidates.append(f"{base_path}/index{ext}")
+
+    return _dedupe_preserve_order(candidates)
+
+
+def _match_by_suffix(candidate: str, path_set: set[str]) -> Optional[str]:
+    if candidate in path_set:
+        return candidate
+    suffix_matches = sorted(
+        path for path in path_set
+        if path == candidate or path.endswith(f"/{candidate}")
+    )
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
+def _resolve_python_import(
+    *,
+    source_path: str,
+    raw_import: str,
+    module_index: Dict[str, str],
+) -> Optional[str]:
+    if raw_import in module_index:
+        return module_index[raw_import]
+
+    if raw_import.startswith("."):
+        level = len(raw_import) - len(raw_import.lstrip("."))
+        remainder = raw_import[level:]
+        source = PurePosixPath(source_path)
+        if source.name == "__init__.py":
+            package_parts = list(source.parent.parts)
+        else:
+            package_parts = list(source.with_suffix("").parts[:-1])
+        if level > 1:
+            trim = min(level - 1, len(package_parts))
+            package_parts = package_parts[:-trim]
+        remainder_parts = [part for part in remainder.split(".") if part]
+        candidate_module = ".".join(package_parts + remainder_parts)
+        if candidate_module in module_index:
+            return module_index[candidate_module]
+        if not remainder_parts:
+            package_only = ".".join(package_parts)
+            if package_only in module_index:
+                return module_index[package_only]
+
+    suffix_matches = sorted(
+        path for module_name, path in module_index.items()
+        if module_name.endswith(raw_import)
+    )
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
+def _resolve_import_target(
+    *,
+    source_path: str,
+    raw_import: str,
+    language: str,
+    path_set: set[str],
+    python_modules: Dict[str, str],
+) -> Optional[str]:
+    cleaned = _clean_import_target(raw_import)
+    if not cleaned:
+        return None
+
+    lang = (language or "").lower()
+    if lang in {"javascript", "typescript"}:
+        for candidate in _candidate_js_paths(source_path, cleaned):
+            matched = _match_by_suffix(candidate, path_set)
+            if matched:
+                return matched
+        return None
+
+    if lang == "python":
+        return _resolve_python_import(
+            source_path=source_path,
+            raw_import=cleaned,
+            module_index=python_modules,
+        )
+
+    return _match_by_suffix(cleaned, path_set)
+
+
+def _count_pattern_hits(patterns: Sequence[Tuple[re.Pattern[str], str]], text: str) -> Tuple[int, List[str]]:
+    hits = 0
+    labels: List[str] = []
+    excerpt = text[:25_000]
+    for pattern, label in patterns:
+        if pattern.search(excerpt):
+            hits += 1
+            labels.append(label)
+    return hits, labels
+
+
+def _parse_js_named_bindings(raw: str) -> List[Tuple[str, str]]:
+    bindings: List[Tuple[str, str]] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        if " as " in value:
+            source_symbol, local_name = [item.strip() for item in value.split(" as ", 1)]
+        else:
+            source_symbol = value
+            local_name = value
+        if source_symbol and local_name:
+            bindings.append((source_symbol, local_name))
+    return bindings
+
+
+def _parse_destructured_bindings(raw: str) -> List[Tuple[str, str]]:
+    bindings: List[Tuple[str, str]] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        if ":" in value:
+            source_symbol, local_name = [item.strip() for item in value.split(":", 1)]
+        else:
+            source_symbol = value
+            local_name = value
+        if source_symbol and local_name:
+            bindings.append((source_symbol, local_name))
+    return bindings
+
+
+def _parse_python_from_import_bindings(raw: str) -> List[Tuple[str, str]]:
+    bindings: List[Tuple[str, str]] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        if " as " in value:
+            source_symbol, local_name = [item.strip() for item in value.split(" as ", 1)]
+        else:
+            source_symbol = value
+            local_name = value
+        if source_symbol and local_name:
+            bindings.append((source_symbol, local_name))
+    return bindings
+
+
+def _parse_python_import_entries(raw: str) -> List[Tuple[str, str]]:
+    entries: List[Tuple[str, str]] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        if " as " in value:
+            target, local_name = [item.strip() for item in value.split(" as ", 1)]
+        else:
+            target = value
+            local_name = value.split(".")[-1]
+        if target and local_name:
+            entries.append((target, local_name))
+    return entries
+
+
+def _extract_defined_symbols(file: ParsedWorkspaceFile) -> List[str]:
+    symbols: List[str] = []
+    for pattern in _FUNCTION_PATTERNS.get(file.language, ()):
+        for match in pattern.findall(file.text[:30_000]):
+            value = match[0] if isinstance(match, tuple) else match
+            symbol = str(value).strip()
+            if symbol:
+                symbols.append(symbol)
+    return _dedupe_preserve_order(symbols)
+
+
+def _extract_exported_symbols(file: ParsedWorkspaceFile) -> List[str]:
+    symbols: List[str] = []
+    lang = (file.language or "").lower()
+    for pattern in _JS_EXPORT_PATTERNS.get(lang, ()):
+        for match in pattern.findall(file.text[:30_000]):
+            value = match[0] if isinstance(match, tuple) else match
+            symbol = str(value).strip()
+            if symbol:
+                symbols.append(symbol)
+    if lang == "python":
+        symbols.extend(_extract_defined_symbols(file))
+    elif lang in {"javascript", "typescript"}:
+        for match in _JS_MODULE_EXPORT_OBJECT.finditer(file.text[:30_000]):
+            symbols.extend(
+                local_name
+                for _, local_name in _parse_destructured_bindings(match.group("bindings"))
+            )
+    return _dedupe_preserve_order(symbols)
+
+
+def _extract_import_metadata(
+    *,
+    file: ParsedWorkspaceFile,
+    path_set: set[str],
+    python_modules: Dict[str, str],
+) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    imports: List[str] = []
+    import_edges: List[Dict[str, Any]] = []
+    binding_map: Dict[str, Dict[str, Any]] = {}
+    seen_import_keys: set[Tuple[str, Optional[str], Optional[str], Optional[str], str]] = set()
+
+    def record_import(
+        raw_target: str,
+        *,
+        binding_name: Optional[str] = None,
+        source_symbol: Optional[str] = None,
+        kind: str = "generic",
+        qualified_calls: bool = False,
+    ) -> None:
+        cleaned = _clean_import_target(raw_target)
+        if not cleaned:
+            return
+        resolved = _resolve_import_target(
+            source_path=file.path,
+            raw_import=cleaned,
+            language=file.language,
+            path_set=path_set,
+            python_modules=python_modules,
+        )
+        key = (cleaned, resolved, binding_name, source_symbol, kind)
+        if key not in seen_import_keys:
+            seen_import_keys.add(key)
+            label = f"{file.path} -> {cleaned}"
+            if resolved:
+                label += f" [{resolved}]"
+            imports.append(label)
+            import_edges.append(
+                {
+                    "source": file.path,
+                    "raw": cleaned,
+                    "resolved": resolved,
+                    "kind": "local" if resolved else "external",
+                    "binding": binding_name,
+                    "symbol": source_symbol,
+                    "import_kind": kind,
+                }
+            )
+        if binding_name and resolved:
+            binding_map[binding_name] = {
+                "resolved": resolved,
+                "source_symbol": source_symbol,
+                "qualified_calls": qualified_calls,
+                "kind": kind,
+            }
+
+    if file.language in {"javascript", "typescript"}:
+        for match in _JS_NAMED_IMPORT.finditer(file.text[:20_000]):
+            target = match.group("target")
+            for source_symbol, local_name in _parse_js_named_bindings(match.group("bindings")):
+                record_import(
+                    target,
+                    binding_name=local_name,
+                    source_symbol=source_symbol,
+                    kind="named",
+                )
+        for match in _JS_NAMESPACE_IMPORT.finditer(file.text[:20_000]):
+            record_import(
+                match.group("target"),
+                binding_name=match.group("binding"),
+                kind="namespace",
+                qualified_calls=True,
+            )
+        for match in _JS_DEFAULT_IMPORT.finditer(file.text[:20_000]):
+            record_import(
+                match.group("target"),
+                binding_name=match.group("binding"),
+                source_symbol="default",
+                kind="default",
+                qualified_calls=True,
+            )
+        for match in _JS_REQUIRE_BINDING.finditer(file.text[:20_000]):
+            record_import(
+                match.group("target"),
+                binding_name=match.group("binding"),
+                source_symbol="default",
+                kind="require",
+                qualified_calls=True,
+            )
+        for match in _JS_REQUIRE_DESTRUCT.finditer(file.text[:20_000]):
+            target = match.group("target")
+            for source_symbol, local_name in _parse_destructured_bindings(match.group("bindings")):
+                record_import(
+                    target,
+                    binding_name=local_name,
+                    source_symbol=source_symbol,
+                    kind="require_destructured",
+                )
+
+    if file.language == "python":
+        for match in _PY_FROM_IMPORT.finditer(file.text[:20_000]):
+            target = match.group("target")
+            for source_symbol, local_name in _parse_python_from_import_bindings(match.group("bindings")):
+                record_import(
+                    target,
+                    binding_name=local_name,
+                    source_symbol=source_symbol,
+                    kind="from_import",
+                )
+        for match in _PY_IMPORT.finditer(file.text[:20_000]):
+            for target, local_name in _parse_python_import_entries(match.group("bindings")):
+                record_import(
+                    target,
+                    binding_name=local_name,
+                    kind="module_alias",
+                    qualified_calls=True,
+                )
+
+    for pattern in _IMPORT_PATTERNS.get(file.language, ()):
+        for match in pattern.findall(file.text[:20_000]):
+            if isinstance(match, tuple):
+                match = match[0]
+            for item in str(match).split(","):
+                record_import(item, kind="generic")
+
+    return imports, import_edges, binding_map
+
+
+def _extract_cross_file_call_edges(
+    *,
+    file: ParsedWorkspaceFile,
+    binding_map: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    direct_calls = Counter(
+        match.group(1)
+        for match in _CALL_NAME_PATTERN.finditer(file.text[:25_000])
+        if match.group(1) not in _CALL_EXCLUDE
+    )
+    qualified_calls = Counter(
+        (match.group(1), match.group(2))
+        for match in _QUALIFIED_CALL_PATTERN.finditer(file.text[:25_000])
+        if match.group(1) not in _CALL_EXCLUDE and match.group(2) not in _CALL_EXCLUDE
+    )
+
+    aggregated: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+
+    for binding_name, count in direct_calls.items():
+        info = binding_map.get(binding_name)
+        if not info or not info.get("resolved"):
+            continue
+        symbol = info.get("source_symbol")
+        if not symbol or symbol == "default":
+            symbol = binding_name
+        aggregated[(file.path, str(info["resolved"]), str(symbol), "direct")] = {
+            "source": file.path,
+            "target": info["resolved"],
+            "symbol": symbol,
+            "count": count,
+            "call_style": "direct",
+        }
+
+    for (qualifier, member), count in qualified_calls.items():
+        info = binding_map.get(qualifier)
+        if not info or not info.get("resolved") or not info.get("qualified_calls"):
+            continue
+        aggregated[(file.path, str(info["resolved"]), member, "qualified")] = {
+            "source": file.path,
+            "target": info["resolved"],
+            "symbol": member,
+            "count": count,
+            "call_style": "qualified",
+        }
+
+    return list(aggregated.values())
+
+
+def _build_execution_paths(
+    *,
+    start_paths: Sequence[str],
+    call_edges: Sequence[Dict[str, Any]],
+    max_paths: int = 8,
+    max_depth: int = 4,
+) -> List[str]:
+    adjacency: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for edge in call_edges:
+        adjacency[str(edge.get("source", ""))].append(edge)
+
+    execution_paths: List[str] = []
+    queue: List[Tuple[str, List[str], int]] = [
+        (path, [path], 0)
+        for path in _dedupe_preserve_order(start_paths)
+        if path
+    ]
+
+    while queue and len(execution_paths) < max_paths:
+        current, segments, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+        visited_paths = {segment.split("::", 1)[0] for segment in segments}
+        for edge in adjacency.get(current, [])[:8]:
+            target = str(edge.get("target", "")).strip()
+            symbol = str(edge.get("symbol", "")).strip()
+            if not target or target in visited_paths:
+                continue
+            next_label = f"{target}::{symbol}" if symbol else target
+            rendered = " -> ".join(segments + [next_label])
+            if rendered not in execution_paths:
+                execution_paths.append(rendered)
+            queue.append((target, segments + [next_label], depth + 1))
+            if len(execution_paths) >= max_paths:
+                break
+
+    return execution_paths
+
+
+def _summarise_priority(
+    file: ParsedWorkspaceFile,
+    *,
+    entry_points: set[str],
+    suspicious_files: set[str],
+    outbound_local: int,
+    inbound_local: int,
+    outbound_calls: int,
+    inbound_calls: int,
+    suspicious_api_hits: int,
+    obfuscation_hits: int,
+    function_count: int,
+    exported_symbol_count: int,
+) -> Dict[str, Any]:
+    score = 0.0
+    reasons: List[str] = []
+
+    if "suspicious" in file.priority or file.path in suspicious_files:
+        score += 6.0
+        reasons.append("suspicious")
+    if "entrypoint" in file.priority or file.path in entry_points:
+        score += 4.5
+        reasons.append("entrypoint")
+    if "manifest" in file.priority:
+        score += 1.2
+        reasons.append("manifest")
+    if inbound_local:
+        score += min(inbound_local * 1.4, 4.8)
+        reasons.append("inbound_dependencies")
+    if outbound_local:
+        score += min(outbound_local * 1.0, 3.5)
+        reasons.append("outbound_dependencies")
+    if inbound_calls:
+        score += min(inbound_calls * 1.7, 5.1)
+        reasons.append("cross_file_call_target")
+    if outbound_calls:
+        score += min(outbound_calls * 1.1, 3.3)
+        reasons.append("cross_file_calls")
+    if suspicious_api_hits:
+        score += min(suspicious_api_hits * 1.5, 4.5)
+        reasons.append("suspicious_api")
+    if obfuscation_hits:
+        score += min(obfuscation_hits * 1.2, 4.5)
+        reasons.append("obfuscation_signals")
+    if function_count:
+        score += min(function_count * 0.15, 1.5)
+    if exported_symbol_count:
+        score += min(exported_symbol_count * 0.18, 1.4)
+
+    if not reasons:
+        reasons.append("bundled_order")
+
+    return {
+        "path": file.path,
+        "language": file.language,
+        "score": round(score, 2),
+        "reasons": reasons,
+        "priority_tags": list(file.priority),
+        "inbound_edges": inbound_local,
+        "outbound_edges": outbound_local,
+        "cross_file_call_in": inbound_calls,
+        "cross_file_call_out": outbound_calls,
+        "suspicious_api_hits": suspicious_api_hits,
+        "obfuscation_signal_hits": obfuscation_hits,
+        "function_count": function_count,
+        "exported_symbol_count": exported_symbol_count,
+    }
 
 
 class WorkspaceProfiler(BaseTransform):
@@ -104,39 +707,140 @@ class WorkspaceProfiler(BaseTransform):
                 details={},
             )
 
+        path_set = {file.path for file in files}
+        python_modules = _build_python_module_index(files)
         imports: List[str] = []
+        import_edges: List[Dict[str, Any]] = []
         functions: List[str] = []
         suspicious_apis: List[str] = []
         evidence_references: List[str] = []
+        local_inbound: Dict[str, int] = defaultdict(int)
+        local_outbound: Dict[str, int] = defaultdict(int)
+        call_inbound: Dict[str, int] = defaultdict(int)
+        call_outbound: Dict[str, int] = defaultdict(int)
+        function_counts: Dict[str, int] = defaultdict(int)
+        suspicious_api_counts: Dict[str, int] = defaultdict(int)
+        obfuscation_signal_counts: Dict[str, int] = defaultdict(int)
+        defined_symbols_by_file: Dict[str, List[str]] = {}
+        exported_symbols_by_file: Dict[str, List[str]] = {}
+        cross_file_call_edges: List[Dict[str, Any]] = []
+        counted_local_dependencies: set[Tuple[str, str]] = set()
 
         for file in files[:48]:
             evidence_references.append(file.path)
-            for pattern in _IMPORT_PATTERNS.get(file.language, ()):
-                for match in pattern.findall(file.text[:20_000]):
-                    if isinstance(match, tuple):
-                        match = match[0]
-                    for item in str(match).split(","):
-                        value = item.strip()
-                        if value:
-                            imports.append(f"{file.path} -> {value}")
+            file_imports, file_import_edges, binding_map = _extract_import_metadata(
+                file=file,
+                path_set=path_set,
+                python_modules=python_modules,
+            )
+            imports.extend(file_imports)
+            import_edges.extend(file_import_edges)
+            for edge in file_import_edges:
+                if edge["kind"] == "local" and edge.get("resolved"):
+                    dependency_key = (file.path, str(edge["resolved"]))
+                    if dependency_key in counted_local_dependencies:
+                        continue
+                    counted_local_dependencies.add(dependency_key)
+                    local_outbound[file.path] += 1
+                    local_inbound[str(edge["resolved"])] += 1
 
-            for pattern in _FUNCTION_PATTERNS.get(file.language, ()):
-                for match in pattern.findall(file.text[:30_000]):
-                    if isinstance(match, tuple):
-                        match = match[0]
-                    value = str(match).strip()
-                    if value:
-                        functions.append(f"{file.path}::{value}")
+            defined_symbols = _extract_defined_symbols(file)
+            exported_symbols = _extract_exported_symbols(file)
+            defined_symbols_by_file[file.path] = defined_symbols
+            exported_symbols_by_file[file.path] = exported_symbols
+            for symbol in defined_symbols:
+                functions.append(f"{file.path}::{symbol}")
+            function_counts[file.path] = len(defined_symbols)
 
             for pattern, label in _SUSPICIOUS_API_PATTERNS:
                 if pattern.search(file.text[:25_000]):
                     suspicious_apis.append(f"{label} @ {file.path}")
+                    suspicious_api_counts[file.path] += 1
+
+            obfuscation_hits, _ = _count_pattern_hits(_OBFUSCATION_SIGNAL_PATTERNS, file.text)
+            if obfuscation_hits:
+                obfuscation_signal_counts[file.path] += obfuscation_hits
+
+            file_call_edges = _extract_cross_file_call_edges(
+                file=file,
+                binding_map=binding_map,
+            )
+            cross_file_call_edges.extend(file_call_edges)
+            for edge in file_call_edges:
+                source = str(edge.get("source", "")).strip()
+                target = str(edge.get("target", "")).strip()
+                count = int(edge.get("count", 1) or 1)
+                if source:
+                    call_outbound[source] += count
+                if target:
+                    call_inbound[target] += count
 
         root_dirs = list(context.get("root_dirs", []))
         entry_points = list(context.get("entry_points", []))
         manifest_files = list(context.get("manifest_files", []))
         suspicious_files = list(context.get("suspicious_files", []))
         languages_counter = Counter(file.language for file in files)
+
+        prioritized_files = sorted(
+            (
+                _summarise_priority(
+                    file,
+                    entry_points=set(entry_points),
+                    suspicious_files=set(suspicious_files),
+                    outbound_local=local_outbound[file.path],
+                    inbound_local=local_inbound[file.path],
+                    outbound_calls=call_outbound[file.path],
+                    inbound_calls=call_inbound[file.path],
+                    suspicious_api_hits=suspicious_api_counts[file.path],
+                    obfuscation_hits=obfuscation_signal_counts[file.path],
+                    function_count=function_counts[file.path],
+                    exported_symbol_count=len(exported_symbols_by_file.get(file.path, [])),
+                )
+                for file in files
+            ),
+            key=lambda item: (-float(item["score"]), item["path"]),
+        )[:16]
+
+        dependency_hotspots = [
+            item["path"]
+            for item in prioritized_files[:8]
+            if item["inbound_edges"] or item["outbound_edges"] or item["reasons"] != ["bundled_order"]
+        ]
+        symbol_hotspots = [
+            item["path"]
+            for item in prioritized_files[:8]
+            if item["cross_file_call_in"] or item["cross_file_call_out"] or item["exported_symbol_count"]
+        ]
+        unique_local_edges: List[Dict[str, Any]] = []
+        unique_external_edges: List[Dict[str, Any]] = []
+        seen_local_edges: set[Tuple[str, str]] = set()
+        seen_external_edges: set[Tuple[str, str]] = set()
+        for edge in import_edges:
+            source = str(edge.get("source", "")).strip()
+            kind = str(edge.get("kind", "")).strip()
+            resolved = str(edge.get("resolved", "")).strip()
+            raw = str(edge.get("raw", "")).strip()
+            target_key = resolved or raw
+            if not source or not target_key:
+                continue
+            edge_key = (source, target_key)
+            if kind == "local":
+                if edge_key in seen_local_edges:
+                    continue
+                seen_local_edges.add(edge_key)
+                unique_local_edges.append(edge)
+            elif kind == "external":
+                if edge_key in seen_external_edges:
+                    continue
+                seen_external_edges.add(edge_key)
+                unique_external_edges.append(edge)
+
+        local_edges = unique_local_edges[:64]
+        external_edges = unique_external_edges[:64]
+        execution_paths = _build_execution_paths(
+            start_paths=entry_points or suspicious_files or dependency_hotspots,
+            call_edges=cross_file_call_edges,
+        )
 
         detected_techniques = ["workspace_bundle"]
         if len(root_dirs) > 1:
@@ -145,14 +849,30 @@ class WorkspaceProfiler(BaseTransform):
             detected_techniques.append("entrypoint_ranked")
         if suspicious_files:
             detected_techniques.append("cross_file_obfuscation_candidate")
+        if local_edges:
+            detected_techniques.append("import_graph_resolved")
+        if cross_file_call_edges:
+            detected_techniques.append("cross_file_call_graph")
+        if dependency_hotspots or symbol_hotspots:
+            detected_techniques.append("workspace_hotspots_ranked")
 
         summary_parts = [
             f"Workspace bundle with {len(files)} file(s)",
             f"{len(entry_points)} likely entrypoint(s)",
             f"{len(suspicious_files)} suspicious file(s)",
+            f"{len(local_edges)} local dependency edge(s)",
         ]
+        if cross_file_call_edges:
+            summary_parts.append(f"{len(cross_file_call_edges)} cross-file call edge(s)")
         if manifest_files:
             summary_parts.append(f"{len(manifest_files)} manifest/config file(s)")
+        hotspot_preview = dependency_hotspots[:2] + [
+            path for path in symbol_hotspots[:2] if path not in dependency_hotspots[:2]
+        ]
+        if hotspot_preview:
+            summary_parts.append(
+                "hotspots: " + " | ".join(hotspot_preview[:3])
+            )
         summary = ". ".join(summary_parts) + "."
 
         workspace_context = {
@@ -161,21 +881,49 @@ class WorkspaceProfiler(BaseTransform):
             "imports_count": len(imports),
             "functions_count": len(functions),
             "languages_by_file": dict(languages_counter),
+            "prioritized_files": prioritized_files,
+            "dependency_hotspots": dependency_hotspots,
+            "symbol_hotspots": symbol_hotspots,
+            "local_dependency_edges": local_edges,
+            "external_dependency_edges": external_edges,
+            "cross_file_call_edges": cross_file_call_edges[:96],
+            "execution_paths": execution_paths[:8],
+            "defined_symbols": [
+                {"path": path, "symbols": symbols[:10]}
+                for path, symbols in list(defined_symbols_by_file.items())[:16]
+                if symbols
+            ],
+            "exported_symbols": [
+                {"path": path, "symbols": symbols[:10]}
+                for path, symbols in list(exported_symbols_by_file.items())[:16]
+                if symbols
+            ],
+            "local_dependency_count": len(local_edges),
+            "external_dependency_count": len(external_edges),
+            "cross_file_call_count": len(cross_file_call_edges),
+            "graph_summary": {
+                "local_edges": len(local_edges),
+                "external_edges": len(external_edges),
+                "cross_file_calls": len(cross_file_call_edges),
+                "execution_paths": len(execution_paths),
+                "hotspots": _dedupe_preserve_order(dependency_hotspots + symbol_hotspots)[:8],
+            },
         }
 
         return TransformResult(
             success=True,
             output=code,
-            confidence=0.85,
+            confidence=0.88,
             description=summary,
             details={
                 "workspace_context": workspace_context,
                 "entry_points": entry_points[:12],
-                "imports": imports[:60],
-                "functions": functions[:60],
+                "imports": _dedupe_preserve_order(imports)[:80],
+                "import_edges": import_edges[:96],
+                "functions": functions[:80],
                 "suspicious_apis": sorted(set(suspicious_apis))[:30],
                 "detected_techniques": detected_techniques,
-                "evidence_references": evidence_references[:32],
+                "evidence_references": evidence_references[:48],
                 "summary": summary,
             },
         )

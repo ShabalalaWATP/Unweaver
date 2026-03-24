@@ -25,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.crypto import decrypt_value, encrypt_value
 from app.core.database import get_db
 from app.models.db_models import ProviderConfig
 from app.models.schemas import (
@@ -36,8 +37,9 @@ from app.services.llm.client import LLMClient, _MAX_TOKENS_MAP
 router = APIRouter(tags=["providers"])
 
 
-def _mask_key(raw: str) -> str:
-    """Mask an API key, showing only the first 4 and last 4 characters."""
+def _mask_key(stored: str) -> str:
+    """Decrypt then mask an API key, showing only the first 4 and last 4 characters."""
+    raw = decrypt_value(stored)
     if not raw:
         return ""
     if len(raw) <= 8:
@@ -86,7 +88,7 @@ async def create_provider(
         name=payload.name,
         base_url=payload.base_url,
         model_name=payload.model_name,
-        api_key_encrypted=payload.api_key,
+        api_key_encrypted=encrypt_value(payload.api_key),
         cert_bundle_path=payload.cert_bundle_path,
         use_system_trust=payload.use_system_trust,
         max_tokens_preset=payload.max_tokens_preset,
@@ -174,7 +176,7 @@ async def update_provider(
     # Only update the API key if a non-empty value was provided
     # (so the frontend can send an empty string to mean "keep existing")
     if payload.api_key:
-        provider.api_key_encrypted = payload.api_key
+        provider.api_key_encrypted = encrypt_value(payload.api_key)
 
     await db.flush()
     await db.refresh(provider)
@@ -215,12 +217,13 @@ async def test_provider(
             detail=f"Provider {provider_id} not found",
         )
 
-    max_tokens = _MAX_TOKENS_MAP.get(provider.max_tokens_preset, 4096)
+    context_window = _MAX_TOKENS_MAP.get(provider.max_tokens_preset, 131_072)
     client = LLMClient(
         base_url=provider.base_url,
-        api_key=provider.api_key_encrypted,
+        api_key=decrypt_value(provider.api_key_encrypted),
         model=provider.model_name,
-        max_tokens=max_tokens,
+        max_tokens=4096,
+        context_window=context_window,
         cert_bundle=provider.cert_bundle_path,
         use_system_trust=provider.use_system_trust,
     )
@@ -268,16 +271,34 @@ async def upload_cert(
             detail="Certificate bundle exceeds 1 MB limit",
         )
 
-    # Basic sanity check: PEM files start with -----BEGIN
+    # Validate PEM structure: must decode as UTF-8, start with -----BEGIN,
+    # and parse as at least one valid certificate.
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError:
-        text = ""
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Certificate file is not valid UTF-8 text",
+        )
 
     if not text.strip().startswith("-----BEGIN"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="File does not appear to be a PEM-format certificate bundle",
+        )
+
+    # Attempt actual PEM parsing via cryptography library
+    try:
+        from cryptography.x509 import load_pem_x509_certificates
+        certs = load_pem_x509_certificates(content)
+        if not certs:
+            raise ValueError("No certificates found")
+    except ImportError:
+        pass  # cryptography not available — fall back to string check only
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File contains PEM headers but no valid X.509 certificates could be parsed",
         )
 
     # Save to disk

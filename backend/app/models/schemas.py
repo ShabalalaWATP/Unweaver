@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class SampleStatus(str, enum.Enum):
     """Lifecycle status of a sample's analysis."""
 
+    READY = "ready"
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -105,9 +106,43 @@ class SampleResponse(BaseModel):
     project_id: str
     filename: str
     language: Optional[str] = None
-    status: SampleStatus = SampleStatus.PENDING
+    status: SampleStatus = SampleStatus.READY
+    saved_analysis_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+
+
+class AISummarySections(BaseModel):
+    """Structured AI-written summary sections for a deobfuscation run."""
+
+    deobfuscation_analysis: str
+    inferred_original_intent: str
+    actual_behavior: str
+    confidence_assessment: str
+
+
+class AISummaryReport(BaseModel):
+    """Structured AI-written assessment returned to the frontend."""
+
+    summary: str
+    sections: AISummarySections
+    confidence_score: Optional[float] = None
+
+
+class SavedAnalysisSnapshot(BaseModel):
+    """Persisted analysis snapshot for reopening a completed run later."""
+
+    saved_at: Optional[datetime] = None
+    sample_status: Optional[SampleStatus] = None
+    transform_count: int = 0
+    finding_count: int = 0
+    ioc_count: int = 0
+    string_count: int = 0
+    recovered_text_length: int = 0
+    confidence_score: Optional[float] = None
+    analysis_summary: str = ""
+    workspace_context: Dict[str, Any] = Field(default_factory=dict)
+    ai_summary: Optional[AISummaryReport] = None
 
 
 class SampleDetail(BaseModel):
@@ -121,8 +156,10 @@ class SampleDetail(BaseModel):
     original_text: str
     recovered_text: Optional[str] = None
     language: Optional[str] = None
-    status: SampleStatus = SampleStatus.PENDING
+    status: SampleStatus = SampleStatus.READY
     analyst_notes: Optional[str] = None
+    saved_analysis: Optional[SavedAnalysisSnapshot] = None
+    saved_analysis_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 

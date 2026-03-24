@@ -8,16 +8,23 @@ manage lifecycle.
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.db_models import Sample
-from app.models.schemas import AnalysisStatus, SampleStatus
+from app.models.schemas import AnalysisStatus, SampleStatus, SavedAnalysisSnapshot
+from app.services.reports.saved_analysis import persist_saved_analysis_snapshot
 from app.tasks.analysis_task import (
     clear_tracker,
     get_analysis_status,
+    is_active,
     is_running,
+    queue_analysis,
     request_stop,
     run_analysis,
 )
@@ -49,7 +56,7 @@ async def start_analysis(
         )
 
     # Don't start if already running
-    if is_running(sample_id):
+    if is_active(sample_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Analysis is already running for this sample",
@@ -66,6 +73,7 @@ async def start_analysis(
     # Reset status if previously completed / failed / stopped
     sample.status = SampleStatus.PENDING.value
     await db.commit()
+    queue_analysis(sample_id, total_iterations=0)
 
     background_tasks.add_task(run_analysis, sample_id)
 
@@ -144,7 +152,16 @@ async def analysis_status(
     try:
         sample_status = SampleStatus(sample.status)
     except ValueError:
-        sample_status = SampleStatus.PENDING
+        sample_status = SampleStatus.READY
+
+    if sample_status == SampleStatus.PENDING:
+        try:
+            sample.status = SampleStatus.READY.value
+            await db.commit()
+        except Exception:
+            logger.warning("Failed to reset PENDING→READY for sample %s", sample_id)
+            await db.rollback()
+        sample_status = SampleStatus.READY
 
     progress = 100.0 if sample_status in (
         SampleStatus.COMPLETED, SampleStatus.FAILED, SampleStatus.STOPPED
@@ -180,13 +197,19 @@ async def stop_analysis(
             detail=f"Sample {sample_id} not found",
         )
 
-    if is_running(sample_id):
+    if is_active(sample_id):
         # Normal case: analysis is actively running — request graceful stop
         request_stop(sample_id)
         tracker = get_analysis_status(sample_id)
+        tracker_status = SampleStatus.RUNNING
+        if tracker:
+            try:
+                tracker_status = SampleStatus(tracker.get("status", SampleStatus.RUNNING.value))
+            except ValueError:
+                tracker_status = SampleStatus.RUNNING
         return AnalysisStatus(
             sample_id=sample_id,
-            status=SampleStatus.RUNNING,
+            status=tracker_status,
             current_iteration=tracker.get("current_iteration", 0) if tracker else 0,
             total_iterations=tracker.get("total_iterations", 0) if tracker else 0,
             current_action="stop requested",
@@ -211,3 +234,37 @@ async def stop_analysis(
         status_code=status.HTTP_409_CONFLICT,
         detail="No running analysis to stop for this sample",
     )
+
+
+# ── POST /api/samples/{id}/analysis/save ────────────────────────────
+@router.post(
+    "/samples/{sample_id}/analysis/save",
+    response_model=SavedAnalysisSnapshot,
+)
+async def save_analysis_snapshot(
+    sample_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> SavedAnalysisSnapshot:
+    """Persist a reusable snapshot of the latest saved analysis data."""
+    sample = await db.get(Sample, sample_id)
+    if sample is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Sample {sample_id} not found",
+        )
+
+    if (
+        sample.status not in (
+            SampleStatus.COMPLETED.value,
+            SampleStatus.STOPPED.value,
+            SampleStatus.FAILED.value,
+        )
+        and not sample.recovered_text
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Analysis results are not ready to save for this sample",
+        )
+
+    snapshot = await persist_saved_analysis_snapshot(db, sample)
+    return snapshot

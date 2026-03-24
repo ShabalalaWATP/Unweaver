@@ -4,6 +4,8 @@ import type { SampleDetail, AnalysisState } from '@/types';
 import ConfidenceGauge from '@/components/common/ConfidenceGauge';
 import { useToast } from '@/components/common/Toast';
 import * as api from '@/services/api';
+import signalChamberGraphic from '@/assets/graphics/signal-chamber.svg';
+import { parseWorkspaceBundle } from '@/utils/workspaceBundle';
 
 interface RightPanelProps {
   sample: SampleDetail;
@@ -34,6 +36,62 @@ const s = {
     border: '1px solid var(--border)',
     borderRadius: 'var(--radius-lg)',
     padding: '12px',
+  } as React.CSSProperties,
+  signalCard: {
+    position: 'relative',
+    overflow: 'hidden',
+    padding: '14px',
+    background: 'linear-gradient(165deg, rgba(88,166,255,0.12) 0%, rgba(17,21,28,0.88) 65%)',
+    border: '1px solid rgba(88,166,255,0.14)',
+    borderRadius: 'var(--radius-lg)',
+  } as React.CSSProperties,
+  signalLabel: {
+    fontSize: '10px',
+    fontWeight: 700,
+    textTransform: 'uppercase',
+    letterSpacing: '0.14em',
+    color: 'var(--accent-bright)',
+    marginBottom: '8px',
+  } as React.CSSProperties,
+  signalTitle: {
+    fontSize: '16px',
+    fontWeight: 700,
+    color: 'var(--text-primary)',
+    lineHeight: 1.2,
+    marginBottom: '8px',
+    maxWidth: '14ch',
+  } as React.CSSProperties,
+  signalBody: {
+    fontSize: '12px',
+    lineHeight: 1.5,
+    color: 'var(--text-secondary)',
+    maxWidth: '20ch',
+  } as React.CSSProperties,
+  signalGraphicWrap: {
+    marginTop: '14px',
+    borderRadius: '16px',
+    overflow: 'hidden',
+    border: '1px solid rgba(255,255,255,0.08)',
+    background: 'rgba(4, 9, 14, 0.4)',
+  } as React.CSSProperties,
+  signalGraphic: {
+    width: '100%',
+    display: 'block',
+  } as React.CSSProperties,
+  signalStats: {
+    display: 'flex',
+    gap: '8px',
+    flexWrap: 'wrap',
+    marginTop: '12px',
+  } as React.CSSProperties,
+  signalStatChip: {
+    padding: '4px 8px',
+    borderRadius: '999px',
+    background: 'rgba(255,255,255,0.05)',
+    border: '1px solid rgba(255,255,255,0.08)',
+    fontSize: '10px',
+    color: 'var(--text-secondary)',
+    fontFamily: 'var(--font-mono)',
   } as React.CSSProperties,
   sectionTitle: {
     fontSize: '10px',
@@ -182,6 +240,7 @@ function getReadabilityColor(val: number): string {
 export default function RightPanel({ sample, analysisState, onRefresh }: RightPanelProps) {
   const [notes, setNotes] = useState(sample.analyst_notes ?? '');
   const [saved, setSaved] = useState(false);
+  const [savingAnalysis, setSavingAnalysis] = useState(false);
   const toast = useToast();
 
   useEffect(() => {
@@ -200,14 +259,44 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
     }
   }, [sample.id, notes, toast]);
 
+  const savedAnalysis = sample.saved_analysis;
   const confidence = analysisState?.confidence ?? null;
-  const overallConfidence = confidence ? Math.round(confidence.overall * 100) : null;
+  const overallConfidence = confidence
+    ? Math.round(confidence.overall * 100)
+    : typeof savedAnalysis?.confidence_score === 'number'
+      ? Math.round(savedAnalysis.confidence_score * 100)
+      : null;
   const readability = analysisState?.transform_history?.length
     ? analysisState.transform_history[analysisState.transform_history.length - 1].readability_after
     : 0;
   const techniques = analysisState?.detected_techniques ?? [];
   const suspiciousApis = analysisState?.suspicious_apis ?? [];
-  const workspaceContext = analysisState?.workspace_context;
+  const parsedWorkspace = sample.language === 'workspace'
+    ? parseWorkspaceBundle(sample.recovered_text ?? '') ?? parseWorkspaceBundle(sample.original_text)
+    : null;
+  const workspaceContext = analysisState?.workspace_context
+    ?? savedAnalysis?.workspace_context
+    ?? (parsedWorkspace
+      ? {
+        ...parsedWorkspace,
+        files_preview: parsedWorkspace.files.slice(0, 12).map((file) => ({
+          path: file.path,
+          language: file.language,
+          priority: file.priority,
+          size_bytes: file.size_bytes,
+        })),
+      }
+      : null);
+  const workspaceGraphSummary = workspaceContext?.graph_summary;
+  const workspaceHotspots = workspaceContext
+    ? Array.from(
+      new Set([
+        ...(workspaceContext.symbol_hotspots ?? []),
+        ...(workspaceContext.dependency_hotspots ?? []),
+      ]),
+    )
+    : [];
+  const workspaceExecutionPaths = workspaceContext?.execution_paths ?? [];
   const languageLabel = sample.language === 'workspace' ? 'Workspace Bundle' : (sample.language ?? 'Unknown');
 
   const handleReanalyse = useCallback(async () => {
@@ -236,9 +325,48 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
     }
   }, [sample, toast]);
 
+  const handleSaveAnalysis = useCallback(async () => {
+    setSavingAnalysis(true);
+    try {
+      await api.saveAnalysisSnapshot(sample.id);
+      onRefresh();
+      toast.success('Analysis snapshot saved');
+    } catch {
+      toast.error('Failed to save analysis snapshot');
+    } finally {
+      setSavingAnalysis(false);
+    }
+  }, [sample.id, onRefresh, toast]);
+
   return (
     <div style={s.root}>
       <div style={s.scrollArea}>
+        <div className="unweaver-card unweaver-signal-panel" style={s.signalCard}>
+          <div style={s.signalLabel}>Live Surface</div>
+          <div style={s.signalTitle}>Deobfuscation field for the current sample.</div>
+          <div style={s.signalBody}>
+            Read deobfuscation confidence, risky APIs, and workspace scope at a glance before you drill into the tabs.
+          </div>
+          <div style={s.signalGraphicWrap}>
+            <img
+              src={signalChamberGraphic}
+              alt="Abstract signal chamber"
+              style={s.signalGraphic}
+            />
+          </div>
+          <div style={s.signalStats}>
+            <span style={s.signalStatChip}>
+              conf {overallConfidence !== null ? `${overallConfidence}%` : 'n/a'}
+            </span>
+            <span style={s.signalStatChip}>
+              tech {techniques.length}
+            </span>
+            <span style={s.signalStatChip}>
+              apis {suspiciousApis.length}
+            </span>
+          </div>
+        </div>
+
         {/* Language */}
         <div className="unweaver-card" style={s.card}>
           <div style={s.sectionTitle}>
@@ -323,6 +451,30 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
               <span>Included files</span>
               <span style={s.statValue}>{workspaceContext.included_files ?? 0}</span>
             </div>
+            {'omitted_files' in workspaceContext && (
+              <div style={s.statRow}>
+                <span>Omitted files</span>
+                <span style={s.statValue}>{workspaceContext.omitted_files ?? 0}</span>
+              </div>
+            )}
+            {typeof workspaceContext.local_dependency_count === 'number' && (
+              <div style={s.statRow}>
+                <span>Local imports</span>
+                <span style={s.statValue}>{workspaceContext.local_dependency_count}</span>
+              </div>
+            )}
+            {typeof workspaceContext.cross_file_call_count === 'number' && (
+              <div style={s.statRow}>
+                <span>Cross-file calls</span>
+                <span style={s.statValue}>{workspaceContext.cross_file_call_count}</span>
+              </div>
+            )}
+            {typeof workspaceGraphSummary?.execution_paths === 'number' && (
+              <div style={s.statRow}>
+                <span>Execution paths</span>
+                <span style={s.statValue}>{workspaceGraphSummary.execution_paths}</span>
+              </div>
+            )}
             {!!workspaceContext.entry_points?.length && (
               <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--text-secondary)' }}>
                 Entrypoints: {workspaceContext.entry_points.slice(0, 4).join(', ')}
@@ -331,6 +483,21 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
             {!!workspaceContext.suspicious_files?.length && (
               <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--danger)' }}>
                 Suspicious: {workspaceContext.suspicious_files.slice(0, 3).join(', ')}
+              </div>
+            )}
+            {!!workspaceHotspots.length && (
+              <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--accent)', lineHeight: '1.55' }}>
+                Hotspots: {workspaceHotspots.slice(0, 4).join(', ')}
+              </div>
+            )}
+            {!!workspaceExecutionPaths.length && (
+              <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.55' }}>
+                Execution path: {workspaceExecutionPaths[0]}
+              </div>
+            )}
+            {!!workspaceContext.files_preview?.length && (
+              <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-muted)', lineHeight: '1.55' }}>
+                Visible bundle files: {workspaceContext.files_preview.slice(0, 4).map((file) => file.path).join(', ')}
               </div>
             )}
           </div>
@@ -353,6 +520,26 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
         <div style={s.card}>
           <div style={s.sectionTitle}>Quick Actions</div>
           <div style={s.actions}>
+            <button
+              style={{
+                ...s.actionBtn,
+                opacity: savingAnalysis ? 0.5 : 1,
+              }}
+              onClick={handleSaveAnalysis}
+              title="Save analysis snapshot"
+              disabled={savingAnalysis}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = 'var(--accent)';
+                e.currentTarget.style.color = 'var(--accent)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = 'var(--border)';
+                e.currentTarget.style.color = 'var(--text-secondary)';
+              }}
+            >
+              <Save size={10} />
+              {savingAnalysis ? 'Saving...' : 'Save Analysis'}
+            </button>
             <button
               style={s.actionBtn}
               onClick={handleReanalyse}
@@ -399,9 +586,14 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
               }}
             >
               <Trash2 size={10} />
-              Clear Cache
+              Refresh
             </button>
           </div>
+          {sample.saved_analysis_at && (
+            <div style={{ marginTop: '10px', fontSize: '11px', color: 'var(--text-muted)', lineHeight: '1.5' }}>
+              Saved analysis available from {new Date(sample.saved_analysis_at).toLocaleString('en-GB')}.
+            </div>
+          )}
         </div>
 
         {/* Analyst notes */}

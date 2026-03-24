@@ -38,6 +38,7 @@ from app.models.schemas import (
 )
 from app.services.ingest.workspace_bundle import (
     extract_workspace_context,
+    parse_workspace_bundle,
     truncate_workspace_bundle,
     workspace_context_prompt,
 )
@@ -1088,6 +1089,7 @@ class AnalysisResult:
     confidence: float = 0.0
     stop_reason: str = ""
     elapsed_seconds: float = 0.0
+    was_stopped: bool = False
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1109,7 +1111,13 @@ class StopVerdict:
 
 
 class StopDecision:
-    """Evaluate stopping conditions after each iteration."""
+    """Evaluate stopping conditions after each iteration.
+
+    When an LLM client is provided, the evaluator will consult the LLM
+    on borderline cases (stall or moderate confidence) to determine
+    whether further transforms are likely to improve the output.  The LLM
+    is asked a bounded yes/no question — it does not rewrite code.
+    """
 
     def __init__(
         self,
@@ -1118,13 +1126,16 @@ class StopDecision:
         min_confidence: float = 0.3,
         max_consecutive_failures: int = 4,
         sufficiency_threshold: float = 0.85,
+        llm_client: Optional[Any] = None,
     ) -> None:
         self.max_iterations = max_iterations
         self.stall_limit = stall_limit
         self.min_confidence = min_confidence
         self.max_consecutive_failures = max_consecutive_failures
         self.sufficiency_threshold = sufficiency_threshold
+        self.llm_client = llm_client
         self._consecutive_failures: int = 0
+        self._llm_consulted: bool = False  # only consult once per analysis
 
     def record_failure(self) -> None:
         self._consecutive_failures += 1
@@ -1232,7 +1243,20 @@ class StopDecision:
                         f"further transforms unlikely to improve output.",
                     )
 
-        # 7. Last action failed -> consider retry or continue.
+        # 7. LLM-assisted stop decision on borderline cases.
+        #    Consult the LLM at most once when we're stalling but haven't
+        #    hit the hard limit yet, or when confidence is moderate.
+        if (
+            self.llm_client is not None
+            and not self._llm_consulted
+            and iteration >= 4
+            and (stall >= max(1, self.stall_limit - 1) or 0.5 <= confidence < 0.7)
+        ):
+            llm_verdict = self._consult_llm(state_manager)
+            if llm_verdict is not None:
+                return llm_verdict
+
+        # 8. Last action failed -> consider retry or continue.
         if not last_transform_success:
             if self._consecutive_failures < 2:
                 return StopVerdict(
@@ -1246,6 +1270,71 @@ class StopDecision:
                 )
 
         return StopVerdict(StopAction.CONTINUE, "Progress ongoing.")
+
+    def _consult_llm(self, state_manager: StateManager) -> Optional[StopVerdict]:
+        """Ask the LLM whether further deobfuscation is worthwhile.
+
+        Returns a StopVerdict if the LLM recommends stopping, or None
+        to let the heuristic evaluation continue.
+        """
+        self._llm_consulted = True
+
+        code = state_manager.current_code
+        # Truncate for the LLM prompt — we only need a representative sample.
+        excerpt = code[:3000] if len(code) > 3000 else code
+        confidence = state_manager.overall_confidence
+        iteration = state_manager.current_iteration
+
+        prompt = (
+            "You are an expert malware analyst reviewing partially deobfuscated code.\n"
+            f"Iteration: {iteration}, Confidence: {confidence:.2f}\n"
+            f"Code excerpt ({len(code)} chars total):\n```\n{excerpt}\n```\n\n"
+            "Answer with ONLY 'STOP' or 'CONTINUE' followed by a one-sentence reason.\n"
+            "STOP if the code is already mostly readable and further transforms are "
+            "unlikely to improve it significantly.\n"
+            "CONTINUE if there are still clearly obfuscated sections that could benefit "
+            "from more transforms."
+        )
+
+        try:
+            # Run the async LLM call in the current event loop.
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're already in an async context — use a new task.
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    reply = pool.submit(
+                        asyncio.run,
+                        self.llm_client.chat(
+                            [{"role": "user", "content": prompt}],
+                            temperature=0.0,
+                            max_tokens=60,
+                        ),
+                    ).result(timeout=30)
+            else:
+                reply = loop.run_until_complete(
+                    self.llm_client.chat(
+                        [{"role": "user", "content": prompt}],
+                        temperature=0.0,
+                        max_tokens=60,
+                    )
+                )
+
+            reply = reply.strip().upper()
+            if reply.startswith("STOP"):
+                reason = reply[4:].strip().lstrip(":").strip() or "LLM recommends stopping."
+                logger.info("LLM stop decision: STOP — %s", reason)
+                return StopVerdict(
+                    StopAction.STOP,
+                    f"LLM assessment: {reason}",
+                )
+            else:
+                logger.info("LLM stop decision: CONTINUE")
+                return None  # let heuristics decide
+
+        except Exception as exc:
+            logger.debug("LLM stop consultation failed (non-critical): %s", exc)
+            return None  # fall back to heuristic evaluation
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1289,9 +1378,10 @@ class Verifier:
         language = (state_manager.state.language or "").lower()
 
         # 1. Readability delta.
+        workspace_delta = self._workspace_readability_delta(code_before, code_after)
         read_before = StateManager._estimate_readability(code_before)
         read_after = StateManager._estimate_readability(code_after)
-        read_delta = read_after - read_before
+        read_delta = workspace_delta if workspace_delta is not None else (read_after - read_before)
         scores.append((0.20, read_delta))
 
         # 1b. Structural validity delta. LLM transforms can otherwise score
@@ -1354,6 +1444,9 @@ class Verifier:
             scores.append((0.10, min(dispatchers * 0.2, 0.5)))
         if layers:
             scores.append((0.10, min(len(layers) * 0.15, 0.5)))
+        changed_workspace_files = details.get("deobfuscated_files", [])
+        if changed_workspace_files:
+            scores.append((0.12, min(len(changed_workspace_files) * 0.08, 0.45)))
 
         # Weighted sum.
         total_weight = sum(w for w, _ in scores)
@@ -1378,6 +1471,39 @@ class Verifier:
         if not before_ok and after_ok:
             return 0.2
         return 0.0
+
+    @classmethod
+    def _workspace_readability_delta(cls, before: str, after: str) -> Optional[float]:
+        before_files = parse_workspace_bundle(before)
+        after_files = parse_workspace_bundle(after)
+        if not before_files or not after_files or len(before_files) != len(after_files):
+            return None
+
+        after_by_path = {item.path: item.text for item in after_files}
+        weighted_delta = 0.0
+        total_weight = 0.0
+        changed_files = 0
+
+        for item in before_files:
+            after_text = after_by_path.get(item.path)
+            if after_text is None or after_text == item.text:
+                continue
+            before_score = StateManager._estimate_readability(item.text)
+            after_score = StateManager._estimate_readability(after_text)
+            delta = after_score - before_score
+            weight = float(max(min(len(after_text), 20_000), 200))
+            weighted_delta += delta * weight
+            total_weight += weight
+            changed_files += 1
+
+        if changed_files == 0 or total_weight == 0:
+            return 0.0
+
+        average_delta = weighted_delta / total_weight
+        coverage_bonus = min(changed_files / max(len(before_files), 1), 0.4) * 0.05
+        if average_delta > 0:
+            average_delta += coverage_bonus
+        return max(-1.0, min(1.0, average_delta))
 
     @classmethod
     def _is_syntax_healthy(cls, language: str, code: str) -> bool:
@@ -1563,10 +1689,13 @@ class Planner:
     _PHASE_DECODE: List[str] = [
         "decode_base64",
         "decode_hex",
+        "decode_base32_base85",
         "normalize_unicode",
         "try_xor_recovery",
+        "decrypt_crypto",
         "powershell_decode",
         "python_decode",
+        "decode_python_serialization",
         "identify_string_resolver",
         "decrypt_strings",
     ]
@@ -1575,6 +1704,7 @@ class Planner:
         "simplify_junk_code",
         "unflatten_control_flow",
         "detect_eval_exec_reflection",
+        "resolve_reflection",
     ]
     _PHASE_FINAL: List[str] = [
         "recover_literals",
@@ -1591,8 +1721,10 @@ class Planner:
         fingerprint run, exposing potentially new patterns.
         """
         _CODE_MODIFYING = {
+            "deobfuscate_workspace_files",
             "decode_base64", "decode_hex", "try_xor_recovery",
             "powershell_decode", "python_decode", "constant_fold",
+            "recover_literals",
             "simplify_junk_code", "identify_string_resolver",
             "normalize_unicode", "decrypt_strings",
             "unflatten_control_flow",
@@ -1638,6 +1770,9 @@ class Planner:
         elif isinstance(stored_workspace, dict) and stored_workspace:
             entry_points = stored_workspace.get("entry_points", [])
             suspicious_files = stored_workspace.get("suspicious_files", [])
+            prioritized_files = stored_workspace.get("prioritized_files", [])
+            dependency_hotspots = stored_workspace.get("dependency_hotspots", [])
+            execution_paths = stored_workspace.get("execution_paths", [])
             included = stored_workspace.get("included_files")
             archive_name = stored_workspace.get("archive_name")
             summary_parts = []
@@ -1653,6 +1788,27 @@ class Planner:
                 summary_parts.append(
                     "Suspicious files: "
                     + " | ".join(str(item) for item in suspicious_files[:6])
+                )
+            hotspot_paths = []
+            for item in prioritized_files[:6]:
+                if isinstance(item, dict):
+                    value = str(item.get("path", "")).strip()
+                else:
+                    value = str(item).strip()
+                if value:
+                    hotspot_paths.append(value)
+            if dependency_hotspots:
+                summary_parts.append(
+                    "Workspace hotspots: "
+                    + " | ".join(str(item) for item in dependency_hotspots[:6])
+                )
+            elif hotspot_paths:
+                summary_parts.append(
+                    "Workspace hotspots: " + " | ".join(hotspot_paths[:6])
+                )
+            if execution_paths:
+                summary_parts.append(
+                    "Execution paths: " + " | ".join(str(item) for item in execution_paths[:4])
                 )
             if summary_parts:
                 parts.append("\n".join(summary_parts))
@@ -1828,16 +1984,276 @@ class Planner:
             analysis = parsed.get("analysis", "")
             if analysis:
                 logger.info("LLM planner analysis: %s", analysis[:200])
+                # Store analysis for display in Agent Notebook
+                state.iteration_state["planner_analysis"] = analysis
+
             logger.debug(
                 "LLM-assisted plan: %d actions (deterministic=%d, llm=%d, merged=%d)",
                 len(merged), len(deterministic), len(llm_actions), len(merged),
             )
+
+            # ── Multi-turn refinement (Turn 2) ──────────────────────
+            # If the LLM's analysis mentions uncertainty or if we're past
+            # iteration 3 with stalls, ask a follow-up refinement question.
+            # This gives the LLM a chance to reconsider its strategy with
+            # the deterministic plan as additional context.
+            classification = state.iteration_state.get("llm_classification")
+            should_refine = (
+                iteration >= 3
+                and state_manager.stall_counter >= 1
+                and len(merged) >= 2
+            )
+            if should_refine:
+                try:
+                    det_names = [a.action_name for a in deterministic]
+                    llm_names = [a.action_name for a in llm_actions]
+
+                    refinement_prompt = (
+                        "Here is what the deterministic planner recommended: "
+                        f"{det_names}\n"
+                        f"Your initial recommendations: {llm_names}\n"
+                        f"Your analysis: {analysis}\n\n"
+                    )
+                    if classification:
+                        refinement_prompt += (
+                            f"Classification: {classification.get('obfuscation_type', 'unknown')}\n"
+                            f"Strategy: {classification.get('recommended_strategy', '')}\n\n"
+                        )
+
+                    refinement_prompt += (
+                        f"The analysis has stalled for {state_manager.stall_counter} "
+                        f"iteration(s) at confidence {confidence:.2f}.\n\n"
+                        "Considering what has already been tried and what failed, "
+                        "should we adjust the strategy? Respond with JSON:\n"
+                        "{\n"
+                        '  "strategy_change": "describe any change or say \'no change needed\'",\n'
+                        '  "recommended_actions": [\n'
+                        '    {"action": "action_name", "confidence": 0.8, '
+                        '"reason": "why", "priority": 1.0}\n'
+                        "  ]\n"
+                        "}\n"
+                        f"Available actions: {actions_list}"
+                    )
+
+                    # Build multi-turn conversation
+                    turn2_messages = [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": reply},
+                        {"role": "user", "content": refinement_prompt},
+                    ]
+
+                    from app.services.transforms.llm_base import LLMTransform
+                    turn2_reply = await self._llm_client.chat(
+                        messages=turn2_messages,
+                        temperature=0.2,
+                        max_tokens=LLMTransform.compute_token_budget(
+                            len(refinement_prompt), "reflect"
+                        ),
+                    )
+
+                    turn2_parsed = _extract_planning_json(turn2_reply)
+                    if turn2_parsed:
+                        strategy_change = turn2_parsed.get("strategy_change", "")
+                        if strategy_change and "no change" not in strategy_change.lower():
+                            logger.info(
+                                "LLM planner turn 2 strategy change: %s",
+                                strategy_change[:200],
+                            )
+                            state.iteration_state["planner_analysis"] = (
+                                f"{analysis}\n\n"
+                                f"[Refinement] {strategy_change}"
+                            )
+
+                        # Merge turn-2 recommendations with higher priority
+                        for item in turn2_parsed.get("recommended_actions", []):
+                            action = item.get("action", "")
+                            if action in self._available_actions:
+                                # Override or append with boosted priority
+                                found = False
+                                for m in merged:
+                                    if m.action_name == action:
+                                        m.priority = min(
+                                            m.priority,
+                                            float(item.get("priority", m.priority)),
+                                        )
+                                        m.confidence = max(
+                                            m.confidence,
+                                            float(item.get("confidence", m.confidence)),
+                                        )
+                                        m.reason += f" [refined: {item.get('reason', '')}]"
+                                        found = True
+                                        break
+                                if not found and action not in seen:
+                                    merged.append(PlannedAction(
+                                        action_name=action,
+                                        confidence=float(item.get("confidence", 0.7)),
+                                        reason=f"[turn-2] {item.get('reason', '')}",
+                                        priority=float(item.get("priority", 5.0)),
+                                    ))
+                                    seen.add(action)
+
+                        merged.sort(key=lambda r: r.priority)
+                except Exception:
+                    logger.debug("LLM planner turn 2 failed (non-critical)")
+
             return merged
 
         except Exception:
             logger.exception("LLM-assisted planning failed; falling back to "
                              "deterministic plan")
             return deterministic
+
+    async def classify_obfuscation(
+        self,
+        state_manager: StateManager,
+    ) -> Optional[Dict[str, Any]]:
+        """Ask the LLM to classify the obfuscation type and recommend strategy.
+
+        Called once on iteration 1 after fingerprinting.  Returns a dict with
+        obfuscation_type, tools_identified, layers, recommended_strategy,
+        priority_transforms, and confidence.  Returns None on any failure.
+        """
+        if self._llm_client is None:
+            return None
+
+        try:
+            from app.services.transforms.llm_base import LLMTransform
+
+            code = state_manager.current_code
+            excerpt = self._planner_code_excerpt(code, max_chars=3000)
+            techniques = list(state_manager.state.detected_techniques)
+            language = state_manager.state.language or "unknown"
+
+            prompt = (
+                "You are an expert malware analyst. Classify the obfuscation "
+                "used in this code sample and recommend a deobfuscation strategy.\n\n"
+                f"Language: {language}\n"
+                f"Regex-detected techniques: {techniques}\n\n"
+                f"Code excerpt:\n```\n{excerpt}\n```\n\n"
+                "Respond with ONLY a JSON object:\n"
+                "{\n"
+                '  "obfuscation_type": "primary obfuscation category",\n'
+                '  "tools_identified": ["specific tool names if recognizable"],\n'
+                '  "layers": ["ordered list of encoding/obfuscation layers"],\n'
+                '  "recommended_strategy": "brief strategy description",\n'
+                '  "priority_transforms": ["ordered action names to try first"],\n'
+                '  "confidence": 0.0\n'
+                "}\n\n"
+                f"Available action names: {sorted(self._available_actions)}"
+            )
+
+            reply = await self._llm_client.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=LLMTransform.compute_token_budget(len(excerpt), "classify"),
+            )
+
+            parsed = _extract_planning_json(reply)
+            if parsed is None:
+                logger.warning("LLM classification returned unparseable response")
+                return None
+
+            # Validate: priority_transforms must be from available actions
+            valid_transforms = [
+                t for t in parsed.get("priority_transforms", [])
+                if t in self._available_actions
+            ]
+            parsed["priority_transforms"] = valid_transforms
+
+            raw_conf = parsed.get("confidence", 0.5)
+            parsed["confidence"] = max(0.0, min(1.0, float(raw_conf)))
+
+            logger.info(
+                "LLM classification: type=%s, strategy=%s, confidence=%.2f",
+                parsed.get("obfuscation_type", "unknown"),
+                parsed.get("recommended_strategy", "none"),
+                parsed["confidence"],
+            )
+            return parsed
+
+        except Exception:
+            logger.exception("LLM obfuscation classification failed (non-critical)")
+            return None
+
+    async def reflect_on_failure(
+        self,
+        failed_action: str,
+        result: TransformResult,
+        state_manager: StateManager,
+        action_queue: ActionQueue,
+    ) -> List[PlannedAction]:
+        """Ask the LLM why a transform failed and what to try instead.
+
+        Called at most once per analysis when a stall is detected.  Returns
+        a list of recommended alternative actions, or an empty list on failure.
+        """
+        if self._llm_client is None:
+            return []
+
+        try:
+            from app.services.transforms.llm_base import LLMTransform
+
+            code_excerpt = self._planner_code_excerpt(
+                state_manager.current_code, max_chars=2000
+            )
+            state_context = self._planner_state_context(state_manager)
+
+            error_detail = result.description[:200]
+            if result.details.get("error"):
+                error_detail += f" Error: {result.details['error']}"
+
+            prompt = (
+                "You are an expert deobfuscation analyst. A transform just failed "
+                "or produced no improvement. Analyze why and recommend alternatives.\n\n"
+                f"Failed action: {failed_action}\n"
+                f"Failure detail: {error_detail}\n\n"
+                f"State:\n{state_context}\n\n"
+                f"Code excerpt:\n```\n{code_excerpt}\n```\n\n"
+                f"Available actions: {sorted(self._available_actions)}\n\n"
+                "Respond with ONLY a JSON object:\n"
+                "{\n"
+                '  "failure_reason": "why the transform failed",\n'
+                '  "alternatives": [\n'
+                '    {"action": "action_name", "confidence": 0.8, '
+                '"reason": "why this might work instead"}\n'
+                "  ]\n"
+                "}\n"
+                "Only suggest actions from the available list. Limit to 1-3."
+            )
+
+            reply = await self._llm_client.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=LLMTransform.compute_token_budget(len(code_excerpt), "reflect"),
+            )
+
+            parsed = _extract_planning_json(reply)
+            if parsed is None:
+                return []
+
+            failure_reason = parsed.get("failure_reason", "")
+            if failure_reason:
+                logger.info(
+                    "LLM reflection on '%s' failure: %s",
+                    failed_action, failure_reason[:150],
+                )
+
+            alternatives: List[PlannedAction] = []
+            for item in parsed.get("alternatives", [])[:3]:
+                action = item.get("action", "")
+                if action in self._available_actions and not action_queue.is_capped(action):
+                    alternatives.append(PlannedAction(
+                        action_name=action,
+                        confidence=max(0.3, min(0.9, float(item.get("confidence", 0.6)))),
+                        reason=f"[reflection] {item.get('reason', 'LLM alternative')}",
+                        priority=8.0,
+                    ))
+
+            return alternatives
+
+        except Exception:
+            logger.exception("LLM failure reflection failed (non-critical)")
+            return []
 
     def plan(
         self,
@@ -1855,6 +2271,20 @@ class Planner:
         )
 
         recommendations: List[PlannedAction] = []
+
+        # ── LLM Classification boost ─────────────────────────────────
+        # If the LLM classified the obfuscation type on iteration 1,
+        # boost its recommended transforms on iterations 1-3.
+        llm_classification = state.iteration_state.get("llm_classification")
+        if llm_classification and iteration <= 3:
+            for t_name in llm_classification.get("priority_transforms", []):
+                if t_name in self._available_actions and not action_queue.has_been_tried(t_name):
+                    recommendations.append(PlannedAction(
+                        action_name=t_name,
+                        confidence=min(llm_classification.get("confidence", 0.7), 0.9),
+                        reason=f"LLM classification: {llm_classification.get('obfuscation_type', 'unknown')}",
+                        priority=7.0,
+                    ))
 
         # ── Phase 1: Initial reconnaissance ──────────────────────────
         if iteration <= 1:
@@ -1986,6 +2416,27 @@ class Planner:
                     priority=11.0,
                 ))
 
+        if (
+            workspace_mode
+            and "deobfuscate_workspace_files" in self._available_actions
+            and iteration >= 2
+            and not action_queue.success_count("deobfuscate_workspace_files")
+        ):
+            workspace_context = state.workspace_context if hasattr(state, "workspace_context") else {}
+            prioritized_files = workspace_context.get("prioritized_files", [])
+            suspicious_files = workspace_context.get("suspicious_files", [])
+            entry_points = workspace_context.get("entry_points", [])
+            if prioritized_files or suspicious_files or entry_points:
+                recommendations.append(PlannedAction(
+                    action_name="deobfuscate_workspace_files",
+                    confidence=0.84,
+                    reason=(
+                        "Run deterministic per-file deobfuscation against prioritized "
+                        "workspace hotspots instead of only whole-bundle passes."
+                    ),
+                    priority=12.2,
+                ))
+
         # ── Phase 3: Simplification ──────────────────────────────────
         if "string_concatenation" in techniques or "junk_code" in techniques:
             if not action_queue.success_count("constant_fold"):
@@ -2069,8 +2520,8 @@ class Planner:
             if action_queue.success_count("decode_base64") or action_queue.success_count("decode_hex"):
                 recommendations.append(PlannedAction(
                     action_name="recover_literals",
-                    confidence=0.7,
-                    reason="Second-pass constant folding after decoding.",
+                    confidence=0.78,
+                    reason="Second-pass literal propagation and dead-branch pruning after decoding.",
                     priority=18.0,
                 ))
 
@@ -2138,6 +2589,42 @@ class Planner:
                     confidence=0.70,
                     reason="Re-extracting strings after significant code changes.",
                     priority=17.0,
+                ))
+
+        # ── Multi-layer re-decode (supports 6+ encoding layers) ───────
+        # After decoding succeeds, the decoded content may itself be
+        # encoded.  Re-queue decode transforms when the code still
+        # contains encoding signatures, even if the transform already ran.
+        if iteration >= 2:
+            _DECODE_RESCAN = {
+                "decode_base64": r"[A-Za-z0-9+/\-_=]{40,}",
+                "decode_hex": r"(?:\\x[0-9a-f]{2}){4,}",
+                "decode_base32_base85": r"(?:[A-Z2-7]{16,}|<~[!-u]{4,}~>)",
+                "try_xor_recovery": None,  # no quick regex test
+                "decrypt_crypto": r"(?:AES|RC4|CryptoJS|Cipher|decrypt)",
+                "powershell_decode": r"-(?:EncodedCommand|enc)\s+[A-Za-z0-9+/=]{20,}",
+                "python_decode": r"(?:chr\s*\(\s*\d+\s*\)\s*\+?\s*){3,}",
+                "decode_python_serialization": r"(?:pickle|marshal)\.loads",
+            }
+            for action, pattern in _DECODE_RESCAN.items():
+                if action not in self._available_actions:
+                    continue
+                prev_successes = action_queue.success_count(action)
+                # Allow up to 5 re-runs of each decoder for deep nesting
+                if prev_successes < 1 or prev_successes >= 5:
+                    continue
+                if action_queue.failure_streak(action) >= 2:
+                    continue  # recent failures mean it's no longer productive
+                # Check if the code still contains patterns this decoder handles
+                if pattern is not None:
+                    import re as _re
+                    if not _re.search(pattern, code, _re.IGNORECASE):
+                        continue
+                recommendations.append(PlannedAction(
+                    action_name=action,
+                    confidence=0.7,
+                    reason=f"Re-decode pass {prev_successes + 1}: code still contains encoded patterns.",
+                    priority=9.0 + prev_successes,  # gradually lower priority
                 ))
 
         # ── LLM-powered actions (when provider is available) ─────────
@@ -2231,6 +2718,100 @@ class ActionSelector:
             )
 
         # Pop the best eligible action.
+        return action_queue.dequeue()
+
+    async def select_with_llm(
+        self,
+        recommendations: List[PlannedAction],
+        action_queue: ActionQueue,
+        state_manager: StateManager,
+        llm_client: Any,
+    ) -> Optional[QueuedAction]:
+        """LLM-informed action selection from queued candidates.
+
+        Asks the LLM to pick from the top pending candidates given the
+        current state and recent history.  Falls back to greedy ``dequeue()``
+        on any failure.
+        """
+        # Enqueue all recommendations first (same as deterministic)
+        for rec in recommendations:
+            action_queue.enqueue(
+                rec.action_name,
+                confidence=rec.confidence,
+                reason=rec.reason,
+                priority=rec.priority,
+            )
+
+        # Collect pending candidates
+        pending = [
+            a for a in action_queue._heap
+            if a.status == ActionStatus.PENDING
+        ]
+        if len(pending) <= 1:
+            return action_queue.dequeue()
+
+        pending.sort()
+        candidates = pending[:6]
+
+        try:
+            from app.services.transforms.llm_base import LLMTransform
+
+            code_excerpt = state_manager.current_code[:2000]
+            confidence = state_manager.overall_confidence
+            iteration = state_manager.current_iteration
+
+            history_lines = []
+            for record in state_manager.state.transform_history[-8:]:
+                status = "succeeded" if record.success else "failed"
+                history_lines.append(
+                    f"  {record.action}: {status} "
+                    f"(conf_delta: {record.confidence_after - record.confidence_before:+.2f})"
+                )
+            history_str = "\n".join(history_lines) if history_lines else "  (none yet)"
+
+            candidate_str = "\n".join(
+                f"  {i+1}. {c.action_name} (priority={c.priority:.1f}, "
+                f"confidence={c.confidence:.2f}, reason='{c.reason}')"
+                for i, c in enumerate(candidates)
+            )
+
+            prompt = (
+                "You are a deobfuscation pipeline controller. Given the current "
+                "state, choose which transform to run next.\n\n"
+                f"Iteration: {iteration}, Overall confidence: {confidence:.2f}\n\n"
+                f"Recent transform history:\n{history_str}\n\n"
+                f"Candidate actions (ranked by heuristic priority):\n{candidate_str}\n\n"
+                f"Code excerpt ({len(state_manager.current_code)} chars total):\n"
+                f"```\n{code_excerpt}\n```\n\n"
+                "Respond with ONLY a JSON object:\n"
+                '{"choice": <number 1-N>, "reason": "one sentence"}\n\n'
+                "Pick the number most likely to make progress."
+            )
+
+            reply = await llm_client.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=LLMTransform.compute_token_budget(len(code_excerpt), "select"),
+            )
+
+            parsed = _extract_planning_json(reply)
+            if parsed and "choice" in parsed:
+                choice_idx = int(parsed["choice"]) - 1
+                if 0 <= choice_idx < len(candidates):
+                    chosen = candidates[choice_idx]
+                    logger.info(
+                        "LLM selected action '%s': %s",
+                        chosen.action_name,
+                        parsed.get("reason", ""),
+                    )
+                    # Boost the chosen action's priority so dequeue picks it
+                    chosen.priority = -999.0
+                    return action_queue.dequeue()
+
+            logger.debug("LLM selection returned invalid choice; falling back")
+        except Exception:
+            logger.exception("LLM action selection failed; falling back to greedy")
+
         return action_queue.dequeue()
 
 
@@ -2338,6 +2919,7 @@ class PreflightValidator:
 
     # Actions that shouldn't run back-to-back (no point re-running immediately).
     _CONFLICT_PAIRS: List[Tuple[str, str]] = [
+        ("deobfuscate_workspace_files", "deobfuscate_workspace_files"),
         ("decode_base64", "decode_base64"),
         ("decode_hex", "decode_hex"),
         ("constant_fold", "constant_fold"),
@@ -2560,8 +3142,22 @@ class StateReconciler:
             stop_decision.record_failure()
 
         # ── Stall tracking ─────────────────────────────────────────
+        # Decode transforms (base64, hex, XOR, PowerShell, Python) that
+        # succeed should NOT count as stalls even if readability doesn't
+        # improve — they're peeling layers and the next decode will benefit.
+        _DECODE_ACTIONS = {
+            "decode_base64", "decode_hex", "decode_base32_base85",
+            "try_xor_recovery", "decrypt_crypto",
+            "powershell_decode", "python_decode", "decrypt_strings",
+            "normalize_unicode", "llm_multilayer_unwrap",
+            "decode_python_serialization",
+        }
         if improvement > 0.01:
             sm.reset_stall()
+        elif result.success and action_name in _DECODE_ACTIONS:
+            # Successful decode but low improvement — don't penalise,
+            # the decoded content likely has more layers to peel.
+            pass
         else:
             sm.increment_stall()
 
@@ -2836,6 +3432,10 @@ def _build_action_space(llm_client: Optional[Any] = None) -> Dict[str, BaseTrans
     # Mapping of action name -> (module_path, class_name).
     _EXTERNAL_MAP: Dict[str, Tuple[str, str]] = {
         "profile_workspace": ("app.services.transforms.workspace_profiler", "WorkspaceProfiler"),
+        "deobfuscate_workspace_files": (
+            "app.services.transforms.workspace_file_deobfuscator",
+            "WorkspaceFileDeobfuscator",
+        ),
         "detect_language": ("app.services.transforms.language_detector", "LanguageDetector"),
         "fingerprint_obfuscation": ("app.services.transforms.obfuscation_fingerprinter", "ObfuscationFingerprinter"),
         "extract_strings": ("app.services.transforms.string_extraction", "StringExtractor"),
@@ -2843,6 +3443,7 @@ def _build_action_space(llm_client: Optional[Any] = None) -> Dict[str, BaseTrans
         "decode_hex": ("app.services.transforms.hex_decoder", "HexDecoder"),
         "try_xor_recovery": ("app.services.transforms.xor_recovery", "XorRecovery"),
         "constant_fold": ("app.services.transforms.constant_folder", "ConstantFolder"),
+        "recover_literals": ("app.services.transforms.literal_propagator", "LiteralPropagator"),
         "simplify_junk_code": ("app.services.transforms.junk_code", "JunkCodeRemover"),
         "detect_eval_exec_reflection": ("app.services.transforms.eval_detection", "EvalExecDetector"),
         "identify_string_resolver": ("app.services.transforms.js_resolvers", "JavaScriptArrayResolver"),
@@ -2857,6 +3458,10 @@ def _build_action_space(llm_client: Optional[Any] = None) -> Dict[str, BaseTrans
         "unflatten_control_flow": ("app.services.transforms.control_flow_unflattener", "ControlFlowUnflattener"),
         "apply_renames": ("app.services.transforms.deterministic_renamer", "DeterministicRenamer"),
         "decrypt_strings": ("app.services.transforms.string_decryptor", "StringDecryptor"),
+        "decode_base32_base85": ("app.services.transforms.base32_base85_decoder", "Base32Base85Decoder"),
+        "decrypt_crypto": ("app.services.transforms.crypto_decryptor", "CryptoDecryptor"),
+        "resolve_reflection": ("app.services.transforms.reflection_resolver", "ReflectionResolver"),
+        "decode_python_serialization": ("app.services.transforms.python_serialization_decoder", "PythonSerializationDecoder"),
     }
 
     # Inline fallbacks.
@@ -2958,6 +3563,11 @@ class Orchestrator:
         self._stop_decision: Optional[StopDecision] = None
         self._findings_gen: Optional[FindingsGenerator] = None
 
+        # LLM intelligence tracking (bounded call budgets per analysis).
+        self._reflected_this_analysis: bool = False
+        self._llm_confidence_checks: int = 0
+        _MAX_LLM_CONFIDENCE_CHECKS = 2
+
         # Action space registry (includes LLM transforms when client available).
         self.action_space: Dict[str, BaseTransform] = _build_action_space(llm_client)
 
@@ -2972,6 +3582,8 @@ class Orchestrator:
         max_iterations: int = 20,
         stall_limit: int = 3,
         progress_callback: Optional[Callable[[int, int, str, float], None]] = None,
+        stop_requested: Optional[Callable[[], bool]] = None,
+        event_callback: Optional[Callable[[str, dict], None]] = None,
     ) -> AnalysisResult:
         """Execute the full multi-pass deobfuscation pipeline.
 
@@ -3016,6 +3628,7 @@ class Orchestrator:
             max_iterations=max_iterations,
             stall_limit=stall_limit,
             min_confidence=min_confidence,
+            llm_client=self.llm_client,
         )
         self._findings_gen = FindingsGenerator(language=self.language)
 
@@ -3031,12 +3644,46 @@ class Orchestrator:
 
         stop_reason = "Completed normally."
         iterations_run = 0
+        was_stopped = False
+
+        def _emit(event_type: str, data: dict | None = None) -> None:
+            """Emit a typed event to the analysis tracker if a callback is set."""
+            if event_callback is not None:
+                try:
+                    event_callback(event_type, data or {})
+                except Exception:
+                    pass
 
         consecutive_stage_errors = 0
         _MAX_STAGE_ERRORS = 5  # abort if too many iterations fail entirely
 
+        def _maybe_stop(stage: str) -> bool:
+            nonlocal stop_reason, was_stopped
+            if stop_requested is None or not stop_requested():
+                return False
+            was_stopped = True
+            stop_reason = f"Stop requested by user during {stage}."
+            logger.info(stop_reason)
+            if self._state_manager is not None:
+                self._state_manager.mark_stopped()
+            if progress_callback is not None:
+                pct = (
+                    min((iterations_run / max_iterations) * 100.0, 99.0)
+                    if max_iterations > 0 else 0.0
+                )
+                progress_callback(
+                    iterations_run,
+                    max_iterations,
+                    "stop requested",
+                    pct,
+                )
+            return True
+
         try:
             for _ in range(max_iterations):
+                if _maybe_stop("iteration dispatch"):
+                    break
+
                 iteration = self._state_manager.advance_iteration()
                 iterations_run = iteration
                 code_before = self._state_manager.current_code
@@ -3072,13 +3719,54 @@ class Orchestrator:
                     [r.action_name for r in recommendations],
                 )
 
+                # ── LLM Obfuscation Classification (once, iteration 1) ──
+                if (
+                    iteration == 1
+                    and self.llm_client is not None
+                    and "llm_classification" not in self._state_manager.state.iteration_state
+                ):
+                    try:
+                        classification = await self._planner.classify_obfuscation(
+                            self._state_manager,
+                        )
+                        if classification:
+                            self._state_manager.state.iteration_state["llm_classification"] = classification
+                            for t_name in classification.get("priority_transforms", []):
+                                self._action_queue.enqueue(
+                                    t_name,
+                                    confidence=0.88,
+                                    reason=f"LLM classification: {classification.get('recommended_strategy', '')}",
+                                    priority=6.0,
+                                )
+                            _emit("classification", {
+                                "obfuscation_type": classification.get("obfuscation_type"),
+                                "tools_identified": classification.get("tools_identified", []),
+                                "layers": classification.get("layers", []),
+                                "recommended_strategy": classification.get("recommended_strategy"),
+                                "confidence": classification.get("confidence"),
+                            })
+                    except Exception:
+                        logger.exception("LLM classification failed (non-critical)")
+
                 # ── Stage 2: Select ──────────────────────────────────
                 try:
-                    selected = self._selector.select(
-                        recommendations,
-                        self._action_queue,
-                        self._state_manager,
-                    )
+                    if (
+                        self.llm_client is not None
+                        and iteration >= 2
+                        and self._action_queue.pending_count >= 3
+                    ):
+                        selected = await self._selector.select_with_llm(
+                            recommendations,
+                            self._action_queue,
+                            self._state_manager,
+                            self.llm_client,
+                        )
+                    else:
+                        selected = self._selector.select(
+                            recommendations,
+                            self._action_queue,
+                            self._state_manager,
+                        )
                 except Exception:
                     logger.exception("Selector failed at iteration %d", iteration)
                     selected = None
@@ -3114,6 +3802,9 @@ class Orchestrator:
                     selected.confidence,
                     selected.reason,
                 )
+
+                if _maybe_stop(f"iteration {iteration} before executing {action_name}"):
+                    break
 
                 # ── Stage 3: Pre-flight ──────────────────────────────
                 try:
@@ -3231,6 +3922,9 @@ class Orchestrator:
                         break
                     continue
 
+                if _maybe_stop(f"iteration {iteration} after {action_name}"):
+                    break
+
                 # Update orchestrator-level language if detect succeeded.
                 if action_name == "detect_language" and result.success:
                     detected = result.details.get("detected_language")
@@ -3247,6 +3941,81 @@ class Orchestrator:
                         "continuing without snapshot",
                         iteration,
                     )
+
+                # ── LLM Reflection on failure ──────────────────────
+                if (
+                    not result.success
+                    and self.llm_client is not None
+                    and self._state_manager.stall_counter >= 2
+                    and not self._reflected_this_analysis
+                ):
+                    try:
+                        reflections = await self._planner.reflect_on_failure(
+                            action_name,
+                            result,
+                            self._state_manager,
+                            self._action_queue,
+                        )
+                        for alt in reflections:
+                            self._action_queue.enqueue(
+                                alt.action_name,
+                                confidence=alt.confidence,
+                                reason=alt.reason,
+                                priority=alt.priority,
+                            )
+                        if reflections:
+                            self._state_manager.reset_stall()
+                            logger.info(
+                                "LLM reflection enqueued %d alternative(s)",
+                                len(reflections),
+                            )
+                            _emit("reflection", {
+                                "failed_action": action_name,
+                                "alternatives": [a.action_name for a in reflections],
+                            })
+                        self._reflected_this_analysis = True
+                    except Exception:
+                        logger.exception("LLM reflection failed (non-critical)")
+
+                # ── LLM Confidence Assessment ─────────────────────
+                if (
+                    result.success
+                    and self.llm_client is not None
+                    and self._llm_confidence_checks < 2
+                    and action_name in (
+                        "llm_deobfuscate", "llm_multilayer_unwrap", "llm_rename",
+                    )
+                ):
+                    try:
+                        llm_scores = await self._llm_assess_confidence(
+                            self._state_manager.current_code,
+                            self._state_manager,
+                        )
+                        if llm_scores:
+                            self._llm_confidence_checks += 1
+                            current = self._state_manager.overall_confidence
+                            llm_overall = llm_scores["overall"]
+                            blended = current * 0.6 + llm_overall * 0.4
+                            self._state_manager.update_confidence(
+                                overall=blended,
+                                naming=llm_scores.get("naming"),
+                                structure=llm_scores.get("structure"),
+                                strings=llm_scores.get("strings"),
+                            )
+                            logger.info(
+                                "LLM confidence: heuristic=%.2f, llm=%.2f, blended=%.2f",
+                                current, llm_overall, blended,
+                            )
+                            _emit("confidence_update", {
+                                "heuristic": round(current, 3),
+                                "llm": round(llm_overall, 3),
+                                "blended": round(blended, 3),
+                                "naming": llm_scores.get("naming"),
+                                "structure": llm_scores.get("structure"),
+                                "strings": llm_scores.get("strings"),
+                            })
+                    except Exception:
+                        logger.exception("LLM confidence assessment failed (non-critical)")
 
                 # ── Feedback-driven replanning ──────────────────────
                 # After a successful transform with meaningful
@@ -3377,6 +4146,7 @@ class Orchestrator:
             confidence=self._state_manager.overall_confidence,
             stop_reason=stop_reason,
             elapsed_seconds=elapsed,
+            was_stopped=was_stopped,
         )
 
     # ------------------------------------------------------------------
@@ -3400,6 +4170,71 @@ class Orchestrator:
         new = current + delta
         # Clamp to [0, 1].
         return max(0.0, min(1.0, new))
+
+    async def _llm_assess_confidence(
+        self,
+        code: str,
+        state_manager: StateManager,
+    ) -> Optional[Dict[str, float]]:
+        """Ask the LLM to assess deobfuscation quality.
+
+        Returns a dict with overall, naming, structure, strings scores
+        (each 0.0-1.0), or None on any failure.  Called at most twice
+        per analysis after a major LLM transform succeeds.
+        """
+        if self.llm_client is None:
+            return None
+
+        try:
+            from app.services.transforms.llm_base import LLMTransform
+
+            excerpt = code[:3000] if len(code) > 3000 else code
+            techniques = list(state_manager.state.detected_techniques)[:10]
+
+            prompt = (
+                "You are an expert code analyst. Rate the deobfuscation quality "
+                "of this code on a 0.0-1.0 scale.\n\n"
+                f"Detected obfuscation techniques: {techniques}\n\n"
+                f"Code:\n```\n{excerpt}\n```\n\n"
+                "Respond with ONLY a JSON object:\n"
+                "{\n"
+                '  "overall": 0.0,\n'
+                '  "naming": 0.0,\n'
+                '  "structure": 0.0,\n'
+                '  "strings": 0.0,\n'
+                '  "assessment": "one sentence summary"\n'
+                "}\n\n"
+                "Scoring: 0.0-0.2=heavily obfuscated, 0.3-0.5=partially readable, "
+                "0.6-0.7=mostly readable, 0.8-0.9=well deobfuscated, 1.0=clean code."
+            )
+
+            reply = await self.llm_client.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=LLMTransform.compute_token_budget(len(excerpt), "confidence"),
+            )
+
+            parsed = _extract_planning_json(reply)
+            if parsed is None:
+                return None
+
+            scores: Dict[str, float] = {}
+            for key in ("overall", "naming", "structure", "strings"):
+                raw = parsed.get(key)
+                if isinstance(raw, (int, float)):
+                    scores[key] = max(0.0, min(1.0, float(raw)))
+                else:
+                    return None
+
+            assessment = parsed.get("assessment", "")
+            if assessment:
+                logger.info("LLM confidence assessment: %s", assessment[:150])
+
+            return scores
+
+        except Exception:
+            logger.exception("LLM confidence assessment failed (non-critical)")
+            return None
 
     @staticmethod
     def _build_summary(

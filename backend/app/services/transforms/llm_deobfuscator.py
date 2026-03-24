@@ -57,7 +57,7 @@ class LLMDeobfuscator(LLMTransform):
     def build_messages(
         self, code: str, language: str, state: dict
     ) -> List[Dict[str, str]]:
-        truncated = self.truncate_code(code)
+        truncated = self.truncate_code(code, max_chars=self._max_code_chars())
         lang = language or state.get("language", "unknown")
         context = self.build_state_context(state)
         workspace = self.build_workspace_context(code)

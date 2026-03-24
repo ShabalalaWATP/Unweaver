@@ -58,6 +58,7 @@ class ActionQueue:
     # configured threshold.
     DETERMINISTIC_ACTIONS: Set[str] = {
         "profile_workspace",
+        "deobfuscate_workspace_files",
         "detect_language",
         "fingerprint_obfuscation",
         "extract_strings",

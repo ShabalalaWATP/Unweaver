@@ -3,6 +3,7 @@ import { Play, Square, RefreshCw, Download, FileText, FileCode, Loader2 } from '
 import type { SampleDetail, AnalysisStatus } from '@/types';
 import StatusBadge from '@/components/common/StatusBadge';
 import * as api from '@/services/api';
+import { parseWorkspaceBundle } from '@/utils/workspaceBundle';
 
 interface TopBarProps {
   sample: SampleDetail | null;
@@ -45,6 +46,15 @@ const s = {
     textTransform: 'uppercase',
     letterSpacing: '0.05em',
     border: '1px solid var(--border)',
+  } as React.CSSProperties,
+  metaChip: {
+    fontSize: '10px',
+    padding: '2px 8px',
+    borderRadius: '10px',
+    background: 'rgba(255,255,255,0.04)',
+    color: 'var(--text-muted)',
+    border: '1px solid var(--border-subtle)',
+    fontFamily: 'var(--font-mono)',
   } as React.CSSProperties,
   separator: {
     width: 1,
@@ -231,11 +241,21 @@ export default function TopBar({
   }
 
   const languageLabel = sample.language === 'workspace' ? 'bundle' : sample.language;
+  const parsedWorkspace = sample.language === 'workspace'
+    ? parseWorkspaceBundle(sample.recovered_text ?? '') ?? parseWorkspaceBundle(sample.original_text)
+    : null;
+  const workspaceFileCount = sample.saved_analysis?.workspace_context?.included_files ?? parsedWorkspace?.included_files;
 
   return (
     <div className="unweaver-glass-bar" style={s.root}>
       <span style={s.title}>{sample.filename}</span>
       {languageLabel && <span style={s.lang}>{languageLabel}</span>}
+      {sample.language === 'workspace' && typeof workspaceFileCount === 'number' && (
+        <span style={s.metaChip}>{workspaceFileCount} files</span>
+      )}
+      {sample.saved_analysis_at && (
+        <span style={s.metaChip}>saved report</span>
+      )}
       <StatusBadge status={sample.status} />
 
       {/* Progress indicator during analysis */}

@@ -11,8 +11,10 @@ Provides:
 
 from __future__ import annotations
 
+import logging
 from typing import AsyncGenerator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -21,6 +23,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 # ── Engine ──────────────────────────────────────────────────────────────
 engine = create_async_engine(
@@ -71,3 +75,31 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _ensure_runtime_columns(conn)
+
+
+async def _ensure_runtime_columns(conn) -> None:
+    """Apply lightweight additive schema updates for SQLite installs.
+
+    These are additive-only (ADD COLUMN) and idempotent — they check
+    existence before altering.  Each migration is wrapped individually
+    so a failure in one does not block the others.
+    """
+    _MIGRATIONS = [
+        ("samples", "saved_analysis_json", "ALTER TABLE samples ADD COLUMN saved_analysis_json JSON"),
+        ("samples", "saved_analysis_at", "ALTER TABLE samples ADD COLUMN saved_analysis_at DATETIME"),
+    ]
+
+    for table, column, ddl in _MIGRATIONS:
+        try:
+            result = await conn.execute(text(f"PRAGMA table_info({table})"))
+            columns = {row[1] for row in result.fetchall()}
+            if column not in columns:
+                await conn.execute(text(ddl))
+                logger.info("Applied schema migration: added %s.%s", table, column)
+        except Exception:
+            logger.warning(
+                "Schema migration failed for %s.%s (may already exist or table locked)",
+                table, column,
+                exc_info=True,
+            )

@@ -33,6 +33,14 @@ const s = {
     fontWeight: 700,
     letterSpacing: '-0.02em',
   } as React.CSSProperties,
+  halo: {
+    position: 'absolute',
+    inset: '18%',
+    borderRadius: '50%',
+    filter: 'blur(12px)',
+    opacity: 0.32,
+    pointerEvents: 'none',
+  } as React.CSSProperties,
   meta: {
     display: 'flex',
     flexDirection: 'column',
@@ -61,7 +69,18 @@ export default function ConfidenceGauge({ value, size = 56 }: ConfidenceGaugePro
   return (
     <div style={s.root}>
       <div style={{ ...s.ring, width: size, height: size }}>
+        <div style={{ ...s.halo, background: color }} />
         <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={radius + 5}
+            fill="none"
+            stroke={color}
+            strokeWidth={1}
+            strokeDasharray="2 8"
+            opacity={0.18}
+          />
           {/* Background ring */}
           <circle
             cx={size / 2}
@@ -104,6 +123,7 @@ export default function ConfidenceGauge({ value, size = 56 }: ConfidenceGaugePro
             ...s.label,
             fontSize: size > 48 ? '14px' : '10px',
             color,
+            textShadow: `0 0 12px ${color}33`,
           }}
         >
           {clamped}%

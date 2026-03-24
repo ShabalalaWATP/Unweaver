@@ -1,8 +1,11 @@
-import { useState, useCallback, useRef } from 'react';
-import { Upload, X, FileText, AlertCircle } from 'lucide-react';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { Upload, X, FileText, AlertCircle, FolderOpen } from 'lucide-react';
+
+import { createArchiveFromDirectory, createArchiveFromDirectoryHandle } from '@/utils/archive';
+import signalChamberGraphic from '@/assets/graphics/signal-chamber.svg';
 
 interface FileUploadProps {
-  onUpload: (file: File) => void | Promise<void>;
+  onUpload: (files: File[]) => void | Promise<void>;
   onClose: () => void;
   maxSizeMB?: number;
   maxArchiveSizeMB?: number;
@@ -17,6 +20,35 @@ const ACCEPTED_FILE_TYPES = [
   '.vbs', '.vb', '.cs', '.java', '.php', '.rb', '.go', '.rs',
   '.sh', '.bat', '.cmd', '.json', '.yaml', '.yml', '.xml', '.txt',
 ].join(',');
+
+type DirectoryInputElement = HTMLInputElement & {
+  webkitdirectory?: boolean;
+  directory?: boolean;
+};
+type WorkspaceArchiveFile = File & {
+  unweaverUploadKind?: 'folder-archive';
+  unweaverSourceName?: string;
+  unweaverSourceFileCount?: number;
+};
+type DirectoryPickerEntry =
+  | {
+    kind: 'file';
+    name: string;
+    getFile: () => Promise<File>;
+  }
+  | {
+    kind: 'directory';
+    name: string;
+    values: () => AsyncIterable<DirectoryPickerEntry>;
+  };
+type DirectoryPickerHandle = {
+  kind: 'directory';
+  name: string;
+  values: () => AsyncIterable<DirectoryPickerEntry>;
+};
+type DirectoryPickerWindow = Window & {
+  showDirectoryPicker?: () => Promise<DirectoryPickerHandle>;
+};
 
 const s = {
   overlay: {
@@ -63,6 +95,53 @@ const s = {
   body: {
     padding: '20px',
   } as React.CSSProperties,
+  visualIntro: {
+    marginBottom: '16px',
+    padding: '14px',
+    borderRadius: 'var(--radius-lg)',
+    background: 'linear-gradient(160deg, rgba(88,166,255,0.12) 0%, rgba(94,234,212,0.05) 52%, rgba(255,255,255,0.02) 100%)',
+    border: '1px solid rgba(88,166,255,0.14)',
+    display: 'flex',
+    gap: '14px',
+    alignItems: 'center',
+    overflow: 'hidden',
+  } as React.CSSProperties,
+  visualGraphic: {
+    width: 112,
+    flexShrink: 0,
+    borderRadius: '16px',
+    overflow: 'hidden',
+    border: '1px solid rgba(255,255,255,0.08)',
+    background: 'rgba(0,0,0,0.12)',
+  } as React.CSSProperties,
+  visualGraphicImg: {
+    width: '100%',
+    display: 'block',
+  } as React.CSSProperties,
+  visualCopy: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+    minWidth: 0,
+  } as React.CSSProperties,
+  visualLabel: {
+    fontSize: '10px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.12em',
+    color: 'var(--accent-bright)',
+    fontWeight: 700,
+  } as React.CSSProperties,
+  visualTitle: {
+    fontSize: '15px',
+    fontWeight: 700,
+    color: 'var(--text-primary)',
+    lineHeight: 1.15,
+  } as React.CSSProperties,
+  visualBody: {
+    fontSize: '12px',
+    color: 'var(--text-secondary)',
+    lineHeight: 1.5,
+  } as React.CSSProperties,
   dropzone: {
     border: '2px dashed var(--border)',
     borderRadius: 'var(--radius-md)',
@@ -90,8 +169,27 @@ const s = {
     fontSize: '11px',
     color: 'var(--text-muted)',
   } as React.CSSProperties,
-  fileInfo: {
+  pickerRow: {
     marginTop: '12px',
+    display: 'flex',
+    gap: '8px',
+  } as React.CSSProperties,
+  pickerBtn: {
+    flex: 1,
+    padding: '8px 12px',
+    fontSize: '12px',
+    fontWeight: 600,
+    borderRadius: 'var(--radius-sm)',
+    border: '1px solid var(--border)',
+    background: 'var(--bg-tertiary)',
+    color: 'var(--text-secondary)',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '6px',
+  } as React.CSSProperties,
+  fileInfo: {
     padding: '10px 12px',
     background: 'var(--bg-primary)',
     border: '1px solid var(--border)',
@@ -99,6 +197,23 @@ const s = {
     display: 'flex',
     alignItems: 'center',
     gap: '8px',
+  } as React.CSSProperties,
+  selectionMeta: {
+    marginTop: '12px',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: '12px',
+    fontSize: '11px',
+    color: 'var(--text-muted)',
+  } as React.CSSProperties,
+  fileList: {
+    marginTop: '8px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+    maxHeight: '180px',
+    overflowY: 'auto',
   } as React.CSSProperties,
   fileName: {
     fontSize: '12px',
@@ -175,30 +290,55 @@ function isArchiveFile(file: File): boolean {
   );
 }
 
+function isWorkspaceArchiveFile(file: File): file is WorkspaceArchiveFile {
+  return (file as WorkspaceArchiveFile).unweaverUploadKind === 'folder-archive';
+}
+
 export default function FileUpload({
   onUpload,
   onClose,
   maxSizeMB = MAX_SIZE_DEFAULT,
   maxArchiveSizeMB = MAX_ARCHIVE_SIZE_DEFAULT,
 }: FileUploadProps) {
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const directoryInputRef = useRef<HTMLInputElement>(null);
+  const [preparingFolder, setPreparingFolder] = useState(false);
+  const [uploading, setUploading] = useState(false);
 
-  const validateFile = useCallback(
-    (f: File): boolean => {
-      const archive = isArchiveFile(f);
-      const allowedMb = archive ? maxArchiveSizeMB : maxSizeMB;
-      const maxBytes = allowedMb * 1024 * 1024;
-      if (f.size > maxBytes) {
-        setError(
-          `${archive ? 'Archive' : 'File'} too large. Maximum size is ${allowedMb} MB.`,
-        );
-        return false;
+  useEffect(() => {
+    const directoryInput = directoryInputRef.current as DirectoryInputElement | null;
+    if (!directoryInput) return;
+    directoryInput.webkitdirectory = true;
+    directoryInput.directory = true;
+    directoryInput.setAttribute('webkitdirectory', '');
+    directoryInput.setAttribute('directory', '');
+    directoryInput.multiple = true;
+  }, []);
+
+  const validateFiles = useCallback(
+    (incomingFiles: File[]): File[] | null => {
+      if (incomingFiles.length === 0) {
+        setError('No files selected.');
+        return null;
       }
+
+      for (const candidate of incomingFiles) {
+        const archive = isArchiveFile(candidate);
+        const allowedMb = archive ? maxArchiveSizeMB : maxSizeMB;
+        const maxBytes = allowedMb * 1024 * 1024;
+        if (candidate.size > maxBytes) {
+          setError(
+            `"${candidate.name}" is too large. Maximum ${archive ? 'archive' : 'file'} size is ${allowedMb} MB.`,
+          );
+          return null;
+        }
+      }
+
       setError(null);
-      return true;
+      return incomingFiles;
     },
     [maxArchiveSizeMB, maxSizeMB],
   );
@@ -207,37 +347,105 @@ export default function FileUpload({
     (e: React.DragEvent) => {
       e.preventDefault();
       setDragging(false);
-      const f = e.dataTransfer.files[0];
-      if (f && validateFile(f)) {
-        setFile(f);
+      const droppedFiles = Array.from(e.dataTransfer.files);
+      const validFiles = validateFiles(droppedFiles);
+      if (validFiles) {
+        setFiles(validFiles);
       }
     },
-    [validateFile],
+    [validateFiles],
   );
 
   const handleFileSelect = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const f = e.target.files?.[0];
-      if (f && validateFile(f)) {
-        setFile(f);
+      const selectedFiles = Array.from(e.target.files ?? []);
+      const validFiles = validateFiles(selectedFiles);
+      if (validFiles) {
+        setFiles(validFiles);
       }
+      e.target.value = '';
     },
-    [validateFile],
+    [validateFiles],
   );
 
-  const [uploading, setUploading] = useState(false);
+  const handleDirectorySelect = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const selectedFiles = e.target.files;
+      e.target.value = '';
+      if (!selectedFiles || selectedFiles.length === 0) return;
+
+      setPreparingFolder(true);
+      setError(null);
+      try {
+        const archiveFile = await createArchiveFromDirectory(selectedFiles);
+        const validFiles = validateFiles([archiveFile]);
+        if (validFiles) {
+          setFiles(validFiles);
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to package folder for upload.');
+      } finally {
+        setPreparingFolder(false);
+      }
+    },
+    [validateFiles],
+  );
+
+  const handleChooseFolder = useCallback(async () => {
+    if (preparingFolder || uploading) return;
+
+    const showDirectoryPicker = (window as DirectoryPickerWindow).showDirectoryPicker;
+    if (!showDirectoryPicker) {
+      directoryInputRef.current?.click();
+      return;
+    }
+
+    setPreparingFolder(true);
+    setError(null);
+    try {
+      const selectedDirectory = await showDirectoryPicker();
+      const archiveFile = await createArchiveFromDirectoryHandle(selectedDirectory);
+      const validFiles = validateFiles([archiveFile]);
+      if (validFiles) {
+        setFiles(validFiles);
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return;
+      }
+
+      if (directoryInputRef.current && (err instanceof DOMException || err instanceof TypeError)) {
+        directoryInputRef.current.click();
+        return;
+      }
+
+      setError(err instanceof Error ? err.message : 'Failed to package folder for upload.');
+    } finally {
+      setPreparingFolder(false);
+    }
+  }, [preparingFolder, uploading, validateFiles]);
 
   const handleUpload = useCallback(async () => {
-    if (!file || uploading) return;
+    if (files.length === 0 || uploading || preparingFolder) return;
     setUploading(true);
     setError(null);
     try {
-      await onUpload(file);
+      await onUpload(files);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Upload failed. Please try again.');
+    } finally {
       setUploading(false);
     }
-  }, [file, onUpload, uploading]);
+  }, [files, onUpload, preparingFolder, uploading]);
+
+  const totalSize = files.reduce((sum, currentFile) => sum + currentFile.size, 0);
+  const uploadLabel = preparingFolder
+    ? 'Packing Folder...'
+    : uploading
+      ? 'Uploading...'
+      : files.length > 1
+        ? `Upload ${files.length} Files`
+        : 'Upload';
 
   return (
     <div style={s.overlay} onClick={onClose}>
@@ -249,6 +457,22 @@ export default function FileUpload({
           </button>
         </div>
         <div style={s.body}>
+          <div style={s.visualIntro}>
+            <div className="unweaver-static-glow" style={s.visualGraphic}>
+              <img
+                src={signalChamberGraphic}
+                alt="Signal chamber upload illustration"
+                style={s.visualGraphicImg}
+              />
+            </div>
+            <div style={s.visualCopy}>
+              <span style={s.visualLabel}>Intake Surface</span>
+              <div style={s.visualTitle}>Upload obfuscated code or a full codebase.</div>
+              <div style={s.visualBody}>
+                Folder uploads are archived locally in the browser before deobfuscation starts on the backend.
+              </div>
+            </div>
+          </div>
           <div
             style={{
               ...s.dropzone,
@@ -261,31 +485,88 @@ export default function FileUpload({
           >
             <Upload size={28} style={s.icon} />
             <div style={s.instruction}>
-              {dragging ? 'Drop file or archive here' : 'Drag & drop a file or archive'}
+              {dragging ? 'Drop files or archives here' : 'Drag & drop files or archives'}
             </div>
             <div style={s.hint}>
-              Code files up to {maxSizeMB} MB, archives up to {maxArchiveSizeMB} MB
+              Select one or more files, or package a whole folder locally before upload
             </div>
+          </div>
+          <div style={s.pickerRow}>
+            <button
+              style={{ ...s.pickerBtn, opacity: preparingFolder || uploading ? 0.6 : 1 }}
+              type="button"
+              onClick={() => inputRef.current?.click()}
+              disabled={preparingFolder || uploading}
+            >
+              <Upload size={14} />
+              Choose File
+            </button>
+            <button
+              style={{ ...s.pickerBtn, opacity: preparingFolder || uploading ? 0.6 : 1 }}
+              type="button"
+              onClick={handleChooseFolder}
+              disabled={preparingFolder || uploading}
+            >
+              <FolderOpen size={14} />
+              Choose Folder
+            </button>
+          </div>
+          <div style={{ ...s.hint, marginTop: '8px' }}>
+            Choosing a folder packages it into a local `.zip` before upload.
           </div>
           <input
             ref={inputRef}
             type="file"
+            multiple
             accept={ACCEPTED_FILE_TYPES}
             style={{ display: 'none' }}
             onChange={handleFileSelect}
           />
-          {file && (
-            <div style={s.fileInfo}>
-              <FileText size={14} style={{ color: 'var(--accent)', flexShrink: 0 }} />
-              <span style={s.fileName}>{file.name}</span>
-              <span style={s.fileSize}>{formatSize(file.size)}</span>
-              <button
-                style={{ ...s.closeBtn, padding: '2px' }}
-                onClick={() => { setFile(null); setError(null); }}
-              >
-                <X size={12} />
-              </button>
-            </div>
+          <input
+            ref={directoryInputRef}
+            type="file"
+            style={{ display: 'none' }}
+            onChange={handleDirectorySelect}
+          />
+          {files.length > 0 && (
+            <>
+              <div style={s.selectionMeta}>
+                <span>
+                  {files.length} item{files.length === 1 ? '' : 's'} selected
+                </span>
+                <span>{formatSize(totalSize)}</span>
+              </div>
+              <div style={s.fileList}>
+                {files.map((file) => {
+                  const workspaceArchive = isWorkspaceArchiveFile(file);
+                  return (
+                  <div key={`${file.name}-${file.size}-${file.lastModified}`} style={s.fileInfo}>
+                    <FileText size={14} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+                    <span style={s.fileName}>
+                      {workspaceArchive
+                        ? `${file.unweaverSourceName} folder (${file.unweaverSourceFileCount ?? 0} files) -> ${file.name}`
+                        : file.name}
+                    </span>
+                    <span style={s.fileSize}>{formatSize(file.size)}</span>
+                    <button
+                      style={{ ...s.closeBtn, padding: '2px' }}
+                      onClick={() => {
+                        setFiles((currentFiles) => currentFiles.filter((candidate) => candidate !== file));
+                        setError(null);
+                      }}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                  );
+                })}
+              </div>
+              {files.some((file) => isWorkspaceArchiveFile(file)) && (
+                <div style={{ ...s.hint, marginTop: '8px' }}>
+                  Folder uploads are converted into one local archive for transport, then unpacked by Unweaver into a multi-file workspace bundle after upload.
+                </div>
+              )}
+            </>
           )}
           {error && (
             <div style={s.error}>
@@ -299,12 +580,12 @@ export default function FileUpload({
             Cancel
           </button>
           <button
-            style={{ ...s.uploadBtn, opacity: file && !uploading ? 1 : 0.4 }}
+            style={{ ...s.uploadBtn, opacity: files.length > 0 && !uploading && !preparingFolder ? 1 : 0.4 }}
             onClick={handleUpload}
-            disabled={!file || uploading}
+            disabled={files.length === 0 || uploading || preparingFolder}
           >
             <Upload size={12} />
-            {uploading ? 'Uploading...' : 'Upload'}
+            {uploadLabel}
           </button>
         </div>
       </div>

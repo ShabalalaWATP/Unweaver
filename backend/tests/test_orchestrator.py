@@ -19,8 +19,9 @@ from app.services.analysis.action_queue import (
     ActionStatus,
     QueuedAction,
 )
-from app.services.analysis.orchestrator import Planner
+from app.services.analysis.orchestrator import Orchestrator, Planner, Verifier
 from app.services.analysis.state_manager import StateManager
+from app.services.transforms.base import TransformResult
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -410,6 +411,72 @@ class TestPlannerWorkspaceBundles:
         assert "detect_language" not in names
         assert "fingerprint_obfuscation" in names
 
+    def test_schedules_targeted_workspace_deobfuscation_after_profile(self):
+        code = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 2\n"
+            "omitted_files: 0\n"
+            "languages: javascript=2\n"
+            "entry_points: src/main.js\n"
+            "suspicious_files: src/decode.js\n"
+            "manifest_files: package.json\n"
+            "root_dirs: src\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="src/main.js" language="javascript" priority="entrypoint" size=42>>>\n'
+            "const payload = atob('aGVsbG8=');\n"
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="src/decode.js" language="javascript" priority="suspicious" size=60>>>\n'
+            "const msg = String.fromCharCode(72, 105);\n"
+            "<<<END FILE>>>\n"
+        )
+        sm = StateManager("bundle-targeted", code, language="workspace")
+        sm.advance_iteration()
+        sm.advance_iteration()
+        sm.merge_workspace_context(
+            {
+                "entry_points": ["src/main.js"],
+                "suspicious_files": ["src/decode.js"],
+                "prioritized_files": [
+                    {"path": "src/decode.js", "score": 9.5},
+                    {"path": "src/main.js", "score": 8.0},
+                ],
+            }
+        )
+        q = ActionQueue()
+        planner = Planner(
+            available_actions={
+                "profile_workspace",
+                "fingerprint_obfuscation",
+                "deobfuscate_workspace_files",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "deobfuscate_workspace_files" in names
+
+
+class TestOrchestratorStopRequests:
+    @pytest.mark.asyncio
+    async def test_run_respects_stop_request_before_first_iteration(self):
+        orchestrator = Orchestrator(
+            sample_id="stop-test",
+            original_code="var payload = atob('aGVsbG8=');",
+            language="javascript",
+        )
+
+        result = await orchestrator.run(
+            max_iterations=3,
+            stop_requested=lambda: True,
+        )
+
+        assert result.was_stopped is True
+        assert result.iterations == 0
+        assert "Stop requested by user" in result.stop_reason
+        assert result.state.iteration_state["stopped"] is True
+
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -451,6 +518,45 @@ function fetchUserData(userId) {
         sm.update_readability("function hello() { return 'hi'; }")
         sm.update_readability("// comment\nfunction hello() { return 'hi'; }")
         assert len(sm.readability_history) == 3  # initial + 2 updates
+
+    def test_workspace_file_level_improvement_is_detected(self):
+        before = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 2\n"
+            "omitted_files: 0\n"
+            "languages: javascript=2\n"
+            "entry_points: src/main.js\n"
+            "suspicious_files: src/main.js\n"
+            "manifest_files: package.json\n"
+            "root_dirs: src\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="src/main.js" language="javascript" priority="suspicious,entrypoint" size=58>>>\n'
+            "const msg = String.fromCharCode(72, 105);\n"
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="src/large.js" language="javascript" priority="normal" size=220>>>\n'
+            "const filler = '"
+            + ("A" * 180)
+            + "';\n"
+            "<<<END FILE>>>\n"
+        )
+        after = before.replace(
+            "const msg = String.fromCharCode(72, 105);",
+            'const msg = "Hi";',
+        )
+        verifier = Verifier()
+        sm = StateManager("workspace-verify", before, language="workspace")
+        result = TransformResult(
+            success=True,
+            output=after,
+            confidence=0.8,
+            description="Improved one workspace file.",
+            details={"deobfuscated_files": ["src/main.js"]},
+        )
+
+        improvement = verifier.verify(before, after, result, sm)
+
+        assert improvement > 0.05
 
 
 # ════════════════════════════════════════════════════════════════════════

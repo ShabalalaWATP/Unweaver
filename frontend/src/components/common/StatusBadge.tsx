@@ -8,6 +8,12 @@ const STATUS_CONFIG: Record<
   SampleStatus,
   { color: string; bg: string; border: string; label: string; pulse?: boolean }
 > = {
+  ready: {
+    color: 'var(--warning)',
+    bg: 'var(--warning-muted)',
+    border: 'rgba(210,153,34,0.3)',
+    label: 'Ready',
+  },
   pending: {
     color: 'var(--text-muted)',
     bg: 'var(--bg-tertiary)',

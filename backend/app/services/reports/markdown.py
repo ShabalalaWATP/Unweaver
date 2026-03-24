@@ -19,6 +19,22 @@ from app.services.ingest.workspace_bundle import (
 )
 
 
+def _latest_workspace_context(iteration_states: List[Dict[str, Any]]) -> Dict[str, Any]:
+    for state in reversed(iteration_states):
+        state_data = state if isinstance(state, dict) else {}
+        state_json_str = state_data.get("state_json", "{}")
+        if not isinstance(state_json_str, str):
+            continue
+        try:
+            parsed = json.loads(state_json_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        workspace_context = parsed.get("workspace_context", {})
+        if isinstance(workspace_context, dict) and workspace_context:
+            return workspace_context
+    return {}
+
+
 def generate_markdown_report(
     *,
     sample_id: str,
@@ -50,7 +66,10 @@ def generate_markdown_report(
     lines.append("")
 
     bundle_text = pick_workspace_bundle_text(recovered_text, original_text)
-    workspace_context = extract_workspace_context(bundle_text or "")
+    workspace_context = {
+        **(extract_workspace_context(bundle_text or "") or {}),
+        **_latest_workspace_context(iteration_states),
+    }
     if workspace_context:
         lines.append("## Workspace Context")
         lines.append("")
@@ -61,7 +80,23 @@ def generate_markdown_report(
             lines.append("- Entry points: " + ", ".join(workspace_context["entry_points"][:8]))
         if workspace_context.get("suspicious_files"):
             lines.append("- Suspicious files: " + ", ".join(workspace_context["suspicious_files"][:8]))
-        preview = workspace_files_preview(bundle_text or "", max_files=12)
+        graph_summary = workspace_context.get("graph_summary", {})
+        if isinstance(graph_summary, dict):
+            if graph_summary.get("cross_file_calls"):
+                lines.append(f"- Cross-file calls: {graph_summary['cross_file_calls']}")
+            if graph_summary.get("execution_paths"):
+                lines.append(f"- Execution paths: {graph_summary['execution_paths']}")
+        if workspace_context.get("dependency_hotspots"):
+            lines.append("- Dependency hotspots: " + ", ".join(workspace_context["dependency_hotspots"][:8]))
+        if workspace_context.get("symbol_hotspots"):
+            lines.append("- Symbol hotspots: " + ", ".join(workspace_context["symbol_hotspots"][:8]))
+        if workspace_context.get("execution_paths"):
+            lines.append("")
+            lines.append("### Execution Paths")
+            lines.append("")
+            for item in workspace_context["execution_paths"][:6]:
+                lines.append(f"- `{item}`")
+        preview = workspace_context.get("files_preview") or workspace_files_preview(bundle_text or "", max_files=12)
         if preview:
             lines.append("")
             lines.append("### Prioritized Files")

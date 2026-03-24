@@ -84,29 +84,46 @@ _STANDALONE_B64 = re.compile(
     r"(?![A-Za-z0-9+/=])"           # not followed by b64 chars
 )
 
-MAX_NESTING = 3
+MAX_NESTING = 8
 
 
 def _is_plausible_b64(s: str) -> bool:
-    """Quick check that a string looks like valid base64."""
+    """Quick check that a string looks like valid base64 (standard or URL-safe)."""
     stripped = s.replace(" ", "").replace("\n", "").replace("\r", "")
     if len(stripped) < 8:
         return False
     if len(stripped) % 4 not in (0, 2, 3):
         return False
-    return bool(re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", stripped))
+    return bool(re.fullmatch(r"[A-Za-z0-9+/\-_]+={0,2}", stripped))
 
 
 def _try_decode(blob: str) -> str | None:
-    """Try to base64-decode a string. Return decoded text or None."""
+    """Try to base64-decode a string. Return decoded text or None.
+
+    Attempts standard base64 first, then URL-safe base64 (RFC 4648
+    with ``-`` and ``_`` instead of ``+`` and ``/``).
+    """
     cleaned = blob.replace(" ", "").replace("\n", "").replace("\r", "")
     # add padding if needed
     missing = len(cleaned) % 4
     if missing:
         cleaned += "=" * (4 - missing)
+
+    # Try standard base64 first
+    raw = None
     try:
         raw = base64.b64decode(cleaned, validate=True)
     except Exception:
+        pass
+
+    # Try URL-safe base64 (RFC 4648: - and _ instead of + and /)
+    if raw is None:
+        try:
+            raw = base64.urlsafe_b64decode(cleaned)
+        except Exception:
+            pass
+
+    if raw is None:
         return None
 
     # Try UTF-8 first (most common)
@@ -161,7 +178,7 @@ def _decode_nested(blob: str, depth: int = 0) -> list[dict[str, Any]]:
 
 class Base64Decoder(BaseTransform):
     name = "base64_decoder"
-    description = "Detect and decode base64-encoded strings (up to 3 layers)"
+    description = "Detect and decode base64-encoded strings (up to 8 nested layers)"
 
     def can_apply(self, code: str, language: str, state: dict) -> bool:
         # Quick heuristic: must contain a longish run of base64-alphabet chars

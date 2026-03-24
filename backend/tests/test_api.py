@@ -12,13 +12,14 @@ Uses httpx AsyncClient with the FastAPI test app to exercise:
 from __future__ import annotations
 
 import io
+import json
 import zipfile
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.db_models import Sample
+from app.models.db_models import IterationState, Sample
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -137,6 +138,7 @@ class TestSamplePaste:
         assert data["project_id"] == project_id
         assert data["filename"] == "test.js"
         assert data["language"] == "javascript"
+        assert data["status"] == "ready"
 
     @pytest.mark.asyncio
     async def test_paste_sample_empty_text_rejected(self, client: AsyncClient):
@@ -190,6 +192,7 @@ class TestSampleUpload:
         data = response.json()
         assert data["project_id"] == project_id
         assert "test.js" in data["filename"]
+        assert data["status"] == "ready"
 
     @pytest.mark.asyncio
     async def test_upload_empty_file_rejected(self, client: AsyncClient):
@@ -255,9 +258,34 @@ class TestSampleUpload:
         assert detail.status_code == 200
         payload = detail.json()
         assert payload["original_text"].startswith("UNWEAVER_WORKSPACE_BUNDLE v1")
+        assert payload["status"] == "ready"
         assert '<<<FILE path="apps/web/src/main.tsx"' in payload["original_text"]
         assert '<<<FILE path="packages/api/src/decode.ts"' in payload["original_text"]
         assert "node_modules/ignored/index.js" not in payload["original_text"]
+
+    @pytest.mark.asyncio
+    async def test_get_sample_repairs_stale_pending_to_ready(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+    ):
+        proj_resp = await client.post("/api/projects", json={"name": "Repair Pending Test"})
+        project_id = proj_resp.json()["id"]
+
+        sample = Sample(
+            project_id=project_id,
+            filename="legacy.js",
+            original_text="console.log('legacy');",
+            language="javascript",
+            status="pending",
+        )
+        db_session.add(sample)
+        await db_session.commit()
+        await db_session.refresh(sample)
+
+        response = await client.get(f"/api/samples/{sample.id}")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ready"
 
     @pytest.mark.asyncio
     async def test_export_deobfuscated_workspace_returns_zip(self, client: AsyncClient):
@@ -442,6 +470,47 @@ class TestAnalysisEndpoints:
         assert data["sample_id"] == sample_id
         assert "status" in data
 
+    @pytest.mark.asyncio
+    async def test_save_analysis_snapshot(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+    ):
+        proj_resp = await client.post("/api/projects", json={"name": "Save Snapshot Test"})
+        project_id = proj_resp.json()["id"]
+
+        paste_resp = await client.post(
+            f"/api/projects/{project_id}/samples/paste",
+            json={"original_text": "atob('dGVzdA==')", "filename": "saved.js"},
+        )
+        sample_id = paste_resp.json()["id"]
+
+        sample = await db_session.get(Sample, sample_id)
+        assert sample is not None
+        sample.status = "completed"
+        sample.recovered_text = "console.log('decoded');"
+        db_session.add(IterationState(
+            sample_id=sample_id,
+            iteration_number=1,
+            state_json=json.dumps({
+                "confidence": {"overall": 0.82},
+                "analysis_summary": "Recovered a decoded script body.",
+                "workspace_context": {"included_files": 1},
+            }),
+        ))
+        await db_session.commit()
+
+        response = await client.post(f"/api/samples/{sample_id}/analysis/save")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["recovered_text_length"] > 0
+        assert payload["confidence_score"] == 0.82
+        assert payload["analysis_summary"] == "Recovered a decoded script body."
+
+        detail = await client.get(f"/api/samples/{sample_id}")
+        assert detail.status_code == 200
+        assert detail.json()["saved_analysis"]["confidence_score"] == 0.82
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  Providers (via API)
@@ -567,3 +636,20 @@ class TestSampleSubResources:
         response = await client.get(f"/api/samples/{sample_id}/transforms")
         assert response.status_code == 200
         assert "transforms" in response.json()
+
+    @pytest.mark.asyncio
+    async def test_generate_summary_returns_structured_sections(self, client: AsyncClient):
+        sample_id = await self._create_sample(client)
+        response = await client.post(f"/api/samples/{sample_id}/summary")
+        assert response.status_code == 200
+        payload = response.json()
+        assert "summary" in payload
+        assert "sections" in payload
+        assert "confidence_score" in payload
+        assert "deobfuscation_analysis" in payload["sections"]
+        assert "inferred_original_intent" in payload["sections"]
+        assert "actual_behavior" in payload["sections"]
+        assert "confidence_assessment" in payload["sections"]
+        detail = await client.get(f"/api/samples/{sample_id}")
+        assert detail.status_code == 200
+        assert detail.json()["saved_analysis"]["ai_summary"]["summary"] == payload["summary"]

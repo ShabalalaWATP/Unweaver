@@ -3,9 +3,11 @@ import { Copy, Check } from 'lucide-react';
 import type { SampleDetail } from '@/types';
 import CodeViewer from '@/components/editors/CodeViewer';
 import { useToast } from '@/components/common/Toast';
+import WorkspaceBundleViewer from '@/components/workspace/WorkspaceBundleViewer';
 
 interface RecoveredTabProps {
   sample: SampleDetail;
+  highlightText?: string | null;
 }
 
 const emptyState: React.CSSProperties = {
@@ -43,7 +45,7 @@ const copyBtnStyle: React.CSSProperties = {
   transition: 'all 0.15s',
 };
 
-export default function RecoveredTab({ sample }: RecoveredTabProps) {
+export default function RecoveredTab({ sample, highlightText }: RecoveredTabProps) {
   const toast = useToast();
   const [copied, setCopied] = useState(false);
 
@@ -63,6 +65,19 @@ export default function RecoveredTab({ sample }: RecoveredTabProps) {
         </div>
         <div>Run analysis to deobfuscate this sample</div>
       </div>
+    );
+  }
+
+  if (sample.language === 'workspace') {
+    return (
+      <WorkspaceBundleViewer
+        bundleText={sample.recovered_text}
+        title="Recovered Workspace Bundle"
+        description="You are browsing the reconstructed files from the recovered workspace bundle. File boundaries are preserved so the codebase reads like a codebase, not one merged buffer."
+        accent="recovered"
+        originalBundleText={sample.original_text}
+        sampleId={sample.id}
+      />
     );
   }
 
@@ -96,6 +111,7 @@ export default function RecoveredTab({ sample }: RecoveredTabProps) {
         value={sample.recovered_text}
         language={sample.language}
         readOnly={true}
+        highlightText={highlightText}
       />
     </div>
   );

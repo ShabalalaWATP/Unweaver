@@ -1,0 +1,100 @@
+<svg width="1280" height="880" viewBox="0 0 1280 880" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="atlasGlow" x1="223" y1="142" x2="1030" y2="746" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#79BBFF"/>
+      <stop offset="0.52" stop-color="#58A6FF"/>
+      <stop offset="1" stop-color="#5EEAD4"/>
+    </linearGradient>
+    <linearGradient id="atlasWarm" x1="309" y1="225" x2="814" y2="617" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD166"/>
+      <stop offset="1" stop-color="#F97316"/>
+    </linearGradient>
+    <radialGradient id="atlasBloom" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(803 312) rotate(129.4) scale(516.366 541.267)">
+      <stop stop-color="#58A6FF" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#58A6FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="atlasBloomTwo" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(398 595) rotate(8.5) scale(371.529 294.357)">
+      <stop stop-color="#7C3AED" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#7C3AED" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softBlur" x="0" y="0" width="1280" height="880" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="48"/>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="880" rx="48" fill="#081018"/>
+  <g opacity="0.7">
+    <path d="M104 117H1176" stroke="white" stroke-opacity="0.08"/>
+    <path d="M104 200H1176" stroke="white" stroke-opacity="0.05"/>
+    <path d="M104 283H1176" stroke="white" stroke-opacity="0.05"/>
+    <path d="M104 366H1176" stroke="white" stroke-opacity="0.05"/>
+    <path d="M104 449H1176" stroke="white" stroke-opacity="0.05"/>
+    <path d="M104 532H1176" stroke="white" stroke-opacity="0.05"/>
+    <path d="M104 615H1176" stroke="white" stroke-opacity="0.05"/>
+    <path d="M104 698H1176" stroke="white" stroke-opacity="0.05"/>
+    <path d="M226 92V788" stroke="white" stroke-opacity="0.04"/>
+    <path d="M422 92V788" stroke="white" stroke-opacity="0.04"/>
+    <path d="M618 92V788" stroke="white" stroke-opacity="0.04"/>
+    <path d="M814 92V788" stroke="white" stroke-opacity="0.04"/>
+    <path d="M1010 92V788" stroke="white" stroke-opacity="0.04"/>
+  </g>
+
+  <g filter="url(#softBlur)" opacity="0.75">
+    <ellipse cx="807" cy="308" rx="266" ry="221" fill="url(#atlasBloom)"/>
+    <ellipse cx="401" cy="602" rx="209" ry="144" fill="url(#atlasBloomTwo)"/>
+  </g>
+
+  <g opacity="0.88">
+    <path d="M198 585C318 497 413 474 497 471C587 468 654 495 757 457C851 423 925 347 1064 269" stroke="url(#atlasGlow)" stroke-width="8" stroke-linecap="round"/>
+    <path d="M225 633C354 558 448 550 542 555C643 560 726 593 840 556C939 523 999 453 1093 392" stroke="url(#atlasGlow)" stroke-opacity="0.56" stroke-width="4" stroke-linecap="round" stroke-dasharray="10 15"/>
+    <path d="M254 686C362 646 447 638 549 639C644 640 708 628 798 577C893 524 946 448 1022 404" stroke="white" stroke-opacity="0.18" stroke-width="2" stroke-linecap="round"/>
+  </g>
+
+  <g>
+    <rect x="232" y="183" width="324" height="248" rx="32" fill="#0D1824" stroke="white" stroke-opacity="0.08"/>
+    <rect x="268" y="220" width="155" height="14" rx="7" fill="white" fill-opacity="0.1"/>
+    <rect x="268" y="252" width="242" height="12" rx="6" fill="#58A6FF" fill-opacity="0.22"/>
+    <rect x="268" y="281" width="215" height="12" rx="6" fill="white" fill-opacity="0.08"/>
+    <rect x="268" y="330" width="116" height="60" rx="16" fill="#101F31"/>
+    <rect x="402" y="330" width="116" height="60" rx="16" fill="#101F31"/>
+    <rect x="286" y="349" width="80" height="10" rx="5" fill="#79BBFF" fill-opacity="0.34"/>
+    <rect x="286" y="367" width="52" height="8" rx="4" fill="white" fill-opacity="0.12"/>
+    <rect x="420" y="349" width="77" height="10" rx="5" fill="#FFD166" fill-opacity="0.44"/>
+    <rect x="420" y="367" width="60" height="8" rx="4" fill="white" fill-opacity="0.12"/>
+  </g>
+
+  <g>
+    <path d="M625 195L993 195C1027.24 195 1055 222.758 1055 257V558C1055 592.242 1027.24 620 993 620H625C590.758 620 563 592.242 563 558V257C563 222.758 590.758 195 625 195Z" fill="#0B141F" stroke="white" stroke-opacity="0.08"/>
+    <circle cx="905" cy="335" r="112" stroke="url(#atlasGlow)" stroke-width="2" stroke-opacity="0.7"/>
+    <circle cx="905" cy="335" r="72" stroke="white" stroke-opacity="0.12"/>
+    <circle cx="905" cy="335" r="10" fill="#79BBFF"/>
+    <circle cx="972" cy="286" r="8" fill="#FFD166"/>
+    <circle cx="842" cy="400" r="7" fill="#5EEAD4"/>
+    <path d="M905 335L972 286" stroke="#FFD166" stroke-opacity="0.7" stroke-width="2"/>
+    <path d="M905 335L842 400" stroke="#5EEAD4" stroke-opacity="0.7" stroke-width="2"/>
+    <path d="M781 463C819 433 864 417 907 417C958 417 1005 440 1032 468" stroke="url(#atlasWarm)" stroke-width="5" stroke-linecap="round"/>
+    <rect x="620" y="234" width="166" height="14" rx="7" fill="white" fill-opacity="0.08"/>
+    <rect x="620" y="267" width="132" height="12" rx="6" fill="#79BBFF" fill-opacity="0.26"/>
+    <rect x="620" y="302" width="108" height="10" rx="5" fill="white" fill-opacity="0.08"/>
+    <rect x="620" y="477" width="96" height="70" rx="20" fill="#101C2A"/>
+    <rect x="734" y="477" width="96" height="70" rx="20" fill="#101C2A"/>
+    <rect x="848" y="477" width="96" height="70" rx="20" fill="#101C2A"/>
+    <rect x="638" y="500" width="60" height="9" rx="4.5" fill="#79BBFF" fill-opacity="0.3"/>
+    <rect x="752" y="500" width="54" height="9" rx="4.5" fill="#5EEAD4" fill-opacity="0.3"/>
+    <rect x="866" y="500" width="46" height="9" rx="4.5" fill="#FFD166" fill-opacity="0.36"/>
+  </g>
+
+  <g opacity="0.95">
+    <path d="M182 730C294 731 368 712 441 655C508 603 552 512 676 470C760 441 845 431 930 434" stroke="url(#atlasWarm)" stroke-width="6" stroke-linecap="round"/>
+    <path d="M236 768C351 766 433 752 507 700C579 650 618 565 738 531C827 505 915 501 1054 525" stroke="white" stroke-opacity="0.14" stroke-width="2" stroke-linecap="round" stroke-dasharray="8 16"/>
+  </g>
+
+  <g opacity="0.54">
+    <circle cx="255" cy="151" r="4" fill="#79BBFF"/>
+    <circle cx="343" cy="159" r="3" fill="#FFD166"/>
+    <circle cx="522" cy="137" r="4" fill="#5EEAD4"/>
+    <circle cx="1106" cy="205" r="4" fill="#79BBFF"/>
+    <circle cx="1047" cy="728" r="4" fill="#FFD166"/>
+    <circle cx="171" cy="690" r="3" fill="#5EEAD4"/>
+  </g>
+</svg>

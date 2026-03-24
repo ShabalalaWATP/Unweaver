@@ -198,6 +198,58 @@ async def export_deobfuscated(
     )
 
 
+# ── GET /api/samples/{id}/export/file ─────────────────────────────
+@router.get("/samples/{sample_id}/export/file")
+async def export_single_file(
+    sample_id: str,
+    path: str,
+    source: str = "recovered",
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Download a single file from a workspace bundle.
+
+    Query params:
+        path: file path within the bundle (e.g. ``src/index.js``)
+        source: ``recovered`` (default) or ``original``
+    """
+    sample = await db.get(Sample, sample_id)
+    if sample is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Sample {sample_id} not found",
+        )
+
+    bundle_text = sample.recovered_text if source == "recovered" else sample.original_text
+    if not bundle_text:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No bundle text available",
+        )
+
+    # Parse the bundle to find the requested file
+    import re
+    file_re = re.compile(
+        r'<<<FILE path="([^"]+)" language="([^"]+)" priority="[^"]*" size=\d+>>>\n'
+        r'([\s\S]*?)\n<<<END FILE>>>',
+    )
+    for match in file_re.finditer(bundle_text):
+        if match.group(1) == path:
+            content = match.group(3)
+            filename = path.rsplit("/", 1)[-1] if "/" in path else path
+            return Response(
+                content=content,
+                media_type="text/plain; charset=utf-8",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                },
+            )
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"File '{path}' not found in workspace bundle",
+    )
+
+
 # ── GET /api/samples/{id}/export/markdown ───────────────────────────
 @router.get("/samples/{sample_id}/export/markdown")
 async def export_markdown(

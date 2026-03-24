@@ -26,8 +26,22 @@ from app.services.transforms.base import BaseTransform, TransformResult
 logger = logging.getLogger(__name__)
 
 # Hard cap on code sent to the LLM (chars, not tokens — conservative).
+# Used as fallback when the client has no context_window attribute.
 _MAX_CODE_CHARS = 12_000
 _MAX_RESPONSE_TOKENS = 4096
+_MIN_RESPONSE_TOKENS = 512
+_TOKENS_PER_CHAR = 0.3  # conservative estimate for code
+
+# Task-specific multipliers: response tokens needed relative to input tokens.
+_TASK_MULTIPLIERS: Dict[str, float] = {
+    "deobfuscate": 1.5,
+    "classify": 0.05,
+    "reflect": 0.1,
+    "rename": 0.8,
+    "summarize": 0.3,
+    "confidence": 0.05,
+    "select": 0.05,
+}
 
 
 class LLMTransform(BaseTransform):
@@ -79,6 +93,40 @@ class LLMTransform(BaseTransform):
         """Override to change the max response tokens."""
         return _MAX_RESPONSE_TOKENS
 
+    def _task_type(self) -> str:
+        """Override to declare the task type for dynamic token budgeting."""
+        return "deobfuscate"
+
+    @staticmethod
+    def compute_token_budget(
+        input_chars: int,
+        task: str = "deobfuscate",
+        ceiling: int = _MAX_RESPONSE_TOKENS,
+    ) -> int:
+        """Compute appropriate max_tokens based on input size and task type.
+
+        Returns a value clamped between ``_MIN_RESPONSE_TOKENS`` and *ceiling*.
+        """
+        input_tokens_est = int(input_chars * _TOKENS_PER_CHAR)
+        multiplier = _TASK_MULTIPLIERS.get(task, 1.0)
+        budget = int(input_tokens_est * multiplier)
+        return max(_MIN_RESPONSE_TOKENS, min(ceiling, budget))
+
+    def _max_code_chars(self) -> int:
+        """Compute max code chars based on the provider's context window.
+
+        Reserves ~30% of the context for system prompt, state context, and
+        response tokens.  Converts the remaining token budget to chars at
+        ~4 chars/token.  Falls back to the hardcoded ``_MAX_CODE_CHARS``
+        when no client or context_window is available.
+        """
+        if not self._client:
+            return _MAX_CODE_CHARS
+        context_window = getattr(self._client, "context_window", 131_072)
+        available_tokens = int(context_window * 0.70)
+        max_chars = available_tokens * 4
+        return max(8_000, min(max_chars, 400_000))
+
     # ------------------------------------------------------------------
     #  BaseTransform interface
     # ------------------------------------------------------------------
@@ -117,10 +165,14 @@ class LLMTransform(BaseTransform):
 
         try:
             messages = self.build_messages(code, language, state)
+            # Use dynamic token budget unless subclass overrides get_max_tokens
+            max_tok = self.get_max_tokens()
+            if max_tok == _MAX_RESPONSE_TOKENS:
+                max_tok = self.compute_token_budget(len(code), self._task_type())
             reply = await self._client.chat(
                 messages=messages,
                 temperature=self.get_temperature(),
-                max_tokens=self.get_max_tokens(),
+                max_tokens=max_tok,
             )
             return self.parse_response(reply, code, language, state)
         except Exception as exc:
@@ -208,6 +260,7 @@ class LLMTransform(BaseTransform):
     def build_state_context(
         state: dict,
         *,
+        compact: bool = False,
         max_strings: int = 8,
         max_transforms: int = 6,
         max_literals: int = 6,
@@ -217,7 +270,15 @@ class LLMTransform(BaseTransform):
         LLM transforms were previously prompted with little more than the raw
         code. Passing the distilled state materially improves planning and
         deobfuscation quality without blowing the token budget.
+
+        When *compact* is True, produces a shorter summary suitable for
+        orchestrator-level LLM calls (classification, selection, reflection).
         """
+        if compact:
+            max_strings = 4
+            max_transforms = 3
+            max_literals = 3
+
         parts: List[str] = []
 
         language = state.get("language")
@@ -267,6 +328,32 @@ class LLMTransform(BaseTransform):
                     "Workspace suspicious files: "
                     + " | ".join(str(item) for item in suspicious_files[:6])
                 )
+            dependency_hotspots = workspace_context.get("dependency_hotspots", [])
+            if dependency_hotspots:
+                parts.append(
+                    "Workspace hotspots: "
+                    + " | ".join(str(item) for item in dependency_hotspots[:6])
+                )
+            execution_paths = workspace_context.get("execution_paths", [])
+            if execution_paths:
+                parts.append(
+                    "Workspace execution paths: "
+                    + " | ".join(str(item) for item in execution_paths[:4])
+                )
+            prioritized_files = workspace_context.get("prioritized_files", [])
+            if prioritized_files:
+                hotspot_paths: List[str] = []
+                for item in prioritized_files[:6]:
+                    if isinstance(item, dict):
+                        value = str(item.get("path", "")).strip()
+                    else:
+                        value = str(item).strip()
+                    if value:
+                        hotspot_paths.append(value)
+                if hotspot_paths:
+                    parts.append(
+                        "Prioritized files: " + " | ".join(hotspot_paths)
+                    )
 
         recovered_literals = state.get("recovered_literals", [])
         if recovered_literals:

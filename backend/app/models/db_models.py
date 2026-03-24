@@ -77,8 +77,10 @@ class Sample(Base):
     original_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     recovered_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     language: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ready")
     analyst_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    saved_analysis: Mapped[dict | None] = mapped_column("saved_analysis_json", JSON, nullable=True)
+    saved_analysis_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

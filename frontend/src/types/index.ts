@@ -2,7 +2,7 @@
 //  Enums
 // ════════════════════════════════════════════════════════════════════════
 
-export type SampleStatus = 'pending' | 'running' | 'completed' | 'failed' | 'stopped';
+export type SampleStatus = 'ready' | 'pending' | 'running' | 'completed' | 'failed' | 'stopped';
 
 export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical';
 
@@ -48,6 +48,7 @@ export interface Sample {
   filename: string;
   language: string | null;
   status: SampleStatus;
+  saved_analysis_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -61,6 +62,8 @@ export interface SampleDetail {
   language: string | null;
   status: SampleStatus;
   analyst_notes: string | null;
+  saved_analysis: SavedAnalysisSnapshot | null;
+  saved_analysis_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -134,6 +137,41 @@ export interface AnalysisState {
     suspicious_files?: string[];
     manifest_files?: string[];
     root_dirs?: string[];
+    dependency_hotspots?: string[];
+    symbol_hotspots?: string[];
+    execution_paths?: string[];
+    local_dependency_count?: number;
+    external_dependency_count?: number;
+    cross_file_call_count?: number;
+    graph_summary?: {
+      local_edges?: number;
+      external_edges?: number;
+      cross_file_calls?: number;
+      execution_paths?: number;
+      hotspots?: string[];
+    };
+    cross_file_call_edges?: Array<{
+      source: string;
+      target: string;
+      symbol: string;
+      count: number;
+      call_style: string;
+    }>;
+    prioritized_files?: Array<{
+      path: string;
+      language: string;
+      score: number;
+      reasons: string[];
+      priority_tags: string[];
+      inbound_edges: number;
+      outbound_edges: number;
+      cross_file_call_in: number;
+      cross_file_call_out: number;
+      suspicious_api_hits: number;
+      obfuscation_signal_hits: number;
+      function_count: number;
+      exported_symbol_count: number;
+    }>;
     files_preview?: Array<{
       path: string;
       language: string;
@@ -154,6 +192,16 @@ export interface AnalysisState {
     stall_counter: number;
     last_confidence: number;
     stopped: boolean;
+    llm_classification?: {
+      obfuscation_type?: string;
+      tools_identified?: string[];
+      layers?: string[];
+      recommended_strategy?: string;
+      priority_transforms?: string[];
+      confidence?: number;
+    };
+    planner_analysis?: string;
+    [key: string]: unknown;
   };
 }
 
@@ -195,6 +243,91 @@ export interface AnalysisStatus {
   total_iterations: number;
   current_action: string;
   progress_pct: number;
+}
+
+export interface AISummarySections {
+  deobfuscation_analysis: string;
+  inferred_original_intent: string;
+  actual_behavior: string;
+  confidence_assessment: string;
+}
+
+export interface AISummaryReport {
+  summary: string;
+  sections: AISummarySections;
+  confidence_score: number | null;
+}
+
+export interface SavedAnalysisSnapshot {
+  saved_at: string | null;
+  sample_status: SampleStatus | null;
+  transform_count: number;
+  finding_count: number;
+  ioc_count: number;
+  string_count: number;
+  recovered_text_length: number;
+  confidence_score: number | null;
+  analysis_summary: string;
+  workspace_context: {
+    archive_name?: string;
+    included_files?: number;
+    omitted_files?: number;
+    languages?: string;
+    entry_points?: string[];
+    suspicious_files?: string[];
+    manifest_files?: string[];
+    root_dirs?: string[];
+    prioritized_paths?: string[];
+    dependency_hotspots?: string[];
+    symbol_hotspots?: string[];
+    execution_paths?: string[];
+    local_dependency_count?: number;
+    external_dependency_count?: number;
+    cross_file_call_count?: number;
+    graph_summary?: {
+      local_edges?: number;
+      external_edges?: number;
+      cross_file_calls?: number;
+      execution_paths?: number;
+      hotspots?: string[];
+    };
+    cross_file_call_edges?: Array<{
+      source: string;
+      target: string;
+      symbol: string;
+      count: number;
+      call_style: string;
+    }>;
+    prioritized_files?: Array<{
+      path: string;
+      language: string;
+      score: number;
+      reasons: string[];
+      priority_tags: string[];
+      inbound_edges: number;
+      outbound_edges: number;
+      cross_file_call_in: number;
+      cross_file_call_out: number;
+      suspicious_api_hits: number;
+      obfuscation_signal_hits: number;
+      function_count: number;
+      exported_symbol_count: number;
+    }>;
+    bundle_note?: string;
+    files_preview?: Array<{
+      path: string;
+      language: string;
+      priority: string[];
+      size_bytes: number;
+    }>;
+    recovered_files_preview?: Array<{
+      path: string;
+      language: string;
+      priority: string[];
+      size_bytes: number;
+    }>;
+  };
+  ai_summary: AISummaryReport | null;
 }
 
 // ════════════════════════════════════════════════════════════════════════

@@ -1,11 +1,12 @@
 import { useState, useCallback } from 'react';
-import { ChevronDown, ChevronRight, AlertTriangle, Info, AlertOctagon, ShieldAlert, ShieldCheck } from 'lucide-react';
+import { ChevronDown, ChevronRight, AlertTriangle, Info, AlertOctagon, ShieldAlert, ShieldCheck, ExternalLink } from 'lucide-react';
 import type { Finding, Severity } from '@/types';
 import { useAsync } from '@/hooks/useApi';
 import * as api from '@/services/api';
 
 interface FindingsTabProps {
   sampleId: string;
+  onNavigateToCode?: (searchText: string) => void;
 }
 
 const SEVERITY_CONFIG: Record<
@@ -152,12 +153,25 @@ function getConfidenceColor(val: number): string {
   return 'var(--danger)';
 }
 
-export default function FindingsTab({ sampleId }: FindingsTabProps) {
+function categorizeFinding(title: string): string {
+  const t = title.toLowerCase();
+  if (t.includes('obfuscation')) return 'Obfuscation';
+  if (t.includes('ioc') || t.includes('indicator')) return 'IOC';
+  if (t.includes('api') || t.includes('suspicious')) return 'Suspicious API';
+  if (t.includes('entropy') || t.includes('encrypted')) return 'Encoding';
+  if (t.includes('assessment') || t.includes('overall')) return 'Assessment';
+  if (t.includes('transform') || t.includes('resistant')) return 'Transform';
+  return 'Analysis';
+}
+
+export default function FindingsTab({ sampleId, onNavigateToCode }: FindingsTabProps) {
   const { data: findings, loading } = useAsync<Finding[]>(
     () => api.getFindings(sampleId),
     [sampleId],
   );
   const [expandedSet, setExpandedSet] = useState<Set<string>>(new Set());
+  const [severityFilter, setSeverityFilter] = useState<string>('all');
+  const [searchTerm, setSearchTerm] = useState('');
 
   const toggleExpand = useCallback((id: string) => {
     setExpandedSet((prev) => {
@@ -179,13 +193,88 @@ export default function FindingsTab({ sampleId }: FindingsTabProps) {
     return <div style={s.emptyState}>No findings yet</div>;
   }
 
-  const sorted = [...findings].sort(
+  const filtered = findings.filter((f) => {
+    if (severityFilter !== 'all' && f.severity !== severityFilter) return false;
+    if (searchTerm) {
+      const term = searchTerm.toLowerCase();
+      return (
+        f.title.toLowerCase().includes(term) ||
+        f.description.toLowerCase().includes(term) ||
+        (f.evidence?.toLowerCase().includes(term) ?? false)
+      );
+    }
+    return true;
+  });
+
+  const sorted = [...filtered].sort(
     (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity),
   );
 
+  const severityCounts = findings.reduce<Record<string, number>>((acc, f) => {
+    acc[f.severity] = (acc[f.severity] ?? 0) + 1;
+    return acc;
+  }, {});
+
   return (
     <div style={s.root}>
-      {sorted.map((f) => {
+      {/* Filter toolbar */}
+      <div style={{
+        display: 'flex',
+        gap: '6px',
+        marginBottom: '12px',
+        flexWrap: 'wrap',
+        alignItems: 'center',
+      }}>
+        <input
+          type="text"
+          placeholder="Search findings..."
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value)}
+          style={{
+            padding: '5px 10px',
+            fontSize: '11px',
+            borderRadius: 'var(--radius-md)',
+            border: '1px solid var(--border)',
+            background: 'var(--bg-tertiary)',
+            color: 'var(--text-primary)',
+            outline: 'none',
+            flex: '1 1 120px',
+            minWidth: '120px',
+          }}
+        />
+        {(['all', ...SEVERITY_ORDER] as const).map((sev) => {
+          const isActive = severityFilter === sev;
+          const count = sev === 'all' ? findings.length : (severityCounts[sev] ?? 0);
+          if (sev !== 'all' && count === 0) return null;
+          const cfg = sev !== 'all' ? SEVERITY_CONFIG[sev] : null;
+          return (
+            <button
+              key={sev}
+              type="button"
+              onClick={() => setSeverityFilter(sev)}
+              style={{
+                padding: '4px 8px',
+                fontSize: '10px',
+                fontWeight: 600,
+                borderRadius: 'var(--radius-sm)',
+                border: `1px solid ${isActive ? (cfg?.color ?? 'var(--accent)') : 'var(--border)'}`,
+                background: isActive ? (cfg?.bg ?? 'var(--accent-muted)') : 'transparent',
+                color: isActive ? (cfg?.color ?? 'var(--accent)') : 'var(--text-muted)',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+                appearance: 'none',
+              }}
+            >
+              {sev === 'all' ? 'All' : sev.toUpperCase()} {count}
+            </button>
+          );
+        })}
+      </div>
+      {sorted.length === 0 ? (
+        <div style={s.emptyState}>No findings match filters</div>
+      ) : sorted.map((f) => {
         const cfg = SEVERITY_CONFIG[f.severity] ?? SEVERITY_CONFIG.info;
         const expanded = expandedSet.has(f.id);
 
@@ -207,6 +296,18 @@ export default function FindingsTab({ sampleId }: FindingsTabProps) {
                 {cfg.label}
               </span>
               <span style={s.title}>{f.title}</span>
+              <span style={{
+                fontSize: '9px',
+                fontWeight: 500,
+                padding: '1px 6px',
+                borderRadius: 'var(--radius-sm)',
+                background: 'var(--bg-tertiary)',
+                color: 'var(--text-muted)',
+                border: '1px solid var(--border)',
+                flexShrink: 0,
+              }}>
+                {categorizeFinding(f.title)}
+              </span>
               <span style={s.confidenceSmall}>
                 {Math.round(f.confidence * 100)}%
               </span>
@@ -240,7 +341,35 @@ export default function FindingsTab({ sampleId }: FindingsTabProps) {
                 </div>
                 {f.evidence && (
                   <div style={{ marginTop: '10px' }}>
-                    <div style={s.evidenceLabel}>Evidence</div>
+                    <div style={{ ...s.evidenceLabel, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <span>Evidence</span>
+                      {onNavigateToCode && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            // Extract the most useful search snippet from evidence
+                            const snippet = f.evidence!.split('\n')[0].trim().slice(0, 80);
+                            if (snippet) onNavigateToCode(snippet);
+                          }}
+                          style={{
+                            background: 'none',
+                            border: '1px solid var(--border)',
+                            borderRadius: 'var(--radius-sm)',
+                            padding: '2px 6px',
+                            fontSize: '9px',
+                            color: 'var(--accent)',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '3px',
+                          }}
+                          title="Find in recovered code"
+                        >
+                          <ExternalLink size={9} />
+                          View in Code
+                        </button>
+                      )}
+                    </div>
                     <div style={s.evidenceBlock}>{f.evidence}</div>
                   </div>
                 )}

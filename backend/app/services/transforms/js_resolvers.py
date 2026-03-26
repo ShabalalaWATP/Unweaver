@@ -191,6 +191,22 @@ def _iter_wrapper_candidates(code: str):
             )
 
 
+def _iter_rotation_candidates(code: str, arrays: dict[str, list[str]]):
+    for pattern, direction in ((_ROTATION_FUNC, "left"), (_RIGHT_ROTATION_FUNC, "right")):
+        for match in pattern.finditer(code):
+            target_arr = match.group(3)
+            rotation_count = _evaluate_rotation_count(match.group(4))
+            if target_arr not in arrays or rotation_count is None:
+                continue
+            yield {
+                "start": match.start(),
+                "end": match.end(),
+                "array": target_arr,
+                "count": rotation_count,
+                "direction": direction,
+            }
+
+
 def _extract_wrapper_definition(
     func_name: str,
     param_name: str,
@@ -317,24 +333,11 @@ class JavaScriptArrayResolver(BaseTransform):
         # 2. Check for rotation functions (handle chained/multiple rotations)
         rotation_applied: dict[str, int] = {}  # track signed rotation per array
         rotation_matches: list[dict[str, Any]] = []
-        for pattern, direction in ((_ROTATION_FUNC, "left"), (_RIGHT_ROTATION_FUNC, "right")):
-            for m in pattern.finditer(code):
-                target_arr = m.group(3)
-                rotation_count = _evaluate_rotation_count(m.group(4))
-                if target_arr not in arrays or rotation_count is None:
-                    continue
-                signed = rotation_count if direction == "left" else -rotation_count
-                total = rotation_applied.get(target_arr, 0) + signed
-                rotation_applied[target_arr] = total
-                rotation_matches.append(
-                    {
-                        "start": m.start(),
-                        "end": m.end(),
-                        "array": target_arr,
-                        "count": rotation_count,
-                        "direction": direction,
-                    }
-                )
+        for rotation in _iter_rotation_candidates(code, arrays):
+            signed = rotation["count"] if rotation["direction"] == "left" else -rotation["count"]
+            total = rotation_applied.get(rotation["array"], 0) + signed
+            rotation_applied[rotation["array"]] = total
+            rotation_matches.append(rotation)
 
         # Apply cumulative rotations
         for arr_name, total_rotation in rotation_applied.items():

@@ -1128,7 +1128,6 @@ def _residual_obfuscation_markers(
     )
 
     if lang in {"javascript", "js", "typescript", "ts"}:
-        _flag(r"\b_0x[0-9a-fA-F]{3,}\b", 1.4, "JavaScript string-table identifiers remain")
         _flag(
             r"""\b\w+\s*\(\s*['"]0x[0-9a-fA-F]+['"]\s*\)""",
             1.4,
@@ -1356,7 +1355,7 @@ class StopDecision:
             and readability_history[-1] >= 0.75
             and confidence >= 0.6
         ):
-            if _pending_can_reduce_residual():
+            if residual["has_residual"] and _pending_can_reduce_residual():
                 return StopVerdict(
                     StopAction.CONTINUE,
                     (
@@ -1378,7 +1377,7 @@ class StopDecision:
             if all(abs(recent[i] - recent[i - 1]) < 0.02 for i in range(1, len(recent))):
                 # Readability has plateaued — further transforms are unlikely to help.
                 if confidence >= 0.5 and iteration >= 5:
-                    if _pending_can_reduce_residual():
+                    if residual["has_residual"] and _pending_can_reduce_residual():
                         return StopVerdict(
                             StopAction.CONTINUE,
                             (

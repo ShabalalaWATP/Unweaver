@@ -574,6 +574,32 @@ class TestPlannerLLMGating:
 
         assert "llm_deobfuscate" in names
 
+    def test_reruns_eval_detection_after_literal_payload_is_exposed(self):
+        sm = StateManager(
+            "literal-eval-rerun",
+            """eval('console.log("loaded")');""",
+            language="javascript",
+        )
+        sm.add_detected_techniques(["eval_exec"])
+        q = ActionQueue()
+        q.enqueue("detect_eval_exec_reflection", confidence=0.9)
+        q.dequeue()
+        q.mark_succeeded("detect_eval_exec_reflection")
+        q.enqueue("constant_fold", confidence=0.9)
+        q.dequeue()
+        q.mark_succeeded("constant_fold")
+        planner = Planner(
+            available_actions={
+                "detect_eval_exec_reflection",
+                "constant_fold",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "detect_eval_exec_reflection" in names
+
 
 class TestStopDecisionResiduals:
     def test_does_not_stop_when_high_confidence_but_residual_markers_remain(self):
@@ -602,6 +628,27 @@ class TestStopDecisionResiduals:
 
         assert verdict.action == StopAction.CONTINUE
         assert "residual" in verdict.reason.lower() or "wrapper" in verdict.reason.lower()
+
+    def test_allows_replanning_when_queue_is_empty_but_residual_wrappers_remain(self):
+        sm = StateManager(
+            "stop-replan-residual",
+            """eval('console.log("loaded")');""",
+            language="javascript",
+        )
+        sm.advance_iteration()
+        sm.update_confidence(overall=0.95)
+        decision = StopDecision(sufficiency_threshold=0.85)
+        q = ActionQueue()
+
+        verdict = decision.evaluate(
+            sm,
+            q,
+            last_transform_success=True,
+            improvement_score=0.02,
+        )
+
+        assert verdict.action == StopAction.CONTINUE
+        assert "planning" in verdict.reason.lower() or "queue exhausted" in verdict.reason.lower()
 
 
 class TestOrchestratorStopRequests:
@@ -860,6 +907,44 @@ class TestOrchestratorDecoderCoverage:
         actions = [item.action for item in result.transform_history]
         assert "identify_string_resolver" in actions
         assert 'console.log("b");' in result.deobfuscated_code
+
+    @pytest.mark.asyncio
+    async def test_javascript_demo_sample_fully_recovers_code(self):
+        code = (
+            "var _0x4a2b = ['aHR0cDovL2V4YW1wbGUuY29tL2MycGF5bG9hZA==', "
+            "'bG9jYWxTdG9yYWdl', 'Z2V0SXRlbQ=='];\n"
+            "(function(_0x1a2b3c, _0x4a2b5d) {\n"
+            "    var _0x1f3a = function(_0x2d1e4f) {\n"
+            "        while (--_0x2d1e4f) {\n"
+            "            _0x1a2b3c['push'](_0x1a2b3c['shift']());\n"
+            "        }\n"
+            "    };\n"
+            "    _0x1f3a(++_0x4a2b5d);\n"
+            "}(_0x4a2b, 0x1a3));\n"
+            "var _0xf1 = function(_0x1, _0x2) {\n"
+            "    _0x1 = _0x1 - 0x0;\n"
+            "    var _0x3 = _0x4a2b[_0x1];\n"
+            "    return _0x3;\n"
+            "};\n"
+            "var url = atob(_0xf1('0x0'));\n"
+            "var storage = _0xf1('0x1');\n"
+            "eval('console' + '.' + 'log' + '(' + '\"loaded\"' + ')');\n"
+        )
+        result = await Orchestrator(
+            sample_id="js-demo-fully-recovered",
+            original_code=code,
+            language="javascript",
+        ).run(max_iterations=12)
+
+        actions = [item.action for item in result.transform_history]
+        assert "identify_string_resolver" in actions
+        assert "detect_eval_exec_reflection" in actions
+        assert "var _0x4a2b = [" not in result.deobfuscated_code
+        assert "_0x1a2b3c['push']" not in result.deobfuscated_code
+        assert "eval(" not in result.deobfuscated_code
+        assert 'var url = "http://example.com/c2payload";' in result.deobfuscated_code
+        assert 'var storage = "localStorage";' in result.deobfuscated_code
+        assert 'console.log("loaded");' in result.deobfuscated_code
 
     @pytest.mark.asyncio
     async def test_javascript_packer_runs_in_orchestrator(self):

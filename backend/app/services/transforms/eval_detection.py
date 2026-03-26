@@ -6,6 +6,7 @@ where possible and flags them as suspicious APIs.
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -316,6 +317,82 @@ _ALL_PATTERNS: dict[str, list[_APIPattern]] = {
 }
 
 
+_JS_LITERAL_EVAL = re.compile(
+    r"""\beval\s*\(\s*(?P<literal>(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"))\s*\)\s*;?""",
+    re.DOTALL,
+)
+
+
+def _sink_family(api_name: str) -> str:
+    value = api_name.lower()
+    if value in {"eval", "function", "function_call", "invoke-expression", "iex_pipe", "scriptblock_create"}:
+        return "dynamic_code_execution"
+    if "process" in value or value in {"os_system", "subprocess", "start-process"}:
+        return "process_execution"
+    if "download" in value:
+        return "network_retrieval"
+    if "assembly" in value or "compile" in value:
+        return "dynamic_loading"
+    if "invoke" in value:
+        return "reflection_invocation"
+    return "suspicious_sink"
+
+
+def _parse_literal_string(literal: str) -> str | None:
+    try:
+        parsed = ast.literal_eval(literal)
+    except (SyntaxError, ValueError):
+        return None
+    return parsed if isinstance(parsed, str) else None
+
+
+def _balanced_snippet(snippet: str) -> bool:
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    closing = {value: key for key, value in pairs.items()}
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+
+    for char in snippet:
+        if quote is not None:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == quote:
+                quote = None
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+            continue
+        if char in pairs:
+            stack.append(char)
+            continue
+        if char in closing:
+            if not stack or stack[-1] != closing[char]:
+                return False
+            stack.pop()
+
+    return not stack and quote is None
+
+
+def _looks_like_js_code(snippet: str) -> bool:
+    candidate = snippet.strip()
+    if len(candidate) < 4:
+        return False
+    indicators = (
+        r"""\b(?:var|let|const|function|return|if|for|while|switch|try|catch|new|class|import|export)\b""",
+        r"""\b[A-Za-z_$][\w$]*\s*\(""",
+        r"""\b[A-Za-z_$][\w$]*\s*=""",
+        r"""\b[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\s*\(""",
+        r"""[{};]""",
+    )
+    return any(re.search(pattern, candidate) for pattern in indicators)
+
+
 class EvalExecDetector(BaseTransform):
     name = "eval_exec_detector"
     description = "Detect eval/exec/invoke and other dangerous API calls"
@@ -327,6 +404,8 @@ class EvalExecDetector(BaseTransform):
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
         patterns = self._get_patterns(language)
         findings: list[dict[str, Any]] = []
+        output = code
+        unwrapped_calls: list[dict[str, str]] = []
 
         for api in patterns:
             for m in api.pattern.finditer(code):
@@ -362,6 +441,21 @@ class EvalExecDetector(BaseTransform):
         high_count = sum(1 for f in findings if f["severity"] == "high")
         confidence = min(0.98, 0.70 + 0.05 * high_count)
 
+        identified_sinks = [
+            {
+                "api": finding["api"],
+                "family": _sink_family(finding["api"]),
+                "severity": finding["severity"],
+                "argument": finding["argument"],
+                "position": finding["position"],
+            }
+            for finding in findings
+        ]
+        suspicious_api_labels = [
+            f'{item["api"]}:{item["severity"]}'
+            for item in findings
+        ]
+
         state.setdefault("suspicious_apis", []).extend(findings)
 
         severity_summary = {}
@@ -374,17 +468,49 @@ class EvalExecDetector(BaseTransform):
             f"{count} {sev}" for sev, count in severity_summary.items()
         )
 
+        lang = (language or "").lower().strip()
+        if lang in {"javascript", "js", "typescript", "ts"}:
+            def _unwrap_literal_eval(match: re.Match[str]) -> str:
+                literal = match.group("literal")
+                decoded = _parse_literal_string(literal)
+                if decoded is None or not _looks_like_js_code(decoded):
+                    return match.group(0)
+
+                snippet = decoded.strip()
+                if not snippet:
+                    return match.group(0)
+                if snippet[-1] not in {";", "}"}:
+                    snippet += ";"
+                if not _balanced_snippet(snippet):
+                    return match.group(0)
+
+                unwrapped_calls.append({
+                    "api": "eval",
+                    "original": match.group(0)[:240],
+                    "rewritten": snippet[:240],
+                })
+                return snippet
+
+            output = _JS_LITERAL_EVAL.sub(_unwrap_literal_eval, output)
+
         return TransformResult(
             success=True,
-            output=code,  # detection only, no modification
+            output=output,
             confidence=confidence,
             description=(
                 f"Detected {len(findings)} suspicious API call(s): {summary}."
+                + (
+                    f" Unwrapped {len(unwrapped_calls)} literal eval payload(s)."
+                    if unwrapped_calls else ""
+                )
             ),
             details={
                 "finding_count": len(findings),
                 "severity_summary": severity_summary,
                 "findings": findings,
+                "identified_sinks": identified_sinks,
+                "suspicious_apis": suspicious_api_labels,
+                "unwrapped_calls": unwrapped_calls,
             },
         )
 

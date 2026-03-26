@@ -532,7 +532,8 @@ class TestJavaScriptArrayResolver:
         result = resolver.apply(code, "javascript", {})
 
         assert result.success is True
-        assert 'var _0xabc = ["b", "c", "a"];' in result.output
+        assert 'var _0xabc = ["b", "c", "a"];' not in result.output
+        assert "var _0xabc" not in result.output
         assert "push(_0xArr.shift())" not in result.output
         assert 'console.log("b");' in result.output
         assert "deterministic_array_rotation_fold" in result.details["detected_techniques"]
@@ -564,6 +565,40 @@ class TestJavaScriptArrayResolver:
             item["type"] for item in result.details["static_rewrites"]
         ]
 
+    def test_removes_unused_array_and_adjacent_rotation_helper_after_inlining(self):
+        resolver = JavaScriptArrayResolver()
+        code = (
+            "var _0x4a2b = ['aHR0cDovL2V4YW1wbGUuY29tL2MycGF5bG9hZA==', 'bG9jYWxTdG9yYWdl'];\n"
+            "(function(_0x1a2b3c, _0x4a2b5d) {\n"
+            "    var _0x1f3a = function(_0x2d1e4f) {\n"
+            "        while (--_0x2d1e4f) {\n"
+            "            _0x1a2b3c['push'](_0x1a2b3c['shift']());\n"
+            "        }\n"
+            "    };\n"
+            "    _0x1f3a(++_0x4a2b5d);\n"
+            "}(_0x4a2b, 0x1a3));\n"
+            "var _0xf1 = function(_0x1) {\n"
+            "    var _0x3 = _0x4a2b[_0x1];\n"
+            "    return _0x3;\n"
+            "};\n"
+            "var url = atob(_0xf1('0x0'));\n"
+            "var storage = _0xf1('0x1');\n"
+        )
+
+        result = resolver.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert "var _0x4a2b = [" not in result.output
+        assert "_0x1a2b3c['push']" not in result.output
+        assert 'var url = atob("aHR0cDovL2V4YW1wbGUuY29tL2MycGF5bG9hZA==");' in result.output
+        assert 'var storage = "bG9jYWxTdG9yYWdl";' in result.output
+        assert "unused_array_removed" in [
+            item["type"] for item in result.details["static_rewrites"]
+        ]
+        assert "unused_rotation_helper_removed" in [
+            item["type"] for item in result.details["static_rewrites"]
+        ]
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  Sink detection metadata
@@ -577,6 +612,14 @@ class TestEvalExecDetector:
         assert result.success is True
         assert result.details["identified_sinks"][0]["family"] == "dynamic_code_execution"
         assert "eval:high" in result.details["suspicious_apis"]
+
+    def test_unwraps_literal_javascript_eval_payload(self):
+        detector = EvalExecDetector()
+        result = detector.apply("""eval('console.log("loaded")');""", "javascript", {})
+
+        assert result.success is True
+        assert result.output == """console.log("loaded");"""
+        assert len(result.details["unwrapped_calls"]) == 1
 
 
 class TestLanguageDetector:

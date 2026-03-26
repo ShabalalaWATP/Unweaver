@@ -207,6 +207,150 @@ def _iter_rotation_candidates(code: str, arrays: dict[str, list[str]]):
             }
 
 
+def _skip_js_trivia(code: str, idx: int) -> int:
+    while idx < len(code):
+        if code[idx].isspace():
+            idx += 1
+            continue
+        if code.startswith("//", idx):
+            newline = code.find("\n", idx + 2)
+            return len(code) if newline == -1 else newline + 1
+        if code.startswith("/*", idx):
+            close = code.find("*/", idx + 2)
+            return len(code) if close == -1 else close + 2
+        break
+    return idx
+
+
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    idx = open_idx
+
+    while idx < len(text):
+        char = text[idx]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            idx += 1
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+        idx += 1
+
+    return -1
+
+
+def _find_named_array_declaration(code: str, array_name: str) -> re.Match[str] | None:
+    for match in _ARRAY_DECL.finditer(code):
+        if match.group(2) == array_name:
+            return match
+    return None
+
+
+def _identifier_occurs_outside_ranges(
+    code: str,
+    name: str,
+    ignore_ranges: list[tuple[int, int]],
+) -> bool:
+    pattern = re.compile(rf"""\b{re.escape(name)}\b""")
+    for match in pattern.finditer(code):
+        if any(start <= match.start() < end for start, end in ignore_ranges):
+            continue
+        return True
+    return False
+
+
+def _find_adjacent_rotation_helper(
+    code: str,
+    decl_end: int,
+    array_name: str,
+) -> tuple[int, int] | None:
+    start = _skip_js_trivia(code, decl_end)
+    if start >= len(code):
+        return None
+
+    probe = start
+    while probe < len(code) and code[probe] in "!~+-":
+        probe += 1
+        probe = _skip_js_trivia(code, probe)
+
+    function_start = probe
+    if probe < len(code) and code[probe] == "(":
+        probe += 1
+        probe = _skip_js_trivia(code, probe)
+        function_start = probe
+
+    func_match = re.match(
+        r"""function\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*\{""",
+        code[function_start:],
+        re.DOTALL,
+    )
+    if func_match is None:
+        return None
+
+    array_param = func_match.group(1)
+    open_brace = code.find("{", function_start + func_match.start())
+    if open_brace == -1:
+        return None
+    close_brace = _find_matching_brace(code, open_brace)
+    if close_brace == -1:
+        return None
+
+    body = code[open_brace + 1:close_brace]
+    push_shift = re.search(
+        rf"""{re.escape(array_param)}\s*(?:\.\s*push|\[\s*['"]push['"]\s*\])\s*\(\s*"""
+        rf"""{re.escape(array_param)}\s*(?:\.\s*shift|\[\s*['"]shift['"]\s*\])\s*\(\s*\)\s*\)""",
+        body,
+        re.DOTALL,
+    )
+    unshift_pop = re.search(
+        rf"""{re.escape(array_param)}\s*(?:\.\s*unshift|\[\s*['"]unshift['"]\s*\])\s*\(\s*"""
+        rf"""{re.escape(array_param)}\s*(?:\.\s*pop|\[\s*['"]pop['"]\s*\])\s*\(\s*\)\s*\)""",
+        body,
+        re.DOTALL,
+    )
+    if push_shift is None and unshift_pop is None:
+        return None
+
+    after_body = _skip_js_trivia(code, close_brace + 1)
+    if after_body < len(code) and code[after_body] == ")":
+        after_body = _skip_js_trivia(code, after_body + 1)
+    if after_body >= len(code) or code[after_body] != "(":
+        return None
+
+    close_paren = _find_matching_paren(code, after_body)
+    if close_paren == -1:
+        return None
+
+    args = code[after_body + 1:close_paren]
+    target_match = re.match(r"""\s*(\w+)\s*(?:,|$)""", args)
+    if target_match is None or target_match.group(1) != array_name:
+        return None
+
+    end = close_paren + 1
+    end = _skip_js_trivia(code, end)
+    if end < len(code) and code[end] == ")":
+        end += 1
+        end = _skip_js_trivia(code, end)
+    if end < len(code) and code[end] == ";":
+        end += 1
+
+    return start, end
+
+
 def _extract_wrapper_definition(
     func_name: str,
     param_name: str,
@@ -453,6 +597,34 @@ class JavaScriptArrayResolver(BaseTransform):
             return m.group(0)
 
         output = _ARRAY_ACCESS.sub(_replace_access, output)
+
+        cleanup_edits: list[tuple[int, int, str]] = []
+        for arr_name in array_declarations:
+            decl_match = _find_named_array_declaration(output, arr_name)
+            if decl_match is None:
+                continue
+            ignore_ranges = [(decl_match.start(), decl_match.end())]
+            helper_range = _find_adjacent_rotation_helper(output, decl_match.end(), arr_name)
+            if helper_range is not None:
+                ignore_ranges.append(helper_range)
+            if _identifier_occurs_outside_ranges(output, arr_name, ignore_ranges):
+                continue
+
+            cleanup_edits.append((decl_match.start(), decl_match.end(), ""))
+            static_rewrites.append({
+                "type": "unused_array_removed",
+                "array": arr_name,
+            })
+            if helper_range is not None:
+                cleanup_edits.append((helper_range[0], helper_range[1], ""))
+                static_rewrites.append({
+                    "type": "unused_rotation_helper_removed",
+                    "array": arr_name,
+                })
+
+        if cleanup_edits:
+            output = _apply_text_edits(output, cleanup_edits)
+            output = re.sub(r"\n{3,}", "\n\n", output).strip()
 
         if not replacements and not static_rewrites:
             return TransformResult(

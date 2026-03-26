@@ -51,6 +51,20 @@ def _fold_string_concat(match_text: str) -> str | None:
     return combined
 
 
+def _quote_folded_string(text: str, language: str) -> str:
+    """Render a folded string using a quote style that preserves contents."""
+    lang = (language or "").lower().strip()
+    if lang in ("powershell", "ps1", "ps"):
+        escaped = text.replace("`", "``").replace('"', '`"')
+        return f'"{escaped}"'
+    if '"' not in text:
+        return f'"{text}"'
+    if "'" not in text:
+        return f"'{text}'"
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 # ---------------------------------------------------------------------------
 # Numeric constant folding (safe recursive descent evaluator)
 # ---------------------------------------------------------------------------
@@ -631,7 +645,7 @@ class ConstantFolder(BaseTransform):
         def _replace_str_concat(m: re.Match) -> str:
             folded = _fold_string_concat(m.group(0))
             if folded is not None:
-                result = f'"{folded}"'
+                result = _quote_folded_string(folded, lang)
                 changes.append({
                     "type": "string_concat",
                     "original": m.group(0),

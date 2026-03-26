@@ -14,6 +14,7 @@ import re
 from typing import Any
 
 from .base import BaseTransform, TransformResult
+from .constant_folder import _fold_numeric
 
 # ---------------------------------------------------------------------------
 # Pattern: var _0xHEX = ["...", "...", ...];
@@ -21,7 +22,7 @@ from .base import BaseTransform, TransformResult
 
 # Array declaration with hex-style or short variable name
 _ARRAY_DECL = re.compile(
-    r"""(?:var|let|const)\s+"""
+    r"""(var|let|const)\s+"""
     r"""((?:_0x[0-9a-fA-F]+|_[a-zA-Z0-9]+|[a-zA-Z]\w{0,3}))\s*=\s*"""
     r"""\[\s*((?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"""
     r"""(?:\s*,\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))*)\s*\]\s*;""",
@@ -45,26 +46,48 @@ _ARRAY_ACCESS = re.compile(
 _ROTATION_FUNC = re.compile(
     r"""\(\s*function\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*\{"""
     r"""[^}]*?\.push\s*\(\s*\1\.shift\s*\(\s*\)\s*\)[^}]*"""
-    r"""\}\s*\)\s*\(\s*(\w+)\s*,\s*(0x[0-9a-fA-F]+|\d+)\s*\)\s*;?""",
+    r"""\}\s*\)\s*\(\s*(\w+)\s*,\s*([^)]+?)\s*\)\s*;?""",
+    re.DOTALL,
+)
+
+_RIGHT_ROTATION_FUNC = re.compile(
+    r"""\(\s*function\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*\{"""
+    r"""[^}]*?\.unshift\s*\(\s*\1\.pop\s*\(\s*\)\s*\)[^}]*"""
+    r"""\}\s*\)\s*\(\s*(\w+)\s*,\s*([^)]+?)\s*\)\s*;?""",
     re.DOTALL,
 )
 
 # ---------------------------------------------------------------------------
 # Pattern: wrapper function
 #   function _0xabcd(_0xParam) { return _0x1234[_0xParam]; }
-#   or with subtraction: return _0x1234[_0xParam - 0x1a3];
+#   var _0xabcd = function(_0xParam) { _0xParam -= 0x1a3; var x = _0x1234[_0xParam]; return x; };
 # ---------------------------------------------------------------------------
 
-_WRAPPER_FUNC = re.compile(
-    r"""function\s+(\w+)\s*\(\s*(\w+)\s*(?:,\s*\w+\s*)*\)\s*\{"""
-    r"""[^}]*?return\s+(\w+)\s*\[\s*\2\s*"""
-    r"""(?:\s*-\s*(0x[0-9a-fA-F]+|\d+))?\s*\]\s*;?\s*\}""",
+_WRAPPER_FUNC_DECL_START = re.compile(
+    r"""function\s+(\w+)\s*\(\s*(\w+)\s*(?:,\s*\w+\s*)*\)\s*\{""",
+    re.DOTALL,
+)
+_WRAPPER_FUNC_EXPR_START = re.compile(
+    r"""(?:var|let|const)\s+(\w+)\s*=\s*function\s*\(\s*(\w+)\s*(?:,\s*\w+\s*)*\)\s*\{""",
     re.DOTALL,
 )
 
-# Wrapper call: _0xabcd(0x1a3) or _0xabcd(42)
+_WRAPPER_DIRECT_RETURN = re.compile(
+    r"""return\s+(\w+)\s*\[\s*{param}\s*(?:-\s*(0x[0-9a-fA-F]+|\d+))?\s*\]\s*;?""",
+    re.DOTALL,
+)
+_WRAPPER_ALIAS_ASSIGN = re.compile(
+    r"""var\s+(\w+)\s*=\s*(\w+)\s*\[\s*{param}\s*(?:-\s*(0x[0-9a-fA-F]+|\d+))?\s*\]\s*;?""",
+    re.DOTALL,
+)
+_WRAPPER_PARAM_OFFSET = re.compile(
+    r"""\b{param}\s*=\s*{param}\s*-\s*(0x[0-9a-fA-F]+|\d+)\s*;?""",
+    re.DOTALL,
+)
+
+# Wrapper call: _0xabcd(0x1a3), _0xabcd(42), or _0xabcd("0x1a3")
 _WRAPPER_CALL = re.compile(
-    r"""\b(\w+)\s*\(\s*(0x[0-9a-fA-F]+|\d+)\s*\)"""
+    r"""\b(\w+)\s*\(\s*(?:(['"])(0x[0-9a-fA-F]+|\d+)\2|(0x[0-9a-fA-F]+|\d+))\s*\)"""
 )
 
 
@@ -89,6 +112,149 @@ def _rotate_array(arr: list[str], count: int) -> list[str]:
     return arr[count:] + arr[:count]
 
 
+def _apply_text_edits(code: str, edits: list[tuple[int, int, str]]) -> str:
+    output = code
+    cursor = len(output) + 1
+    for start, end, replacement in sorted(edits, key=lambda item: (item[0], item[1]), reverse=True):
+        if start < 0 or end < start or end > cursor:
+            continue
+        output = output[:start] + replacement + output[end:]
+        cursor = start
+    return output
+
+
+def _render_array_declaration(kind: str, name: str, values: list[str]) -> str:
+    quoted = ", ".join(f'"{value}"' for value in values)
+    return f"{kind} {name} = [{quoted}];"
+
+
+def _evaluate_rotation_count(expr: str) -> int | None:
+    candidate = expr.strip()
+    if not candidate:
+        return None
+    if re.fullmatch(r"0x[0-9a-fA-F]+|\d+", candidate):
+        return _parse_int(candidate)
+    folded = _fold_numeric(candidate)
+    return int(folded) if folded is not None else None
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    idx = open_idx
+
+    while idx < len(text):
+        char = text[idx]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            idx += 1
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return idx
+        idx += 1
+
+    return -1
+
+
+def _iter_wrapper_candidates(code: str):
+    for pattern in (_WRAPPER_FUNC_DECL_START, _WRAPPER_FUNC_EXPR_START):
+        for match in pattern.finditer(code):
+            open_brace = code.find("{", match.end() - 1)
+            if open_brace == -1:
+                continue
+            close_brace = _find_matching_brace(code, open_brace)
+            if close_brace == -1:
+                continue
+            end = close_brace + 1
+            while end < len(code) and code[end].isspace():
+                end += 1
+            if end < len(code) and code[end] == ";":
+                end += 1
+            yield (
+                match.group(1),
+                match.group(2),
+                code[open_brace + 1:close_brace],
+                code[match.start():end],
+            )
+
+
+def _extract_wrapper_definition(
+    func_name: str,
+    param_name: str,
+    body: str,
+    arrays: dict[str, list[str]],
+) -> tuple[str, int] | None:
+    """Resolve array-backed wrapper helpers, including self-redefining ones."""
+    param_pattern = re.escape(param_name)
+    offset = 0
+
+    offset_match = re.search(
+        _WRAPPER_PARAM_OFFSET.pattern.format(param=param_pattern),
+        body,
+        re.DOTALL,
+    )
+    if offset_match:
+        offset = _parse_int(offset_match.group(1))
+
+    direct_return = re.search(
+        _WRAPPER_DIRECT_RETURN.pattern.format(param=param_pattern),
+        body,
+        re.DOTALL,
+    )
+    if direct_return:
+        array_name = direct_return.group(1)
+        direct_offset = _parse_int(direct_return.group(2)) if direct_return.group(2) else 0
+        if array_name in arrays:
+            return array_name, offset + direct_offset
+
+    alias_assign = re.search(
+        _WRAPPER_ALIAS_ASSIGN.pattern.format(param=param_pattern),
+        body,
+        re.DOTALL,
+    )
+    if alias_assign:
+        alias_name = alias_assign.group(1)
+        array_name = alias_assign.group(2)
+        alias_offset = _parse_int(alias_assign.group(3)) if alias_assign.group(3) else 0
+        if (
+            array_name in arrays
+            and re.search(rf"""return\s+{re.escape(alias_name)}\s*;?""", body)
+        ):
+            return array_name, offset + alias_offset
+
+    if (
+        func_name in body
+        and re.search(rf"""{re.escape(func_name)}\s*\[\s*['"]initialized['"]\s*\]""", body)
+    ):
+        nested_candidates = [
+            match
+            for match in re.finditer(
+                rf"""(\w+)\s*=\s*(\w+)\s*\[\s*{param_pattern}\s*\]\s*;""",
+                body,
+            )
+        ]
+        for candidate in nested_candidates:
+            array_name = candidate.group(2)
+            alias_name = candidate.group(1)
+            if array_name in arrays and re.search(rf"""return\s+{re.escape(alias_name)}\s*;?""", body):
+                return array_name, offset
+
+    return None
+
+
 class JavaScriptArrayResolver(BaseTransform):
     name = "js_array_resolver"
     description = (
@@ -104,12 +270,15 @@ class JavaScriptArrayResolver(BaseTransform):
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
         output = code
         replacements: list[dict[str, Any]] = []
+        static_rewrites: list[dict[str, Any]] = []
 
         # 1. Find all array declarations — filter to obfuscation-like arrays only
         arrays: dict[str, list[str]] = {}
+        array_declarations: dict[str, dict[str, Any]] = {}
         for m in _ARRAY_DECL.finditer(code):
-            var_name = m.group(1)
-            strings = _extract_strings(m.group(2))
+            decl_kind = m.group(1)
+            var_name = m.group(2)
+            strings = _extract_strings(m.group(3))
 
             # Only target arrays that look like obfuscation tables:
             # - Variable name matches obfuscated pattern (_0x..., _a, short etc.)
@@ -131,6 +300,11 @@ class JavaScriptArrayResolver(BaseTransform):
 
             if is_obfuscated_name or is_large_table or has_rotation_ref or has_wrapper_ref:
                 arrays[var_name] = strings
+                array_declarations[var_name] = {
+                    "kind": decl_kind,
+                    "match": m,
+                    "original": strings[:],
+                }
 
         if not arrays:
             return TransformResult(
@@ -141,27 +315,78 @@ class JavaScriptArrayResolver(BaseTransform):
             )
 
         # 2. Check for rotation functions (handle chained/multiple rotations)
-        rotation_applied: dict[str, int] = {}  # track total rotation per array
-        for m in _ROTATION_FUNC.finditer(code):
-            target_arr = m.group(3)
-            rotation_count = _parse_int(m.group(4))
-            if target_arr in arrays:
-                total = rotation_applied.get(target_arr, 0) + rotation_count
+        rotation_applied: dict[str, int] = {}  # track signed rotation per array
+        rotation_matches: list[dict[str, Any]] = []
+        for pattern, direction in ((_ROTATION_FUNC, "left"), (_RIGHT_ROTATION_FUNC, "right")):
+            for m in pattern.finditer(code):
+                target_arr = m.group(3)
+                rotation_count = _evaluate_rotation_count(m.group(4))
+                if target_arr not in arrays or rotation_count is None:
+                    continue
+                signed = rotation_count if direction == "left" else -rotation_count
+                total = rotation_applied.get(target_arr, 0) + signed
                 rotation_applied[target_arr] = total
+                rotation_matches.append(
+                    {
+                        "start": m.start(),
+                        "end": m.end(),
+                        "array": target_arr,
+                        "count": rotation_count,
+                        "direction": direction,
+                    }
+                )
 
         # Apply cumulative rotations
         for arr_name, total_rotation in rotation_applied.items():
             if arr_name in arrays:
                 arrays[arr_name] = _rotate_array(arrays[arr_name], total_rotation)
 
+        rewrite_edits: list[tuple[int, int, str]] = []
+        for arr_name, meta in array_declarations.items():
+            rotated = arrays.get(arr_name, [])
+            if rotated != meta["original"]:
+                match = meta["match"]
+                rewrite_edits.append(
+                    (
+                        match.start(),
+                        match.end(),
+                        _render_array_declaration(meta["kind"], arr_name, rotated),
+                    )
+                )
+                static_rewrites.append(
+                    {
+                        "type": "array_rotation_fold",
+                        "array": arr_name,
+                        "rotation": rotation_applied.get(arr_name, 0),
+                    }
+                )
+        for rotation in rotation_matches:
+            rewrite_edits.append((rotation["start"], rotation["end"], ""))
+            static_rewrites.append(
+                {
+                    "type": "rotation_runtime_removed",
+                    "array": rotation["array"],
+                    "direction": rotation["direction"],
+                    "count": rotation["count"],
+                }
+            )
+
+        if rewrite_edits:
+            output = _apply_text_edits(output, rewrite_edits)
+
         # 3. Find wrapper functions
         wrappers: dict[str, tuple[str, int]] = {}  # func_name -> (array_name, offset)
-        for m in _WRAPPER_FUNC.finditer(code):
-            func_name = m.group(1)
-            array_name = m.group(3)
-            offset = _parse_int(m.group(4)) if m.group(4) else 0
-            if array_name in arrays:
-                wrappers[func_name] = (array_name, offset)
+        wrapper_sources: dict[str, str] = {}
+        for func_name, param_name, body, source_text in _iter_wrapper_candidates(output):
+            if not func_name:
+                continue
+            wrapper_def = _extract_wrapper_definition(func_name, param_name, body, arrays)
+            if wrapper_def is None:
+                continue
+            wrappers[func_name] = wrapper_def
+            wrapper_sources[func_name] = source_text
+
+        wrapper_replacement_counts: dict[str, int] = {name: 0 for name in wrappers}
 
         # 4. Replace wrapper function calls: _0xabcd(0x1a3) -> "resolved"
         def _replace_wrapper(m: re.Match) -> str:
@@ -171,10 +396,14 @@ class JavaScriptArrayResolver(BaseTransform):
             arr_name, offset = wrappers[func_name]
             if arr_name not in arrays:
                 return m.group(0)
-            idx = _parse_int(m.group(2)) - offset
+            arg_text = m.group(3) or m.group(4)
+            if arg_text is None:
+                return m.group(0)
+            idx = _parse_int(arg_text) - offset
             arr = arrays[arr_name]
             if 0 <= idx < len(arr):
                 resolved = arr[idx]
+                wrapper_replacement_counts[func_name] += 1
                 replacements.append({
                     "type": "wrapper_call",
                     "original": m.group(0),
@@ -187,6 +416,19 @@ class JavaScriptArrayResolver(BaseTransform):
 
         if wrappers:
             output = _WRAPPER_CALL.sub(_replace_wrapper, output)
+
+        for func_name, source_text in wrapper_sources.items():
+            if wrapper_replacement_counts.get(func_name, 0) <= 0:
+                continue
+            if re.search(rf"""\b{re.escape(func_name)}\s*\(""", output):
+                continue
+            output = output.replace(source_text, "", 1)
+            static_rewrites.append(
+                {
+                    "type": "wrapper_runtime_removed",
+                    "function": func_name,
+                }
+            )
 
         # 5. Replace direct array accesses: _0x1234[0] -> "resolved"
         def _replace_access(m: re.Match) -> str:
@@ -209,11 +451,11 @@ class JavaScriptArrayResolver(BaseTransform):
 
         output = _ARRAY_ACCESS.sub(_replace_access, output)
 
-        if not replacements:
+        if not replacements and not static_rewrites:
             return TransformResult(
-                success=True,
+                success=False,
                 output=code,
-                confidence=0.3,
+                confidence=0.2,
                 description=(
                     f"Found {len(arrays)} obfuscation array(s) but no "
                     f"resolvable lookups."
@@ -223,20 +465,30 @@ class JavaScriptArrayResolver(BaseTransform):
 
         state.setdefault("js_resolved", []).extend(replacements)
 
-        confidence = min(0.95, 0.75 + 0.02 * len(replacements))
+        techniques = ["array_lookup_resolution"]
+        if rotation_matches:
+            techniques.append("deterministic_array_rotation_fold")
+
+        confidence = min(
+            0.97,
+            0.72 + 0.02 * len(replacements) + 0.03 * len(static_rewrites),
+        )
         return TransformResult(
             success=True,
             output=output,
             confidence=confidence,
             description=(
-                f"Resolved {len(replacements)} array lookup(s) across "
-                f"{len(arrays)} obfuscation array(s)."
+                f"Resolved {len(replacements)} array lookup(s), folded "
+                f"{len(rotation_matches)} deterministic rotation(s), and "
+                f"rewrote {len(static_rewrites)} array helper segment(s)."
             ),
             details={
                 "arrays_found": len(arrays),
-                "rotation_applied": bool(_ROTATION_FUNC.search(code)),
+                "rotation_applied": bool(rotation_matches),
                 "wrappers_found": len(wrappers),
                 "replacement_count": len(replacements),
                 "replacements": replacements,
+                "static_rewrites": static_rewrites,
+                "detected_techniques": techniques,
             },
         )

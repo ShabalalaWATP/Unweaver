@@ -12,7 +12,9 @@ techniques:
 from __future__ import annotations
 
 import base64
+import gzip
 import re
+import zlib
 from typing import Any
 
 from .base import BaseTransform, TransformResult
@@ -26,23 +28,227 @@ _ENCODED_CMD = re.compile(
     re.IGNORECASE,
 )
 
+_GETSTRING_FROM_B64 = re.compile(
+    r"\[System\.Text\.Encoding\]::(Unicode|UTF8)\.GetString\(\s*"
+    r"(?:\[System\.Convert\]::|\[Convert\]::|Convert\.)FromBase64String\(\s*['\"]([A-Za-z0-9+/=\s]+)['\"]\s*\)\s*\)",
+    re.IGNORECASE,
+)
+_GETSTRING_START = re.compile(
+    r"\[System\.Text\.Encoding\]::(Unicode|UTF8)\.GetString\s*\(",
+    re.IGNORECASE,
+)
+_FROM_B64 = re.compile(
+    r"(?:\[System\.Convert\]::|\[Convert\]::|Convert\.)FromBase64String\(\s*['\"]([A-Za-z0-9+/=\s]+)['\"]\s*\)",
+    re.IGNORECASE,
+)
+_FROM_B64_EXPR = re.compile(
+    r"(?:\[System\.Convert\]::|\[Convert\]::|Convert\.)FromBase64String\(\s*(.+?)\s*\)$",
+    re.IGNORECASE,
+)
+_PS_STRING_ASSIGN = re.compile(
+    r"""^\s*(\$\w+)\s*=\s*(?:"((?:[^"\\`]|`.|"")*)"|'((?:[^']|'')*)')\s*$""",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PS_FROM_B64_ASSIGN = re.compile(
+    r"""^\s*(\$\w+)\s*=\s*((?:\[System\.Convert\]::|\[Convert\]::|Convert\.)FromBase64String\(\s*.+?\s*\))\s*$""",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PS_GETSTRING_ASSIGN = re.compile(
+    r"""^\s*(\$\w+)\s*=\s*\[System\.Text\.Encoding\]::(Unicode|UTF8)\.GetString\(\s*(.+?)\s*\)\s*$""",
+    re.IGNORECASE | re.MULTILINE,
+)
+_IEX_VAR = re.compile(r"""(?im)\b(?:Invoke-Expression|IEX)\s+(\$\w+)\b""")
+
 
 def _decode_encoded_command(blob: str) -> str | None:
     """Decode a PowerShell -EncodedCommand payload (UTF-16LE base64)."""
-    cleaned = blob.replace(" ", "").replace("\n", "").replace("\r", "")
-    # Add padding if needed
+    raw = _decode_base64_bytes(blob)
+    if raw is None:
+        return None
+    try:
+        return raw.decode("utf-16-le")
+    except Exception:
+        try:
+            return raw.decode("utf-8")
+        except Exception:
+            return None
+
+
+def _clean_base64(blob: str) -> str:
+    return blob.replace(" ", "").replace("\n", "").replace("\r", "")
+
+
+def _decode_base64_bytes(blob: str) -> bytes | None:
+    cleaned = _clean_base64(blob)
     missing = len(cleaned) % 4
     if missing:
         cleaned += "=" * (4 - missing)
     try:
-        raw = base64.b64decode(cleaned, validate=True)
-        return raw.decode("utf-16-le")
+        return base64.b64decode(cleaned, validate=True)
     except Exception:
         try:
-            raw = base64.b64decode(cleaned)
-            return raw.decode("utf-8")
+            return base64.b64decode(cleaned)
         except Exception:
             return None
+
+
+def _decode_text_bytes(raw: bytes, encoding_name: str | None = None) -> str | None:
+    candidates: list[str] = []
+    if encoding_name:
+        enc = "utf-16-le" if encoding_name.lower() == "unicode" else "utf-8"
+        candidates.append(enc)
+    candidates.extend(["utf-8", "utf-16-le", "latin-1"])
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            text = raw.decode(candidate)
+        except Exception:
+            continue
+        printable = sum(1 for char in text if char.isprintable() or char in "\r\n\t ")
+        if printable / max(len(text), 1) >= 0.65:
+            return text
+    return None
+
+
+def _decode_getstring_wrapper(encoding_name: str, blob: str) -> str | None:
+    raw = _decode_base64_bytes(blob)
+    if raw is None:
+        return None
+    return _decode_text_bytes(raw, encoding_name)
+
+
+def _ps_string_literal(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _parse_ps_string_literal(expr: str) -> str | None:
+    value = expr.strip()
+    if len(value) < 2 or value[0] != value[-1] or value[0] not in {"'", '"'}:
+        return None
+    inner = value[1:-1]
+    if value[0] == "'":
+        return inner.replace("''", "'")
+    return inner.replace('""', '"').replace("`\"", '"')
+
+
+def _resolve_ps_string_expr(expr: str, string_bindings: dict[str, str]) -> str | None:
+    literal = _parse_ps_string_literal(expr)
+    if literal is not None:
+        return literal
+    return string_bindings.get(expr.strip())
+
+
+def _resolve_ps_bytes_expr(
+    expr: str,
+    string_bindings: dict[str, str],
+    byte_bindings: dict[str, bytes],
+) -> bytes | None:
+    value = expr.strip()
+    if value in byte_bindings:
+        return byte_bindings[value]
+
+    from_b64 = _FROM_B64_EXPR.match(value)
+    if from_b64 is None:
+        return None
+
+    blob = _resolve_ps_string_expr(from_b64.group(1), string_bindings)
+    if blob is None:
+        return None
+    return _decode_base64_bytes(blob)
+
+
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    depth = 0
+    in_single = False
+    in_double = False
+    i = open_idx
+    while i < len(text):
+        char = text[i]
+        if in_single:
+            if char == "'" and text[i + 1:i + 2] == "'":
+                i += 2
+                continue
+            if char == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if char == "`" and i + 1 < len(text):
+                i += 2
+                continue
+            if char == '"' and text[i + 1:i + 2] == '"':
+                i += 2
+                continue
+            if char == '"':
+                in_double = False
+            i += 1
+            continue
+        if char == "'":
+            in_single = True
+        elif char == '"':
+            in_double = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _iter_getstring_calls(code: str):
+    for match in _GETSTRING_START.finditer(code):
+        open_idx = code.find("(", match.end() - 1)
+        if open_idx == -1:
+            continue
+        close_idx = _find_matching_paren(code, open_idx)
+        if close_idx == -1:
+            continue
+        yield match.group(1), code[match.start():close_idx + 1]
+
+
+def _decode_compressed_getstring_call(encoding_name: str, call_text: str) -> tuple[str, str] | None:
+    if "frombase64string" not in call_text.lower():
+        return None
+    blob_match = _FROM_B64.search(call_text)
+    if blob_match is None:
+        return None
+    raw = _decode_base64_bytes(blob_match.group(1))
+    if raw is None:
+        return None
+
+    call_lower = call_text.lower()
+    candidates: list[bytes] = []
+    if "gzipstream" in call_lower:
+        for decoder in (
+            lambda b: gzip.decompress(b),
+            lambda b: zlib.decompress(b, zlib.MAX_WBITS | 16),
+        ):
+            try:
+                candidates.append(decoder(raw))
+            except Exception:
+                continue
+    elif "deflatestream" in call_lower:
+        for decoder in (
+            lambda b: zlib.decompress(b),
+            lambda b: zlib.decompress(b, -zlib.MAX_WBITS),
+        ):
+            try:
+                candidates.append(decoder(raw))
+            except Exception:
+                continue
+    else:
+        return None
+
+    for candidate in candidates:
+        decoded = _decode_text_bytes(candidate, encoding_name)
+        if decoded:
+            return blob_match.group(1), decoded
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +371,10 @@ _CHAR_INT_CONCAT = re.compile(
     r"(?:\[char\]\s*(0x[0-9a-fA-F]+|\d+)\s*\+?\s*){2,}",
     re.IGNORECASE,
 )
+_CHAR_ARRAY_JOIN = re.compile(
+    r"\(\s*\[char\[\]\]\s*\(\s*([^)]+?)\s*\)\s*\)\s*-join\s*(['\"])(.*?)\2",
+    re.IGNORECASE,
+)
 
 
 def _fold_char_ints(m: re.Match) -> str | None:
@@ -179,11 +389,27 @@ def _fold_char_ints(m: re.Match) -> str | None:
         return None
 
 
+def _fold_char_array_join(m: re.Match) -> str | None:
+    raw_values = [token.strip() for token in m.group(1).split(",") if token.strip()]
+    if len(raw_values) < 2:
+        return None
+
+    chars: list[str] = []
+    try:
+        for token in raw_values:
+            value = int(token, 16) if token.lower().startswith("0x") else int(token)
+            chars.append(chr(value))
+    except Exception:
+        return None
+
+    return m.group(3).join(chars)
+
+
 class PowerShellDecoder(BaseTransform):
     name = "powershell_decoder"
     description = (
         "Decode PowerShell obfuscation: EncodedCommand, format strings, "
-        "replacement chains, backticks"
+        "replacement chains, compressed wrappers, and backticks"
     )
 
     def can_apply(self, code: str, language: str, state: dict) -> bool:
@@ -195,9 +421,12 @@ class PowerShellDecoder(BaseTransform):
             r"-(?:EncodedCommand|enc)\b",
             r"\bInvoke-Expression\b",
             r"\biex\b",
-            r"\[System\.Convert\]",
+            r"\[(?:System\.)?Convert\]",
+            r"(?:GzipStream|DeflateStream)",
             r"\[ScriptBlock\]",
+            r"\[char\[\]\]",
             r"-(?:replace|creplace)\s",
+            r"-join\s*['\"]",
             r"`[a-zA-Z]",  # backtick obfuscation
             r"\"\s*-f\s",  # format string
         ]
@@ -206,6 +435,7 @@ class PowerShellDecoder(BaseTransform):
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
         output = code
         changes: list[dict[str, Any]] = []
+        decoded_payloads: list[str] = []
 
         # --- Backtick removal ---
         cleaned, backtick_count = _remove_backticks(output)
@@ -225,6 +455,38 @@ class PowerShellDecoder(BaseTransform):
                 "count": caret_count,
             })
 
+        # --- [System.Text.Encoding]::*.GetString(New-Object ...GzipStream/DeflateStream...) ---
+        for encoding_name, call_text in list(_iter_getstring_calls(output)):
+            decoded_compressed = _decode_compressed_getstring_call(encoding_name, call_text)
+            if decoded_compressed is None:
+                continue
+            encoded_blob, decoded = decoded_compressed
+            changes.append({
+                "type": "compressed_getstring",
+                "encoding": encoding_name,
+                "encoded": encoded_blob[:80],
+                "decoded": decoded,
+            })
+            decoded_payloads.append(decoded)
+            output = output.replace(call_text, _ps_string_literal(decoded), 1)
+
+        # --- [System.Text.Encoding]::*.GetString([System.Convert]::FromBase64String(...)) ---
+        for m in _GETSTRING_FROM_B64.finditer(output):
+            decoded = _decode_getstring_wrapper(m.group(1), m.group(2))
+            if decoded:
+                changes.append({
+                    "type": "encoding_getstring",
+                    "encoding": m.group(1),
+                    "encoded": m.group(2)[:80],
+                    "decoded": decoded,
+                })
+                decoded_payloads.append(decoded)
+                output = output.replace(
+                    m.group(0),
+                    _ps_string_literal(decoded),
+                    1,
+                )
+
         # --- Encoded command ---
         for m in _ENCODED_CMD.finditer(output):
             decoded = _decode_encoded_command(m.group(1))
@@ -234,6 +496,7 @@ class PowerShellDecoder(BaseTransform):
                     "encoded": m.group(1)[:80],
                     "decoded": decoded,
                 })
+                decoded_payloads.append(decoded)
                 output = output.replace(
                     m.group(0),
                     f"# DECODED EncodedCommand:\n{decoded}",
@@ -282,6 +545,21 @@ class PowerShellDecoder(BaseTransform):
 
         output = _PS_CONCAT.sub(_replace_concat, output)
 
+        # --- ([char[]](73,69,88)) -join '' ---
+        def _replace_char_array_join(m: re.Match) -> str:
+            folded = _fold_char_array_join(m)
+            if folded is not None:
+                changes.append({
+                    "type": "char_array_join",
+                    "original": m.group(0)[:120],
+                    "folded": folded,
+                    "decoded": folded,
+                })
+                return f'"{folded}"'
+            return m.group(0)
+
+        output = _CHAR_ARRAY_JOIN.sub(_replace_char_array_join, output)
+
         # --- [char] int concatenation ---
         def _replace_char_int(m: re.Match) -> str:
             folded = _fold_char_ints(m)
@@ -295,6 +573,73 @@ class PowerShellDecoder(BaseTransform):
             return m.group(0)
 
         output = _CHAR_INT_CONCAT.sub(_replace_char_int, output)
+        output = re.sub(r"""(['"])\s*(\$\w+\s*=)""", r"\1\n\2", output)
+
+        string_bindings: dict[str, str] = {}
+        byte_bindings: dict[str, bytes] = {}
+        for _ in range(3):
+            bindings_changed = False
+
+            for m in _PS_STRING_ASSIGN.finditer(output):
+                var_name = m.group(1)
+                literal = m.group(2) if m.group(2) is not None else m.group(3)
+                value = (literal or "").replace("''", "'").replace('""', '"')
+                if string_bindings.get(var_name) != value:
+                    string_bindings[var_name] = value
+                    bindings_changed = True
+
+            for m in _PS_FROM_B64_ASSIGN.finditer(output):
+                resolved = _resolve_ps_bytes_expr(m.group(2), string_bindings, byte_bindings)
+                if resolved is not None and byte_bindings.get(m.group(1)) != resolved:
+                    byte_bindings[m.group(1)] = resolved
+                    bindings_changed = True
+
+            for m in _PS_GETSTRING_ASSIGN.finditer(output):
+                var_name = m.group(1)
+                resolved_bytes = _resolve_ps_bytes_expr(m.group(3), string_bindings, byte_bindings)
+                if resolved_bytes is None:
+                    continue
+                resolved = _decode_text_bytes(resolved_bytes, m.group(2))
+                if resolved and string_bindings.get(var_name) != resolved:
+                    string_bindings[var_name] = resolved
+                    bindings_changed = True
+
+            if not bindings_changed:
+                break
+
+        for m in list(_PS_GETSTRING_ASSIGN.finditer(output)):
+            var_name = m.group(1)
+            resolved = string_bindings.get(var_name)
+            if not resolved:
+                continue
+            changes.append({
+                "type": "binding_getstring",
+                "variable": var_name,
+                "decoded": resolved,
+            })
+            decoded_payloads.append(resolved)
+            output = output.replace(
+                m.group(0),
+                f"{var_name} = {_ps_string_literal(resolved)}",
+                1,
+            )
+
+        for m in list(_IEX_VAR.finditer(output)):
+            variable = m.group(1)
+            resolved = string_bindings.get(variable)
+            if not resolved:
+                continue
+            changes.append({
+                "type": "iex_inline",
+                "variable": variable,
+                "decoded": resolved,
+            })
+            decoded_payloads.append(resolved)
+            output = output.replace(
+                m.group(0),
+                f"# DECODED (IEX):\n{resolved}",
+                1,
+            )
 
         if not changes:
             return TransformResult(
@@ -323,5 +668,14 @@ class PowerShellDecoder(BaseTransform):
                 "change_count": len(changes),
                 "type_counts": type_counts,
                 "changes": changes,
+                "decoded_payloads": decoded_payloads,
+                "decoded_strings": [
+                    {
+                        "encoded": change.get("encoded", change.get("type", "powershell_payload")),
+                        "decoded": change.get("decoded", ""),
+                    }
+                    for change in changes
+                    if change.get("decoded")
+                ],
             },
         )

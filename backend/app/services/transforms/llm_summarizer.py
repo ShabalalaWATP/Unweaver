@@ -60,29 +60,8 @@ class LLMSummarizer(LLMTransform):
     ) -> List[Dict[str, str]]:
         truncated = self.truncate_code(code, max_chars=self._max_code_chars())
         lang = language or state.get("language", "unknown")
-
-        # Provide prior context to the LLM for richer analysis.
-        context_parts: List[str] = [f"Language: {lang}"]
-        techniques = state.get("detected_techniques", [])
-        if techniques:
-            context_parts.append(
-                f"Previously detected techniques: {', '.join(techniques[:15])}"
-            )
-        apis = state.get("suspicious_apis", [])
-        if apis:
-            context_parts.append(
-                f"Suspicious APIs: {', '.join(apis[:10])}"
-            )
-        strings = state.get("strings", [])
-        if strings:
-            sample_strings = [
-                (s.get("value") if isinstance(s, dict) else str(s))[:60]
-                for s in strings[:10]
-            ]
-            context_parts.append(
-                f"Extracted strings (sample): {sample_strings}"
-            )
-        context = "\n".join(context_parts)
+        context = self.build_state_context(state, code=code)
+        workspace = self.build_workspace_context(code)
 
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -91,6 +70,8 @@ class LLMSummarizer(LLMTransform):
                 "content": (
                     f"Analyse this code sample.\n\n"
                     f"Context:\n{context}\n\n"
+                    + (f"Workspace context:\n{workspace}\n\n" if workspace else "")
+                    +
                     f"```\n{truncated}\n```"
                 ),
             },

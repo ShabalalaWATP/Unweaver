@@ -66,6 +66,7 @@ class ActionQueue:
         "decode_base64",
         "decode_hex",
         "normalize_unicode",
+        "deobfuscate_js_bundle",
         "decrypt_strings",
         "constant_fold",
         "simplify_junk_code",

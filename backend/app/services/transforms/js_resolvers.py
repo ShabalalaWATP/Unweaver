@@ -15,6 +15,7 @@ from typing import Any
 
 from .base import BaseTransform, TransformResult
 from .constant_folder import _fold_numeric
+from .js_tooling import resolve_javascript_arrays_ast
 
 # ---------------------------------------------------------------------------
 # Pattern: var _0xHEX = ["...", "...", ...];
@@ -415,6 +416,48 @@ def _extract_wrapper_definition(
     return None
 
 
+def _build_ast_transform_result(
+    worker: dict[str, Any],
+    state: dict,
+) -> TransformResult | None:
+    if not worker.get("ok") or not worker.get("changed"):
+        return None
+
+    replacements = list(worker.get("replacements", []))
+    static_rewrites = list(worker.get("staticRewrites", []))
+    arrays_found = int(worker.get("arraysFound", 0) or 0)
+    wrappers_found = int(worker.get("wrappersFound", 0) or 0)
+    rotation_applied = bool(worker.get("rotationApplied"))
+    detected_techniques = list(worker.get("detectedTechniques", []))
+
+    state.setdefault("js_resolved", []).extend(replacements)
+
+    confidence = min(
+        0.97,
+        0.74 + 0.02 * len(replacements) + 0.03 * len(static_rewrites),
+    )
+    return TransformResult(
+        success=True,
+        output=str(worker.get("output") or ""),
+        confidence=confidence,
+        description=(
+            f"Resolved {len(replacements)} array lookup(s), folded "
+            f"{1 if rotation_applied else 0} deterministic rotation group(s), and "
+            f"rewrote {len(static_rewrites)} array helper segment(s) via AST analysis."
+        ),
+        details={
+            "arrays_found": arrays_found,
+            "rotation_applied": rotation_applied,
+            "wrappers_found": wrappers_found,
+            "replacement_count": len(replacements),
+            "replacements": replacements,
+            "static_rewrites": static_rewrites,
+            "detected_techniques": detected_techniques,
+            "parser_engine": worker.get("parser", "unknown"),
+        },
+    )
+
+
 class JavaScriptArrayResolver(BaseTransform):
     name = "js_array_resolver"
     description = (
@@ -423,11 +466,16 @@ class JavaScriptArrayResolver(BaseTransform):
 
     def can_apply(self, code: str, language: str, state: dict) -> bool:
         lang = (language or "").lower().strip()
-        if lang and lang not in ("javascript", "js", "typescript", "ts", ""):
+        if lang and lang not in ("javascript", "js", "jsx", "typescript", "ts", "tsx", ""):
             return False
         return bool(_ARRAY_DECL.search(code))
 
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
+        ast_worker = resolve_javascript_arrays_ast(code, language or "javascript")
+        ast_result = _build_ast_transform_result(ast_worker, state)
+        if ast_result is not None:
+            return ast_result
+
         output = code
         replacements: list[dict[str, Any]] = []
         static_rewrites: list[dict[str, Any]] = []
@@ -635,7 +683,10 @@ class JavaScriptArrayResolver(BaseTransform):
                     f"Found {len(arrays)} obfuscation array(s) but no "
                     f"resolvable lookups."
                 ),
-                details={"arrays_found": len(arrays)},
+                details={
+                    "arrays_found": len(arrays),
+                    "ast_worker_error": ast_worker.get("error", ""),
+                },
             )
 
         state.setdefault("js_resolved", []).extend(replacements)
@@ -665,5 +716,6 @@ class JavaScriptArrayResolver(BaseTransform):
                 "replacements": replacements,
                 "static_rewrites": static_rewrites,
                 "detected_techniques": techniques,
+                "ast_worker_error": ast_worker.get("error", ""),
             },
         )

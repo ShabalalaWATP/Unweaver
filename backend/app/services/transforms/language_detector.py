@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .base import BaseTransform, TransformResult
+from .binary_analysis import binary_text_to_bytes, looks_like_dotnet_assembly_bytes
 
 # ---------------------------------------------------------------------------
 # Heuristic definitions per language
@@ -155,6 +156,8 @@ _EXTENSION_MAP: dict[str, str] = {
     ".psd1": "powershell",
     ".cs": "csharp",
     ".csx": "csharp",
+    ".dll": "dotnet",
+    ".exe": "dotnet",
 }
 
 
@@ -167,6 +170,25 @@ class LanguageDetector(BaseTransform):
         return bool(code and code.strip())
 
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
+        if looks_like_dotnet_assembly_bytes(binary_text_to_bytes(code)):
+            state["detected_language"] = "dotnet"
+            state["language_confidence"] = 0.99
+            state["language_scores"] = {"dotnet": 20.0}
+            return TransformResult(
+                success=True,
+                output=code,
+                confidence=0.99,
+                description="Detected language: dotnet (confidence 99%).",
+                details={
+                    "detected_language": "dotnet",
+                    "detected": "dotnet",
+                    "confidence": 0.99,
+                    "scores": {"dotnet": 20.0},
+                    "raw_scores": {"dotnet": 20.0},
+                    "match_details": {"dotnet": ["PE/CLR metadata signature"]},
+                },
+            )
+
         scores: dict[str, float] = {}
         match_details: dict[str, list[str]] = {}
 
@@ -226,6 +248,7 @@ class LanguageDetector(BaseTransform):
                 f"(confidence {confidence:.0%})."
             ),
             details={
+                "detected_language": best_lang,
                 "detected": best_lang,
                 "confidence": confidence,
                 "scores": dict(ranked),

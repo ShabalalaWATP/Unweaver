@@ -99,6 +99,35 @@ class TestLiteralPropagator:
         assert result.output == code
         assert result.success is False
 
+    def test_javascript_ast_tolerates_whitespace_anomalies(self):
+        code = (
+            "const\u200b enabled\u00a0=\u00a0false;\n"
+            "if\u00a0(enabled) {\n"
+            '  console.log("dead");\n'
+            "} else {\n"
+            '  console.log("decoded");\n'
+            "}\n"
+        )
+
+        result = LiteralPropagator().apply(code, "javascript", {})
+
+        assert result.success is True
+        assert "if" not in result.output
+        assert 'console.log("decoded");' in result.output
+
+    def test_tsx_uses_modern_parser_for_literal_normalization(self):
+        code = (
+            "const label = 'decoded';\n"
+            "export const View = (value: string): JSX.Element => <div>{label}</div>;\n"
+        )
+
+        result = LiteralPropagator().apply(code, "tsx", {})
+
+        assert result.success is True
+        assert 'const label = "decoded";' not in result.output
+        assert '<div>{"decoded"}</div>' in result.output
+        assert "javascript_ast_literal_propagation" in result.details["detected_techniques"]
+
 
 class TestWorkspaceLiteralPropagation:
     def test_workspace_pipeline_applies_literal_propagation_to_hotspot_files(self):

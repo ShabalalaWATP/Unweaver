@@ -12,6 +12,7 @@ Supported formats:
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -114,6 +115,37 @@ def _try_text(raw: bytes) -> str | None:
     return None
 
 
+def _escape_for_quote(text: str, quote: str) -> str:
+    escaped = text.replace("\\", "\\\\")
+    escaped = escaped.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    if quote == '"':
+        return escaped.replace('"', '\\"')
+    return escaped.replace("'", "\\'")
+
+
+def _literal_for_language(text: str, language: str) -> str:
+    lang = (language or "").lower().strip()
+    if lang in ("python", "py"):
+        return repr(text)
+    if lang in ("powershell", "ps1", "ps"):
+        return "'" + text.replace("'", "''") + "'"
+    return json.dumps(text)
+
+
+def _render_decoded_literal(
+    text: str,
+    code: str,
+    start: int,
+    end: int,
+    language: str,
+) -> str:
+    if start > 0 and end < len(code):
+        quote = code[start - 1]
+        if quote in {'"', "'"} and code[end] == quote:
+            return _escape_for_quote(text, quote)
+    return _literal_for_language(text, language)
+
+
 class HexDecoder(BaseTransform):
     name = "hex_decoder"
     description = "Detect and decode hex-encoded strings in various formats"
@@ -156,8 +188,13 @@ class HexDecoder(BaseTransform):
                         "start": m.start(),
                         "end": m.end(),
                     })
-                    # Replace in output with decoded value as a comment
-                    replacement = f"/* HEX_DECODED[{label}]: {decoded!r} */"
+                    replacement = _render_decoded_literal(
+                        decoded,
+                        output,
+                        m.start(),
+                        m.end(),
+                        language,
+                    )
                     output = (
                         output[:m.start()]
                         + replacement
@@ -188,7 +225,13 @@ class HexDecoder(BaseTransform):
                     "start": m2.start(),
                     "end": m2.end(),
                 })
-                replacement = f"/* HEX_DECODED[{label}]: {decoded!r} */"
+                replacement = _render_decoded_literal(
+                    decoded,
+                    output,
+                    m2.start(),
+                    m2.end(),
+                    language,
+                )
                 output = (
                     output[:m2.start()]
                     + replacement
@@ -214,5 +257,12 @@ class HexDecoder(BaseTransform):
             details={
                 "decoded_count": len(decoded_items),
                 "items": decoded_items,
+                "decoded_strings": [
+                    {
+                        "encoded": item["encoded"],
+                        "decoded": item["decoded"],
+                    }
+                    for item in decoded_items
+                ],
             },
         )

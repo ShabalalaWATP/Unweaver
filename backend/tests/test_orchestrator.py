@@ -472,6 +472,56 @@ class TestPlannerWorkspaceBundles:
 
         assert "deobfuscate_workspace_files" in names
 
+    def test_schedules_follow_up_workspace_wave_when_frontier_remains(self):
+        code = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 2\n"
+            "omitted_files: 3\n"
+            "languages: javascript=2\n"
+            "entry_points: src/main.js\n"
+            "suspicious_files: src/decode.js\n"
+            "manifest_files: package.json\n"
+            "root_dirs: src\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="src/main.js" language="javascript" priority="entrypoint" size=42>>>\n'
+            "const payload = atob('aGVsbG8=');\n"
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="src/decode.js" language="javascript" priority="suspicious" size=60>>>\n'
+            "const msg = String.fromCharCode(72, 105);\n"
+            "<<<END FILE>>>\n"
+        )
+        sm = StateManager("bundle-follow-up", code, language="workspace")
+        sm.advance_iteration()
+        sm.advance_iteration()
+        sm.merge_workspace_context(
+            {
+                "entry_points": ["src/main.js"],
+                "suspicious_files": ["src/decode.js"],
+                "prioritized_files": [
+                    {"path": "src/decode.js", "score": 9.5},
+                    {"path": "src/main.js", "score": 8.0},
+                ],
+                "remaining_frontier_paths": ["src/extra.js"],
+            }
+        )
+        q = ActionQueue()
+        q.enqueue("deobfuscate_workspace_files", confidence=0.8)
+        q.dequeue()
+        q.mark_succeeded("deobfuscate_workspace_files")
+        planner = Planner(
+            available_actions={
+                "profile_workspace",
+                "fingerprint_obfuscation",
+                "deobfuscate_workspace_files",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "deobfuscate_workspace_files" in names
+
 
 class TestPlannerPreprocessing:
     def test_schedules_preprocess_for_minified_code(self):
@@ -494,6 +544,28 @@ class TestPlannerPreprocessing:
         names = [item.action_name for item in actions]
 
         assert "preprocess_source" in names
+
+    def test_schedules_specialist_bundle_pass_for_bundle_runtime(self):
+        code = (
+            "(()=>{var __webpack_modules__={1:(module)=>{module.exports='ok'}};"
+            "function __webpack_require__(id){return __webpack_modules__[id];}"
+            "console.log(__webpack_require__(1));})();"
+        )
+        sm = StateManager("bundle-pass", code, language="javascript")
+        sm.advance_iteration()
+        sm.advance_iteration()
+        q = ActionQueue()
+        planner = Planner(
+            available_actions={
+                "deobfuscate_js_bundle",
+                "fingerprint_obfuscation",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "deobfuscate_js_bundle" in names
 
 
 class TestPlannerLLMGating:
@@ -518,6 +590,69 @@ class TestPlannerLLMGating:
 
         assert "decode_base64" in names
         assert "llm_deobfuscate" not in names
+
+    def test_schedules_early_llm_for_hard_javascript(self):
+        sm = StateManager(
+            "llm-gating-hard-js",
+            (
+                "var _0x1a2b=['YWxlcnQoMSk=','log'];"
+                "var _0x5c6d=function(_0x7f0a){return _0x1a2b[_0x7f0a];};"
+                "function _0x9e1b(){debugger;return _0x5c6d('0x0');}"
+                "while(!![]){switch(_0x5c6d('0x1')){case 'log':console[_0x5c6d('0x1')](_0x9e1b());break;}}"
+            ),
+            language="javascript",
+        )
+        sm.advance_iteration()
+        sm.advance_iteration()
+        q = ActionQueue()
+        q.enqueue("identify_string_resolver", confidence=0.9)
+        q.dequeue()
+        q.mark_succeeded("identify_string_resolver")
+        planner = Planner(
+            available_actions={
+                "identify_string_resolver",
+                "unflatten_control_flow",
+                "llm_deobfuscate",
+                "llm_multilayer_unwrap",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+        hard_mode = sm.state.iteration_state.get("js_hard_mode", {})
+
+        assert hard_mode.get("enabled") is True
+        assert "llm_deobfuscate" in names
+        assert "llm_multilayer_unwrap" in names
+        assert "string_array_wrappers" in hard_mode.get("signals", [])
+
+    def test_schedules_llm_after_minified_beautification_when_js_evidence_remains(self):
+        sm = StateManager(
+            "llm-gating-post-beautify",
+            "function run(){const payload='hello';return eval(payload);}",
+            language="javascript",
+        )
+        sm.advance_iteration()
+        sm.advance_iteration()
+        sm.state.detected_techniques.append("minified_code_beautification")
+        sm.add_suspicious_apis(["eval", "Function"])
+        sm.add_recovered_literals(["hello"])
+        sm.add_functions(["run"])
+        q = ActionQueue()
+        q.enqueue("preprocess_source", confidence=0.9)
+        q.dequeue()
+        q.mark_succeeded("preprocess_source")
+        planner = Planner(
+            available_actions={
+                "preprocess_source",
+                "llm_deobfuscate",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "llm_deobfuscate" in names
 
     def test_schedules_llm_deobfuscation_after_stall_with_evidence(self):
         sm = StateManager(
@@ -599,6 +734,38 @@ class TestPlannerLLMGating:
         names = [item.action_name for item in actions]
 
         assert "detect_eval_exec_reflection" in names
+
+    def test_schedules_llm_rename_earlier_for_hard_javascript(self):
+        sm = StateManager(
+            "llm-rename-hard-js",
+            (
+                "var _0x1a2b=['one','two'];"
+                "var _0x5c6d=function(_0x7f0a){return _0x1a2b[_0x7f0a];};"
+                "function _0x9e1b(){debugger;return _0x5c6d('0x0');}"
+                "eval(_0x9e1b());"
+            ),
+            language="javascript",
+        )
+        for _ in range(3):
+            sm.advance_iteration()
+        sm.add_suspicious_apis(["eval"])
+        sm.add_recovered_literals(["one"])
+        q = ActionQueue()
+        q.enqueue("identify_string_resolver", confidence=0.9)
+        q.dequeue()
+        q.mark_succeeded("identify_string_resolver")
+        planner = Planner(
+            available_actions={
+                "apply_renames",
+                "llm_rename",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "apply_renames" in names
+        assert "llm_rename" in names
 
 
 class TestStopDecisionResiduals:

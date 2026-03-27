@@ -8,6 +8,7 @@ such as ``[System.Convert]::FromBase64String``, ``atob()``, and
 from __future__ import annotations
 
 import base64
+import json
 import re
 from typing import Any
 
@@ -18,6 +19,25 @@ from .base import BaseTransform, TransformResult
 # ---------------------------------------------------------------------------
 
 _WRAPPER_PATTERNS: list[tuple[str, re.Pattern]] = [
+    # PowerShell: [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('...'))
+    (
+        "powershell_getstring",
+        re.compile(
+            r"\[System\.Text\.Encoding\]::(?:Unicode|UTF8)\.GetString\(\s*"
+            r"\[System\.Convert\]::FromBase64String\(\s*['\"]"
+            r"([A-Za-z0-9+/\s=]+)['\"]\s*\)\s*\)",
+            re.IGNORECASE,
+        ),
+    ),
+    # C#: Encoding.UTF8.GetString(Convert.FromBase64String("..."))
+    (
+        "csharp_getstring",
+        re.compile(
+            r"(?:System\.Text\.)?Encoding\.(?:Unicode|UTF8)\.GetString\(\s*"
+            r"Convert\.FromBase64String\(\s*['\"]([A-Za-z0-9+/\s=]+)['\"]\s*\)\s*\)",
+            re.IGNORECASE,
+        ),
+    ),
     # PowerShell: [System.Convert]::FromBase64String('...')
     (
         "powershell_convert",
@@ -85,6 +105,37 @@ _STANDALONE_B64 = re.compile(
 )
 
 MAX_NESTING = 8
+
+
+def _escape_for_quote(text: str, quote: str) -> str:
+    escaped = text.replace("\\", "\\\\")
+    escaped = escaped.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    if quote == '"':
+        return escaped.replace('"', '\\"')
+    return escaped.replace("'", "\\'")
+
+
+def _literal_for_language(text: str, language: str) -> str:
+    lang = (language or "").lower().strip()
+    if lang in ("python", "py"):
+        return repr(text)
+    if lang in ("powershell", "ps1", "ps"):
+        return "'" + text.replace("'", "''") + "'"
+    return json.dumps(text)
+
+
+def _render_decoded_literal(
+    text: str,
+    code: str,
+    start: int,
+    end: int,
+    language: str,
+) -> str:
+    if start > 0 and end < len(code):
+        quote = code[start - 1]
+        if quote in {'"', "'"} and code[end] == quote:
+            return _escape_for_quote(text, quote)
+    return _literal_for_language(text, language)
 
 
 def _is_plausible_b64(s: str) -> bool:
@@ -202,9 +253,14 @@ class Base64Decoder(BaseTransform):
                         layer["match_start"] = m.start()
                         layer["match_end"] = m.end()
                     decoded_items.extend(layers)
-                    # In the output, replace the call with a comment showing decoded
                     deepest = layers[-1]["decoded"]
-                    replacement = f"/* DECODED[{wrapper_name}]: {deepest!r} */"
+                    replacement = _render_decoded_literal(
+                        deepest,
+                        code,
+                        m.start(),
+                        m.end(),
+                        language,
+                    )
                     output = output.replace(m.group(0), replacement, 1)
 
         # --- standalone blobs ---
@@ -233,7 +289,13 @@ class Base64Decoder(BaseTransform):
                     layer["match_end"] = span[1]
                 decoded_items.extend(layers)
                 deepest = layers[-1]["decoded"]
-                replacement = f"/* DECODED: {deepest!r} */"
+                replacement = _render_decoded_literal(
+                    deepest,
+                    code,
+                    span[0],
+                    span[1],
+                    language,
+                )
                 output = output.replace(m.group(0), replacement, 1)
 
         if not decoded_items:
@@ -261,5 +323,12 @@ class Base64Decoder(BaseTransform):
                 "decoded_count": len(decoded_items),
                 "max_nesting": max_layer,
                 "items": decoded_items,
+                "decoded_strings": [
+                    {
+                        "encoded": item["encoded"],
+                        "decoded": item["decoded"],
+                    }
+                    for item in decoded_items
+                ],
             },
         )

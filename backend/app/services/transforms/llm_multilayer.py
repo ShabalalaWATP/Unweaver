@@ -27,6 +27,14 @@ Your task:
 3. Attempt to decode/unwrap as many layers as you can.
 4. If you find a payload hidden inside the layers, include it.
 
+For hard JavaScript samples, explicitly look for:
+- javascript-obfuscator style string tables and resolver helpers
+- constructor/eval chains (JSFuck/JJEncode/AAEncode-like runtime encoders)
+- RC4/CryptoJS/string decryptor helpers
+- switch-dispatch control-flow flattening
+- self-defending, debugger, or domain-lock wrappers that can be separated from
+  the payload without changing payload semantics
+
 Return your answer as JSON:
 
 ```json
@@ -66,7 +74,7 @@ class LLMMultiLayerUnwrapper(LLMTransform):
     ) -> List[Dict[str, str]]:
         truncated = self.truncate_code(code, max_chars=self._max_code_chars())
         lang = language or state.get("language", "unknown")
-        context = self.build_state_context(state)
+        context = self.build_state_context(state, code=code)
         workspace = self.build_workspace_context(code)
 
         return [
@@ -116,7 +124,16 @@ class LLMMultiLayerUnwrapper(LLMTransform):
         if unwrapped and len(unwrapped.strip()) >= 10:
             # Sanity check: unwrapped should be different from input.
             if unwrapped.strip() != code.strip():
-                validation = self.validate_candidate_code(code, unwrapped, language)
+                validation = self.assess_candidate_rewrite(
+                    code,
+                    unwrapped,
+                    language,
+                    state,
+                    artifacts=hidden_payloads,
+                    allow_noop=False,
+                    min_readability_delta=-8.0,
+                    require_evidence_retention=True,
+                )
                 use_unwrapped = validation["accepted"]
 
         # Extract techniques from layers for the state.

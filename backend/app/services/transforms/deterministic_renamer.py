@@ -1,9 +1,12 @@
 """
 DeterministicRenamer -- identifies obfuscated variable names using pattern
 analysis and usage-context heuristics, then *applies* the renames directly
-to the source code.  Unlike RenameSuggester (which only proposes names),
-this transform rewrites every matched identifier in-place and returns the
-modified source.
+to the source code.
+
+For JavaScript-like inputs the transform now aims for JSNice-style
+readability: idiomatic camelCase names, string-table/resolver recovery,
+boolean prefixes, plural collection names, and optional post-rename
+beautification when the source still looks compressed.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import re
 from typing import Any
 
 from .base import BaseTransform, TransformResult
+from .source_preprocessor import beautify_source, detect_minified_source
 
 # ---------------------------------------------------------------------------
 # Reserved words -- never rename these
@@ -61,7 +65,6 @@ _CONVENTIONAL_SHORT: frozenset[str] = frozenset({
 
 # ---------------------------------------------------------------------------
 # Common abbreviations that should NOT be renamed
-# These are legitimate short variable/function names used by real developers
 # ---------------------------------------------------------------------------
 
 _COMMON_ABBREVIATIONS: frozenset[str] = frozenset({
@@ -82,22 +85,19 @@ _COMMON_ABBREVIATIONS: frozenset[str] = frozenset({
     "wmi", "adsi", "cli",
 })
 
+_JS_LIKE_LANGUAGES = {"javascript", "js", "typescript", "ts"}
+_WORKSPACE_BUNDLE_HEADER = "UNWEAVER_WORKSPACE_BUNDLE v1"
+
 # ---------------------------------------------------------------------------
 # Obfuscation detection patterns
 # ---------------------------------------------------------------------------
 
 _OBFUSCATION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    # _0x-prefixed hex identifiers (e.g. _0x3a8f, _0x1eabc7d2)
     ("hex_prefix", re.compile(r"\b_0x[a-fA-F0-9]{4,8}\b")),
-    # Il1-confusion identifiers (mix of uppercase-I, lowercase-l, digit-1)
     ("il_confusion", re.compile(r"\b(?=[Il1]*[I])(?=[Il1]*[l1])[Il1]{4,}\b")),
-    # Random consonant soup (4+ consecutive consonants, no vowels)
     ("consonant_soup", re.compile(r"\b[bcdfghjkmnpqrstvwxzBCDFGHJKMNPQRSTVWXZ]{4,}\b")),
-    # Hash-style names: _<8+ hex chars>
     ("hash_name", re.compile(r"\b_[a-fA-F0-9]{8}\b")),
-    # Generic numbered variables: var1, var2, ...
     ("generic_numbered", re.compile(r"\bvar\d+\b")),
-    # Single-character variables (filtered later by frequency & convention)
     ("single_char", re.compile(r"\b([a-zA-Z])\b")),
 ]
 
@@ -106,59 +106,85 @@ _OBFUSCATION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # ---------------------------------------------------------------------------
 
 _CONTEXT_RULES: list[tuple[re.Pattern[str], str]] = [
-    # URL / endpoint
     (re.compile(r"""https?://|['"]https?:""", re.IGNORECASE), "url"),
-    # Fetch / XHR / request
     (re.compile(
-        r"XMLHttpRequest|fetch\s*\(|\.open\s*\(\s*['\"](?:GET|POST|PUT|DELETE)",
+        r"XMLHttpRequest|fetch\s*\(|\.open\s*\(\s*['\"](?:GET|POST|PUT|DELETE)|axios\.",
         re.IGNORECASE,
     ), "request"),
-    # File path
     (re.compile(
         r"""[A-Z]:\\|/tmp/|/etc/|/home/|\\\\|['"][./][\w/\\]+\.\w{1,5}['"]""",
         re.IGNORECASE,
     ), "filepath"),
-    # Regex / pattern
     (re.compile(r"re\.compile|RegExp\s*\(|/[^/]+/[gimsuy]*", re.IGNORECASE), "pattern"),
-    # DOM / document
     (re.compile(
-        r"document\.\w+|\.getElementById|\.querySelector|\.innerHTML|\.appendChild",
+        r"document\.\w+|\.getElementById|\.querySelector|\.innerHTML|\.appendChild|HTMLElement",
         re.IGNORECASE,
     ), "element"),
-    # Crypto / encode / decode
     (re.compile(
-        r"crypto|encrypt|decrypt|cipher|base64|btoa|atob|encode|decode|hash|md5|sha",
+        r"crypto|encrypt|decrypt|cipher|base64|btoa|atob|encode|decode|hash|md5|sha|rc4",
         re.IGNORECASE,
     ), "cipher"),
-    # Callback / handler (function passed as arg or assigned)
     (re.compile(
-        r"addEventListener|\.on\w+\s*=|callback|handler|\.then\s*\(|\.catch\s*\(",
+        r"addEventListener|\.on\w+\s*=|callback|handler|\.then\s*\(|\.catch\s*\(|setTimeout|setInterval",
         re.IGNORECASE,
     ), "handler"),
-    # Function definition
     (re.compile(r"function\s+\$NAME|def\s+\$NAME|\$NAME\s*=\s*function"), "func"),
-    # Array / list
     (re.compile(
-        r"\$NAME\s*=\s*\[|Array\s*\(|new\s+Array|\.push\s*\(|\.pop\s*\(|\.concat\s*\(",
+        r"\$NAME\s*=\s*\[|Array\s*\(|new\s+Array|\.push\s*\(|\.pop\s*\(|\.concat\s*\(|\.map\s*\(",
         re.IGNORECASE,
     ), "items"),
-    # Counter / number in loop
     (re.compile(
         r"\$NAME\s*\+\+|\$NAME\s*--|for\s*\(.*\$NAME.*\+\+|for\s.*\$NAME\s+in\s+range",
         re.IGNORECASE,
     ), "counter"),
 ]
 
-# Fallback label when no context rule matches
 _FALLBACK_PREFIX = "var"
+
+_JS_PREFIX_BASES: dict[str, str] = {
+    "url": "requestUrl",
+    "request": "requestData",
+    "filepath": "filePath",
+    "pattern": "matchPattern",
+    "element": "targetElement",
+    "cipher": "decodedPayload",
+    "handler": "callback",
+    "func": "helperFunction",
+    "items": "items",
+    "counter": "index",
+    "var": "value",
+}
+
+_BOOLEAN_NAME_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bready\b", re.IGNORECASE), "isReady"),
+    (re.compile(r"\bloaded?\b", re.IGNORECASE), "isLoaded"),
+    (re.compile(r"\bvalid\b", re.IGNORECASE), "isValid"),
+    (re.compile(r"\benabled?\b", re.IGNORECASE), "isEnabled"),
+    (re.compile(r"\bvisible\b", re.IGNORECASE), "isVisible"),
+    (re.compile(r"\btoken\b", re.IGNORECASE), "hasToken"),
+    (re.compile(r"\bpayload\b", re.IGNORECASE), "hasPayload"),
+    (re.compile(r"\bvalue\b", re.IGNORECASE), "hasValue"),
+    (re.compile(r"\bretry\b", re.IGNORECASE), "shouldRetry"),
+    (re.compile(r"\bcontinue\b", re.IGNORECASE), "shouldContinue"),
+]
+
+_COLLECTION_NAME_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bsplit\s*\(", re.IGNORECASE), "segments"),
+    (re.compile(r"\bhandler\b|addEventListener", re.IGNORECASE), "handlers"),
+    (re.compile(r"\btoken\b", re.IGNORECASE), "tokens"),
+    (re.compile(r"\bstring\b|\bliteral\b", re.IGNORECASE), "strings"),
+]
 
 
 # ===================================================================
 # Helper utilities
 # ===================================================================
 
+def _is_js_like(language: str) -> bool:
+    return (language or "").lower().strip() in _JS_LIKE_LANGUAGES
+
+
 def _collect_existing_identifiers(code: str) -> set[str]:
-    """Return every word-like token in *code* so we can check for collisions."""
     return set(re.findall(r"\b[a-zA-Z_]\w*\b", code))
 
 
@@ -167,7 +193,6 @@ def _count_occurrences(code: str, name: str) -> int:
 
 
 def _get_assignment_rhs(code: str, name: str) -> str:
-    """Return the concatenated right-hand sides of all assignments to *name*."""
     escaped = re.escape(name)
     pat = re.compile(
         rf"(?:var|let|const|my|local)?\s*{escaped}\s*=\s*([^\n;]+)",
@@ -176,19 +201,52 @@ def _get_assignment_rhs(code: str, name: str) -> str:
     return " ".join(m.group(1).strip() for m in pat.finditer(code))
 
 
-def _get_usage_context(code: str, name: str, window: int = 80) -> str:
-    """Return snippets surrounding every use of *name*."""
+def _get_usage_context(code: str, name: str, window: int = 100) -> str:
     escaped = re.escape(name)
     pat = re.compile(rf".{{0,{window}}}{escaped}.{{0,{window}}}")
-    return " ".join(m.group(0) for m in pat.finditer(code))[:4000]
+    return " ".join(m.group(0) for m in pat.finditer(code))[:5000]
+
+
+def _get_function_snippets(code: str, name: str) -> str:
+    escaped = re.escape(name)
+    patterns = [
+        re.compile(
+            rf"function\s+{escaped}\s*\(([^)]*)\)\s*\{{([\s\S]{{0,1400}}?)\}}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?:var|let|const)\s+{escaped}\s*=\s*(?:async\s*)?function\s*\(([^)]*)\)\s*\{{([\s\S]{{0,1400}}?)\}}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?:var|let|const)\s+{escaped}\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>\s*\{{([\s\S]{{0,1400}}?)\}}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?:var|let|const)\s+{escaped}\s*=\s*(?:async\s*)?([a-zA-Z_]\w*)\s*=>\s*\{{([\s\S]{{0,1400}}?)\}}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?:var|let|const)\s+{escaped}\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>\s*([^\n;]+)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?:var|let|const)\s+{escaped}\s*=\s*(?:async\s*)?([a-zA-Z_]\w*)\s*=>\s*([^\n;]+)",
+            re.IGNORECASE,
+        ),
+    ]
+    snippets: list[str] = []
+    for pattern in patterns:
+        for match in pattern.finditer(code):
+            snippets.extend(
+                str(group).strip()
+                for group in match.groups()
+                if group and str(group).strip()
+            )
+    return " ".join(snippets)[:5000]
 
 
 def _infer_semantic_prefix(code: str, name: str) -> str:
-    """Run context rules against the usage neighbourhood of *name*.
-
-    Returns the best semantic prefix (e.g. "url", "request", "filepath").
-    Falls back to ``_FALLBACK_PREFIX``.
-    """
     assign_rhs = _get_assignment_rhs(code, name)
     usage_ctx = _get_usage_context(code, name)
     combined = assign_rhs + " " + usage_ctx
@@ -197,7 +255,6 @@ def _infer_semantic_prefix(code: str, name: str) -> str:
     best_score = 0
 
     for rule_pat, prefix in _CONTEXT_RULES:
-        # Replace the $NAME placeholder so rules can reference the identifier
         adjusted_src = rule_pat.pattern.replace("$NAME", re.escape(name))
         adjusted = re.compile(adjusted_src, rule_pat.flags)
         hits = len(adjusted.findall(combined))
@@ -209,43 +266,32 @@ def _infer_semantic_prefix(code: str, name: str) -> str:
 
 
 def _build_string_mask(code: str) -> list[tuple[int, int]]:
-    """Return (start, end) spans of string literals and comments.
-
-    Covers:
-      - single-quoted strings (with escaped quote handling)
-      - double-quoted strings
-      - template literals (backtick)
-      - single-line comments (// and #)
-      - multi-line comments (/* ... */)
-    """
     spans: list[tuple[int, int]] = []
-    # Order matters: longer patterns first to avoid partial matches
     pattern = re.compile(
         r'(?:'
-        r'"""[\s\S]*?"""|'          # Python triple-double
-        r"'''[\s\S]*?'''|"          # Python triple-single
-        r'`(?:[^`\\]|\\.)*`|'       # JS template literal
-        r'"(?:[^"\\]|\\.)*"|'       # double-quoted string
-        r"'(?:[^'\\]|\\.)*'|"       # single-quoted string
-        r'//[^\n]*|'                # single-line comment (//)
-        r'#[^\n]*|'                 # single-line comment (#)
-        r'/\*[\s\S]*?\*/'           # multi-line comment
+        r'"""[\s\S]*?"""|'
+        r"'''[\s\S]*?'''|"
+        r'`(?:[^`\\]|\\.)*`|'
+        r'"(?:[^"\\]|\\.)*"|'
+        r"'(?:[^'\\]|\\.)*'|"
+        r'//[^\n]*|'
+        r'#[^\n]*|'
+        r'/\*[\s\S]*?\*/'
         r')'
     )
-    for m in pattern.finditer(code):
-        spans.append((m.start(), m.end()))
+    for match in pattern.finditer(code):
+        spans.append((match.start(), match.end()))
     return spans
 
 
 def _position_in_string_or_comment(
     pos: int, spans: list[tuple[int, int]]
 ) -> bool:
-    """Return True if *pos* falls inside any of the protected spans."""
     for start, end in spans:
         if start <= pos < end:
             return True
         if start > pos:
-            break  # spans are sorted by start
+            break
     return False
 
 
@@ -255,27 +301,269 @@ def _safe_rename(
     new_name: str,
     protected_spans: list[tuple[int, int]],
 ) -> str:
-    """Replace *old_name* with *new_name* at word boundaries, skipping
-    positions that fall inside string literals or comments.
-
-    Returns the modified code; protected_spans are **not** updated (the
-    caller must rebuild them if doing multiple passes -- or process
-    names longest-first to avoid offset drift issues by rebuilding between
-    renames).
-    """
     pat = re.compile(r"\b" + re.escape(old_name) + r"\b")
-    # We process from right-to-left so earlier offsets stay valid.
     matches = list(pat.finditer(code))
-    for m in reversed(matches):
-        if _position_in_string_or_comment(m.start(), protected_spans):
+    for match in reversed(matches):
+        if _position_in_string_or_comment(match.start(), protected_spans):
             continue
-        code = code[:m.start()] + new_name + code[m.end():]
+        code = code[:match.start()] + new_name + code[match.end():]
     return code
+
+
+def _to_camel_case(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) and any(ch.isupper() for ch in value[1:]):
+        candidate = value[0].lower() + value[1:]
+        if not candidate[0].isalpha() and candidate[0] != "_":
+            candidate = f"value{candidate}"
+        return candidate
+
+    parts = [part for part in re.split(r"[^a-zA-Z0-9]+", value) if part]
+    if not parts:
+        return "value"
+    first = parts[0].lower()
+    rest = [part[:1].upper() + part[1:].lower() for part in parts[1:]]
+    candidate = first + "".join(rest)
+    if not candidate[0].isalpha() and candidate[0] != "_":
+        candidate = f"value{candidate}"
+    return candidate
+
+
+def _allocate_identifier(base: str, existing_ids: set[str]) -> str:
+    candidate = _to_camel_case(base)
+    if candidate not in existing_ids and candidate not in KEYWORDS:
+        existing_ids.add(candidate)
+        return candidate
+
+    index = 2
+    while True:
+        numbered = f"{candidate}{index}"
+        if numbered not in existing_ids and numbered not in KEYWORDS:
+            existing_ids.add(numbered)
+            return numbered
+        index += 1
+
+
+def _looks_like_string_table(rhs: str, combined: str) -> bool:
+    quoted_entries = len(
+        re.findall(r"""(['"])(?:(?=(\\?))\2.)*?\1""", rhs)
+    )
+    return (
+        (
+            bool(re.search(r"^\s*\[", rhs))
+            and (
+                quoted_entries >= 2
+                or bool(
+                    re.search(
+                        r"(?:0x[0-9a-fA-F]+|\d+)(?:\s*,\s*(?:0x[0-9a-fA-F]+|\d+)){3,}",
+                        rhs,
+                    )
+                )
+            )
+        )
+        or bool(
+            re.search(
+                r"""\.push\s*\(\s*\w+\.shift\s*\(""",
+                combined,
+                re.IGNORECASE,
+            )
+        )
+    )
+
+
+def _looks_like_string_resolver(function_src: str, combined: str) -> bool:
+    return bool(
+        re.search(
+            r"""\breturn\s+\w+\s*\[\s*(?:0x[0-9a-fA-F]+|\d+|\w+)\s*\]""",
+            function_src,
+            re.IGNORECASE,
+        )
+        or re.search(r"\bparseInt\s*\(", function_src, re.IGNORECASE)
+        or re.search(r"""\w+\s*\(\s*['"]0x[0-9a-fA-F]+['"]\s*\)""", combined)
+    )
+
+
+def _looks_like_decoder(function_src: str, combined: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:atob|btoa|decodeURIComponent|fromCharCode|charCodeAt|CryptoJS|RC4|rc4|decrypt|decode)\b",
+            function_src + " " + combined,
+            re.IGNORECASE,
+        )
+        or re.search(r"\.split\(\s*['\"]{0,1}\s*['\"]{0,1}\s*\)\.reverse\(\)\.join", function_src)
+        or "^" in function_src
+    )
+
+
+def _looks_like_callback(combined: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:addEventListener|callback|handler|setTimeout|setInterval)\b|\.then\s*\(|\.catch\s*\(",
+            combined,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_dom_element(combined: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:document|window)\b|getElementById|querySelector|createElement|HTMLElement",
+            combined,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_collection(rhs: str, combined: str) -> bool:
+    return bool(
+        re.search(r"^\s*\[", rhs)
+        or re.search(r"\bnew\s+Array\b|\bArray\s*\(", rhs, re.IGNORECASE)
+        or re.search(r"\.(?:push|pop|map|filter|reduce|forEach|join|concat|slice)\s*\(", combined)
+    )
+
+
+def _looks_like_boolean(rhs: str, combined: str, name: str) -> bool:
+    escaped = re.escape(name)
+    strong_rhs = bool(
+        re.search(r"\b(?:true|false)\b|!0\b|!1\b|!!\[\]|!\[\]", rhs, re.IGNORECASE)
+    )
+    comparison_usage = bool(
+        re.search(
+            rf"\b(?:if|while)\s*\(\s*!?\s*{escaped}\b|"
+            rf"\b{escaped}\b\s*(?:===|!==|==|!=)\s*(?:true|false)|"
+            rf"(?:true|false)\s*(?:===|!==|==|!=)\s*{escaped}\b",
+            combined,
+            re.IGNORECASE,
+        )
+    )
+    return strong_rhs or comparison_usage
+
+
+def _looks_like_index(combined: str, name: str) -> bool:
+    escaped = re.escape(name)
+    return bool(
+        re.search(
+            rf"\[\s*{escaped}\s*\]|\b{escaped}\s*\+\+|\b{escaped}\s*--|for\s*\([^)]*\b{escaped}\b[^)]*(?:\+\+|--)",
+            combined,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_function(code: str, name: str, function_src: str) -> bool:
+    if function_src:
+        return True
+    escaped = re.escape(name)
+    return bool(
+        re.search(rf"\bfunction\s+{escaped}\b", code)
+        or re.search(rf"\b(?:var|let|const)\s+{escaped}\s*=\s*(?:async\s*)?(?:function|\([^)]*\)\s*=>|[A-Za-z_]\w*\s*=>)", code)
+    )
+
+
+def _infer_boolean_name(combined: str) -> str:
+    for pattern, candidate in _BOOLEAN_NAME_RULES:
+        if pattern.search(combined):
+            return candidate
+    return "isEnabled"
+
+
+def _infer_collection_name(combined: str) -> str:
+    for pattern, candidate in _COLLECTION_NAME_RULES:
+        if pattern.search(combined):
+            return candidate
+    return "items"
+
+
+def _map_prefix_to_base(prefix: str, *, is_function: bool) -> str:
+    base = _JS_PREFIX_BASES.get(prefix, _JS_PREFIX_BASES["var"])
+    if is_function:
+        if prefix == "url":
+            return "resolveUrl"
+        if prefix == "request":
+            return "sendRequest"
+        if prefix == "filepath":
+            return "resolveFilePath"
+        if prefix == "pattern":
+            return "matchValue"
+        if prefix == "element":
+            return "resolveElement"
+        if prefix == "cipher":
+            return "decodeValue"
+        if prefix == "handler":
+            return "handleEvent"
+        if prefix == "items":
+            return "collectItems"
+        if prefix == "counter":
+            return "nextIndex"
+        return "helperFunction"
+    return base
+
+
+def _infer_semantic_name(
+    code: str,
+    name: str,
+    language: str,
+    ptype: str,
+) -> str:
+    rhs = _get_assignment_rhs(code, name)
+    usage_ctx = _get_usage_context(code, name)
+    function_src = _get_function_snippets(code, name)
+    combined = " ".join(part for part in (rhs, usage_ctx, function_src) if part)
+    js_like = _is_js_like(language)
+    is_function = _looks_like_function(code, name, function_src)
+
+    if js_like:
+        if _looks_like_string_table(rhs, combined):
+            return "stringTable"
+        if _looks_like_string_resolver(function_src, combined):
+            return "resolveString"
+        if _looks_like_decoder(function_src, combined):
+            if re.search(r"\b(?:decrypt|rc4|xor|cipher|crypto)\b|\^", combined, re.IGNORECASE):
+                return "decryptString" if is_function else "decryptedValue"
+            return "decodeString" if is_function else "decodedValue"
+        if _looks_like_dom_element(combined):
+            return "targetElement"
+        if _looks_like_callback(combined):
+            return "handleEvent" if is_function else "callback"
+        if _looks_like_boolean(rhs, combined, name):
+            return _infer_boolean_name(combined)
+        if _looks_like_index(combined, name):
+            return "index"
+        if re.search(r"\bfetch\s*\(", combined, re.IGNORECASE):
+            return "fetchData" if is_function else "responsePromise"
+        if re.search(r"\b(?:response|json\s*\(|text\s*\(|status)\b", combined, re.IGNORECASE):
+            return "response"
+        if _looks_like_collection(rhs, combined):
+            return _infer_collection_name(combined)
+        if ptype == "single_char" and re.search(r"\^", combined):
+            return "byteValue"
+        if ptype == "single_char" and re.search(r"\b(?:charCodeAt|fromCharCode)\b", combined, re.IGNORECASE):
+            return "charCode"
+
+    prefix = _infer_semantic_prefix(code, name)
+    return _map_prefix_to_base(prefix, is_function=is_function) if js_like else prefix
+
+
+def _maybe_beautify_renamed_code(code: str, language: str) -> tuple[str, str]:
+    if not _is_js_like(language):
+        return code, "none"
+    if code.lstrip().startswith(_WORKSPACE_BUNDLE_HEADER):
+        return code, "none"
+
+    profile = detect_minified_source(code, language)
+    if not profile.get("likely") and profile.get("max_line_length", 0) < 140:
+        return code, "none"
+
+    beautified, engine = beautify_source(code, language)
+    if beautified and beautified != code:
+        return beautified, engine
+    return code, "none"
 
 
 # ===================================================================
 # Transform class
 # ===================================================================
+
 
 class DeterministicRenamer(BaseTransform):
     name = "DeterministicRenamer"
@@ -284,59 +572,41 @@ class DeterministicRenamer(BaseTransform):
         "usage context."
     )
 
-    # ---------------------------------------------------------------
-    # can_apply
-    # ---------------------------------------------------------------
     def can_apply(self, code: str, language: str, state: dict) -> bool:
-        """Return True if the code contains identifiers that match known
-        obfuscation patterns."""
         for ptype, pat in _OBFUSCATION_PATTERNS:
             if ptype == "single_char":
-                # Only flag single-char vars if they appear many times and
-                # are not conventional short names.
-                for m in pat.finditer(code):
-                    ch = m.group(0)
-                    if ch in _CONVENTIONAL_SHORT or ch in KEYWORDS:
+                for match in pat.finditer(code):
+                    candidate = match.group(0)
+                    if candidate in _CONVENTIONAL_SHORT or candidate in KEYWORDS:
                         continue
-                    if _count_occurrences(code, ch) >= 5:
+                    if _count_occurrences(code, candidate) >= 5:
                         return True
             else:
                 if pat.search(code):
                     return True
         return False
 
-    # ---------------------------------------------------------------
-    # apply
-    # ---------------------------------------------------------------
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
-        # ----- Step 1: collect obfuscated candidates -----
-        candidates: dict[str, str] = {}  # name -> pattern_type
+        candidates: dict[str, str] = {}
 
         for ptype, pat in _OBFUSCATION_PATTERNS:
-            for m in pat.finditer(code):
-                name = m.group(0)
+            for match in pat.finditer(code):
+                name = match.group(0)
 
-                # Skip conventional short names
                 if ptype == "single_char":
                     if name in _CONVENTIONAL_SHORT:
                         continue
-                    # Only rename single-char vars appearing many times
                     if _count_occurrences(code, name) < 5:
                         continue
 
                 if name in KEYWORDS:
                     continue
-
-                # Skip common abbreviations (legitimate short names)
                 if name.lower() in _COMMON_ABBREVIATIONS:
                     continue
-
-                # Minimum-occurrence gate (applies to all patterns)
                 if _count_occurrences(code, name) < 2:
                     continue
 
-                if name not in candidates:
-                    candidates[name] = ptype
+                candidates.setdefault(name, ptype)
 
         if not candidates:
             return TransformResult(
@@ -346,44 +616,23 @@ class DeterministicRenamer(BaseTransform):
                 description="No obfuscated identifiers detected.",
             )
 
-        # ----- Step 2: build rename map -----
         existing_ids = _collect_existing_identifiers(code)
         rename_map: dict[str, str] = {}
-        prefix_counters: dict[str, int] = {}
         patterns_detected: set[str] = set()
 
-        for name, ptype in candidates.items():
+        for name, ptype in sorted(candidates.items(), key=lambda item: (-len(item[0]), item[0])):
             patterns_detected.add(ptype)
-            prefix = _infer_semantic_prefix(code, name)
-
-            # Allocate a unique suffix
-            n = prefix_counters.get(prefix, 0) + 1
-            prefix_counters[prefix] = n
-            proposed = f"{prefix}_{n}"
-
-            # Collision check -- bump until unique
-            while proposed in existing_ids or proposed in KEYWORDS:
-                n += 1
-                prefix_counters[prefix] = n
-                proposed = f"{prefix}_{n}"
-
-            rename_map[name] = proposed
-            existing_ids.add(proposed)  # reserve
-
-        # ----- Step 3: apply renames (longest names first) -----
-        sorted_names = sorted(rename_map, key=len, reverse=True)
+            semantic_name = _infer_semantic_name(code, name, language, ptype)
+            rename_map[name] = _allocate_identifier(semantic_name, existing_ids)
 
         renamed_code = code
         renames_applied = 0
 
-        for old_name in sorted_names:
+        for old_name in sorted(rename_map, key=len, reverse=True):
             new_name = rename_map[old_name]
-            # Rebuild protected spans for every pass so offsets stay accurate
             protected = _build_string_mask(renamed_code)
             before = renamed_code
-            renamed_code = _safe_rename(
-                renamed_code, old_name, new_name, protected
-            )
+            renamed_code = _safe_rename(renamed_code, old_name, new_name, protected)
             if renamed_code != before:
                 renames_applied += 1
 
@@ -400,11 +649,15 @@ class DeterministicRenamer(BaseTransform):
                 },
             )
 
-        # ----- Step 4: result -----
+        beautifier = "none"
+        beautified_code, beautifier = _maybe_beautify_renamed_code(renamed_code, language)
+        renamed_code = beautified_code
+
         confidence = 0.60 + 0.02 * min(renames_applied, 20)
+        if beautifier != "none":
+            confidence += 0.03
         confidence = min(confidence, 0.95)
 
-        # Store mapping in pipeline state for downstream transforms
         state.setdefault("applied_renames", {}).update(rename_map)
 
         return TransformResult(
@@ -419,5 +672,7 @@ class DeterministicRenamer(BaseTransform):
                 "renames_applied": renames_applied,
                 "rename_map": rename_map,
                 "patterns_detected": sorted(patterns_detected),
+                "rename_style": "jsnice-inspired" if _is_js_like(language) else "semantic-prefix",
+                "beautifier": beautifier,
             },
         )

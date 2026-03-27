@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import ast
 import base64
+import io
 import shutil
+import zipfile
 
 import pytest
 
+from app.services.ingest.workspace_bundle import scan_workspace_archive
 from tests.dotnet_test_utils import (
     build_resx,
     build_test_dotnet_assembly,
@@ -27,6 +30,7 @@ from app.services.transforms.base64_decoder import (
     _try_decode,
 )
 from app.services.transforms.constant_folder import ConstantFolder
+from app.services.transforms.deterministic_renamer import DeterministicRenamer
 from app.services.transforms.dotnet_assembly_analyzer import DotNetAssemblyAnalyzer
 from app.services.transforms.hex_decoder import (
     HexDecoder,
@@ -37,6 +41,7 @@ from app.services.transforms.hex_decoder import (
     _decode_hex_stream,
 )
 from app.services.transforms.eval_detection import EvalExecDetector
+from app.services.transforms.javascript_bundle_deobfuscator import JavaScriptBundleDeobfuscator
 from app.services.transforms.javascript_encoder_decoder import JavaScriptEncoderDecoder
 from app.services.transforms.js_packer_unpacker import JavaScriptPackerUnpacker
 from app.services.transforms.js_resolvers import JavaScriptArrayResolver
@@ -51,6 +56,8 @@ from app.services.transforms.string_extraction import (
     _strip_quotes,
     _flag_string,
 )
+from app.services.transforms.workspace_file_deobfuscator import WorkspaceFileDeobfuscator
+from app.services.transforms.workspace_profiler import WorkspaceProfiler
 from app.services.transforms.xor_recovery import XorRecovery
 from app.services.analysis.state_manager import StateManager
 
@@ -516,6 +523,27 @@ class TestSourcePreprocessor:
         assert self.preprocessor.can_apply(code, "", {}) is False
 
 
+class TestDeterministicRenamer:
+    def setup_method(self):
+        self.renamer = DeterministicRenamer()
+
+    def test_javascript_renames_string_tables_and_resolvers_readably(self):
+        code = (
+            "var _0x1a2b=['alpha','beta'];"
+            "var _0x5c6d=function(_0x7f0a){return _0x1a2b[_0x7f0a];};"
+            "console.log(_0x5c6d(0));"
+        )
+
+        result = self.renamer.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert "stringTable" in result.output
+        assert "resolveString" in result.output
+        assert "index" in result.output
+        assert result.details["rename_style"] == "jsnice-inspired"
+        assert result.details["rename_map"]["_0x1a2b"] == "stringTable"
+        assert result.details["rename_map"]["_0x5c6d"] == "resolveString"
+
 # ════════════════════════════════════════════════════════════════════════
 #  JavaScript array resolver
 # ════════════════════════════════════════════════════════════════════════
@@ -598,6 +626,29 @@ class TestJavaScriptArrayResolver:
         assert "unused_rotation_helper_removed" in [
             item["type"] for item in result.details["static_rewrites"]
         ]
+
+
+class TestJavaScriptBundleDeobfuscator:
+    def test_webcrack_reformats_bundle_like_javascript(self):
+        transform = JavaScriptBundleDeobfuscator()
+        code = (
+            "(()=>{var __webpack_modules__={1:(module)=>{module.exports='ok'}};"
+            "var __webpack_module_cache__={};"
+            "function __webpack_require__(id){"
+            "var cached=__webpack_module_cache__[id];"
+            "if(cached!==undefined){return cached.exports;}"
+            "var module=__webpack_module_cache__[id]={exports:{}};"
+            "__webpack_modules__[id](module,module.exports,__webpack_require__);"
+            "return module.exports;}"
+            "console.log(__webpack_require__(1));})();"
+        )
+
+        result = transform.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert "\n" in result.output
+        assert "function __webpack_require__(id)" in result.output
+        assert "javascript_bundle_deobfuscation" in result.details["detected_techniques"]
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -809,6 +860,189 @@ class TestTransformResult:
             success=True, output="x", confidence=0.5, description="test", details=None
         )
         assert r.details == {}
+
+
+class TestWorkspaceScaleTransforms:
+    def test_workspace_archive_scan_cap_keeps_highest_scoring_files(self):
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, mode="w") as archive:
+            for index in range(5):
+                archive.writestr(f"pkg/file{index}.js", "export const ok = 1;\n")
+            archive.writestr("pkg/late-suspicious.js", "eval(atob('aGVsbG8='));\n")
+
+        result = scan_workspace_archive(
+            filename="repo.zip",
+            content_bytes=archive_bytes.getvalue(),
+            max_member_bytes=1024 * 1024,
+            max_scan_files=5,
+        )
+
+        paths = [item.path for item in result.files]
+        assert "pkg/late-suspicious.js" in paths
+        assert len(paths) == 5
+
+    def test_workspace_archive_keeps_minified_and_bundle_javascript(self):
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, mode="w") as archive:
+            archive.writestr("web/app.bundle.js", "(()=>{const a=1;return a;})();\n")
+            archive.writestr("web/vendor.min.js", "function a(){return 1;}\n")
+            archive.writestr("web/readme.txt", "plain text\n")
+
+        result = scan_workspace_archive(
+            filename="repo.zip",
+            content_bytes=archive_bytes.getvalue(),
+            max_member_bytes=1024 * 1024,
+            max_scan_files=10,
+        )
+
+        paths = [item.path for item in result.files]
+        assert "web/app.bundle.js" in paths
+        assert "web/vendor.min.js" in paths
+        bundle_item = next(item for item in result.files if item.path == "web/app.bundle.js")
+        minified_item = next(item for item in result.files if item.path == "web/vendor.min.js")
+        assert "bundle" in bundle_item.priority_tags
+        assert "minified" in minified_item.priority_tags
+
+    def test_workspace_profiler_indexes_full_archive_when_source_path_is_available(self, tmp_path):
+        archive_path = tmp_path / "repo.zip"
+        with zipfile.ZipFile(archive_path, mode="w") as archive:
+            archive.writestr("src/main.js", "import { decode } from './decode';\nconsole.log(decode('a'));\n")
+            archive.writestr("src/decode.js", "export function decode(value){ return eval(value); }\n")
+            archive.writestr("package.json", '{"name":"repo"}')
+
+        bundle = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 1\n"
+            "omitted_files: 2\n"
+            "languages: javascript=1\n"
+            "entry_points: src/main.js\n"
+            "suspicious_files: none\n"
+            "manifest_files: none\n"
+            "root_dirs: src\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="src/main.js" language="javascript" priority="entrypoint" size=64>>>\n'
+            "import { decode } from './decode';\nconsole.log(decode('a'));\n"
+            "<<<END FILE>>>\n"
+        )
+        profiler = WorkspaceProfiler()
+
+        result = profiler.apply(
+            bundle,
+            "workspace",
+            {
+                "iteration_state": {
+                    "sample_metadata": {
+                        "content_kind": "archive_bundle",
+                        "stored_file_path": str(archive_path),
+                        "filename": "repo.zip",
+                    }
+                }
+            },
+        )
+
+        assert result.success is True
+        context = result.details["workspace_context"]
+        assert context["indexed_from_archive"] is True
+        assert context["indexed_file_count"] >= 3
+        assert "src/decode.js" in context["analysis_frontier"]
+        assert "src/decode.js" in context["bundle_expansion_paths"]
+
+    def test_workspace_file_deobfuscator_can_expand_bundle_from_archive(self, tmp_path):
+        archive_path = tmp_path / "repo.zip"
+        with zipfile.ZipFile(archive_path, mode="w") as archive:
+            archive.writestr("src/main.js", "import { decode } from './decode';\nconsole.log(decode('a'));\n")
+            archive.writestr("src/decode.js", "export function decode(value){ return String.fromCharCode(72, 105); }\n")
+
+        bundle = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 1\n"
+            "omitted_files: 1\n"
+            "languages: javascript=1\n"
+            "entry_points: src/main.js\n"
+            "suspicious_files: none\n"
+            "manifest_files: none\n"
+            "root_dirs: src\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="src/main.js" language="javascript" priority="entrypoint" size=64>>>\n'
+            "import { decode } from './decode';\nconsole.log(decode('a'));\n"
+            "<<<END FILE>>>\n"
+        )
+        transform = WorkspaceFileDeobfuscator()
+
+        result = transform.apply(
+            bundle,
+            "workspace",
+            {
+                "workspace_context": {
+                    "entry_points": ["src/main.js"],
+                    "analysis_frontier": ["src/decode.js", "src/main.js"],
+                    "bundle_expansion_paths": ["src/decode.js"],
+                    "llm_focus_paths": ["src/decode.js"],
+                },
+                "iteration_state": {
+                    "sample_metadata": {
+                        "content_kind": "archive_bundle",
+                        "stored_file_path": str(archive_path),
+                        "filename": "repo.zip",
+                    }
+                },
+            },
+        )
+
+        assert result.success is True
+        assert "src/decode.js" in result.details["added_files_to_bundle"]
+        assert '<<<FILE path="src/decode.js"' in result.output
+
+    def test_workspace_file_deobfuscator_uses_current_bundle_literals_over_archive(self, tmp_path):
+        archive_path = tmp_path / "repo.zip"
+        with zipfile.ZipFile(archive_path, mode="w") as archive:
+            archive.writestr("src/a.js", 'export const VALUE = atob("aGk=");\n')
+            archive.writestr("src/b.js", "import { VALUE } from './a.js';\nconsole.log(VALUE);\n")
+
+        bundle = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 2\n"
+            "omitted_files: 0\n"
+            "languages: javascript=2\n"
+            "entry_points: src/b.js\n"
+            "suspicious_files: src/a.js\n"
+            "manifest_files: none\n"
+            "root_dirs: src\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="src/a.js" language="javascript" priority="suspicious" size=26>>>\n'
+            'export const VALUE = "hi";\n'
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="src/b.js" language="javascript" priority="entrypoint" size=51>>>\n'
+            "import { VALUE } from './a.js';\nconsole.log(VALUE);\n"
+            "<<<END FILE>>>\n"
+        )
+        transform = WorkspaceFileDeobfuscator()
+
+        result = transform.apply(
+            bundle,
+            "workspace",
+            {
+                "workspace_context": {
+                    "entry_points": ["src/b.js"],
+                    "analysis_frontier": ["src/b.js"],
+                },
+                "iteration_state": {
+                    "sample_metadata": {
+                        "content_kind": "archive_bundle",
+                        "stored_file_path": str(archive_path),
+                        "filename": "repo.zip",
+                    }
+                },
+            },
+        )
+
+        assert result.success is False
+        summary = result.details["file_transform_summary"]
+        b_file = next(item for item in summary if item["path"] == "src/b.js")
+        assert "VALUE" in b_file.get("imported_literals", [])
 
 
 class TestAdditionalDecoderCoverage:

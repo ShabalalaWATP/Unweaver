@@ -13,15 +13,23 @@ import json
 import logging
 import re
 from abc import abstractmethod
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.core.config import settings
 from app.services.ingest.workspace_bundle import (
+    load_workspace_archive_file_from_path,
+    load_workspace_archive_from_path,
+    overlay_workspace_files,
     truncate_workspace_bundle,
     validate_workspace_bundle_candidate,
     workspace_context_prompt,
 )
 from app.services.llm.client import LLMClient
 from app.services.transforms.base import BaseTransform, TransformResult
+from app.services.transforms.js_tooling import validate_javascript_source
+from app.services.transforms.readability_scorer import compute_readability_score
+from app.services.transforms.source_preprocessor import normalize_source_anomalies
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +268,7 @@ class LLMTransform(BaseTransform):
     def build_state_context(
         state: dict,
         *,
+        code: Optional[str] = None,
         compact: bool = False,
         max_strings: int = 8,
         max_transforms: int = 6,
@@ -284,6 +293,40 @@ class LLMTransform(BaseTransform):
         language = state.get("language")
         if language:
             parts.append(f"Language: {language}")
+
+        iteration_state = state.get("iteration_state", {})
+        if isinstance(iteration_state, dict):
+            js_hard_mode = iteration_state.get("js_hard_mode")
+            if isinstance(js_hard_mode, dict) and js_hard_mode.get("enabled"):
+                score = js_hard_mode.get("score")
+                score_text = (
+                    f" (score {float(score):.1f})"
+                    if isinstance(score, (int, float))
+                    else ""
+                )
+                parts.append(f"JavaScript hard mode: enabled{score_text}")
+                signals = [
+                    str(item)
+                    for item in js_hard_mode.get("signals", [])[:6]
+                    if str(item).strip()
+                ]
+                if signals:
+                    parts.append("Hard-mode signals: " + " | ".join(signals))
+
+            llm_classification = iteration_state.get("llm_classification")
+            if isinstance(llm_classification, dict):
+                obfuscation_type = str(
+                    llm_classification.get("obfuscation_type", "")
+                ).strip()
+                if obfuscation_type:
+                    parts.append(f"Classifier verdict: {obfuscation_type}")
+                tools = [
+                    str(item)
+                    for item in llm_classification.get("tools_identified", [])[:6]
+                    if str(item).strip()
+                ]
+                if tools:
+                    parts.append("Classifier tools: " + " | ".join(tools))
 
         confidence = state.get("confidence", {})
         overall = confidence.get("overall")
@@ -316,6 +359,15 @@ class LLMTransform(BaseTransform):
 
         workspace_context = state.get("workspace_context", {})
         if isinstance(workspace_context, dict):
+            indexed_file_count = workspace_context.get("indexed_file_count")
+            bundled_file_count = workspace_context.get("bundled_file_count")
+            if isinstance(indexed_file_count, int):
+                bundle_text = (
+                    f" ({bundled_file_count} currently bundled)"
+                    if isinstance(bundled_file_count, int)
+                    else ""
+                )
+                parts.append(f"Workspace indexed files: {indexed_file_count}{bundle_text}")
             entry_points = workspace_context.get("entry_points", [])
             if entry_points:
                 parts.append(
@@ -333,6 +385,12 @@ class LLMTransform(BaseTransform):
                 parts.append(
                     "Workspace hotspots: "
                     + " | ".join(str(item) for item in dependency_hotspots[:6])
+                )
+            unbundled_hotspots = workspace_context.get("unbundled_hotspots", [])
+            if unbundled_hotspots:
+                parts.append(
+                    "Deferred hotspots: "
+                    + " | ".join(str(item) for item in unbundled_hotspots[:6])
                 )
             execution_paths = workspace_context.get("execution_paths", [])
             if execution_paths:
@@ -354,6 +412,29 @@ class LLMTransform(BaseTransform):
                     parts.append(
                         "Prioritized files: " + " | ".join(hotspot_paths)
                     )
+            llm_focus_paths = workspace_context.get("llm_focus_paths", [])
+            if llm_focus_paths:
+                parts.append(
+                    "LLM focus paths: "
+                    + " | ".join(str(item) for item in llm_focus_paths[:8])
+                )
+            graph_summary = workspace_context.get("graph_summary", {})
+            if isinstance(graph_summary, dict) and graph_summary:
+                graph_parts: List[str] = []
+                for key in ("local_edges", "external_edges", "cross_file_calls", "execution_paths", "bundle_expansion_candidates"):
+                    value = graph_summary.get(key)
+                    if isinstance(value, int):
+                        graph_parts.append(f"{key}={value}")
+                if graph_parts:
+                    parts.append("Workspace graph: " + ", ".join(graph_parts))
+
+            workspace_focus_excerpt = LLMTransform._build_workspace_focus_excerpt(
+                state,
+                code=code,
+                compact=compact,
+            )
+            if workspace_focus_excerpt:
+                parts.append(workspace_focus_excerpt)
 
         recovered_literals = state.get("recovered_literals", [])
         if recovered_literals:
@@ -393,12 +474,203 @@ class LLMTransform(BaseTransform):
                 "Prior suggestions: " + " | ".join(str(s)[:100] for s in llm_suggestions[:6])
             )
 
+        evidence_digest = LLMTransform.build_evidence_digest(
+            state,
+            source_text=code or "",
+            compact=compact,
+        )
+        if evidence_digest:
+            parts.append(evidence_digest)
+
         return "\n".join(parts) if parts else "No prior analysis context."
 
     @staticmethod
     def build_workspace_context(code: str) -> Optional[str]:
         """Return a workspace summary when the input is a bundled codebase."""
         return workspace_context_prompt(code)
+
+    @staticmethod
+    def _build_workspace_focus_excerpt(
+        state: dict,
+        *,
+        code: str = "",
+        compact: bool = False,
+    ) -> Optional[str]:
+        workspace_context = state.get("workspace_context", {})
+        if not isinstance(workspace_context, dict):
+            return None
+
+        iteration_state = state.get("iteration_state", {})
+        if not isinstance(iteration_state, dict):
+            return None
+        sample_metadata = iteration_state.get("sample_metadata", {})
+        if not isinstance(sample_metadata, dict):
+            return None
+        if sample_metadata.get("content_kind") != "archive_bundle":
+            return None
+
+        archive_path = str(sample_metadata.get("stored_file_path", "")).strip()
+        if not archive_path:
+            return None
+
+        focus_paths: List[str] = []
+        for key in ("llm_focus_paths", "dependency_hotspots", "symbol_hotspots", "bundle_expansion_paths"):
+            for value in workspace_context.get(key, []):
+                path = str(value).strip()
+                if path and path not in focus_paths:
+                    focus_paths.append(path)
+        if not focus_paths:
+            return None
+
+        try:
+            scan = load_workspace_archive_from_path(
+                archive_path,
+                archive_name=str(sample_metadata.get("filename") or Path(archive_path).name),
+                max_member_bytes=getattr(settings, "MAX_ARCHIVE_MEMBER_SIZE", 2 * 1024 * 1024),
+                max_scan_files=getattr(settings, "MAX_ARCHIVE_SCAN_FILES", 0) or None,
+            )
+        except Exception:
+            return None
+
+        overlaid_files = overlay_workspace_files(code, scan.files)
+        by_path = {item.path: item for item in overlaid_files}
+        max_files = 3 if compact else getattr(settings, "MAX_WORKSPACE_LLM_FOCUS_FILES", 8)
+        max_chars = 3200 if compact else 9000
+        excerpts: List[str] = []
+        used_chars = 0
+
+        for path in focus_paths:
+            file = by_path.get(path)
+            if file is None:
+                file = load_workspace_archive_file_from_path(
+                    archive_path,
+                    member_path=path,
+                    archive_name=str(sample_metadata.get("filename") or Path(archive_path).name),
+                    max_member_bytes=getattr(settings, "MAX_ARCHIVE_MEMBER_SIZE", 2 * 1024 * 1024),
+                )
+            if file is None:
+                continue
+            remaining = max_chars - used_chars
+            if remaining < 280:
+                break
+            snippet_budget = min(1400 if not compact else 700, max(remaining - 160, 120))
+            snippet = file.text[:snippet_budget].rstrip()
+            excerpts.append(f"[{file.path}] ({file.language})\n{snippet}")
+            used_chars += len(excerpts[-1]) + 2
+            if len(excerpts) >= max_files:
+                break
+
+        if not excerpts:
+            return None
+        return "Workspace focus excerpts:\n" + "\n\n".join(excerpts)
+
+    @staticmethod
+    def _state_text_value(item: Any) -> str:
+        if isinstance(item, dict):
+            for key in ("value", "decoded", "context", "path", "name", "type"):
+                value = item.get(key)
+                if value:
+                    return str(value)
+            return ""
+        return str(getattr(item, "value", item))
+
+    @staticmethod
+    def _clean_evidence_value(text: str) -> str:
+        return re.sub(r"\s+", " ", text.strip())[:140]
+
+    @staticmethod
+    def _is_salient_evidence(text: str, kind: str) -> bool:
+        if not text:
+            return False
+        if text.lower() in {"none", "unknown", "null", "true", "false"}:
+            return False
+        if not any(ch.isalnum() for ch in text):
+            return False
+
+        min_len = 4
+        if kind in {"api", "import", "function"}:
+            min_len = 3
+        if len(text) < min_len:
+            return False
+
+        if kind in {"string", "literal"} and re.fullmatch(r"[A-Za-z_]\w{0,3}", text):
+            return False
+        return True
+
+    @classmethod
+    def collect_evidence_items(
+        cls,
+        state: Optional[dict],
+        *,
+        source_text: str = "",
+        max_items: int = 12,
+    ) -> List[Dict[str, str]]:
+        state = state or {}
+        items: List[Dict[str, str]] = []
+        seen: set[str] = set()
+
+        def add(kind: str, raw_value: Any) -> None:
+            value = cls._clean_evidence_value(cls._state_text_value(raw_value))
+            if not cls._is_salient_evidence(value, kind):
+                return
+            key = f"{kind}:{value.lower()}"
+            if key in seen:
+                return
+            seen.add(key)
+            items.append({"kind": kind, "value": value})
+
+        for value in state.get("recovered_literals", [])[: max_items * 2]:
+            add("literal", value)
+        for value in state.get("suspicious_apis", [])[: max_items * 2]:
+            add("api", value)
+        for value in state.get("imports", [])[:max_items]:
+            add("import", value)
+        for value in state.get("functions", [])[:max_items]:
+            add("function", value)
+        for value in state.get("evidence_references", [])[:max_items]:
+            add("evidence", value)
+        for value in state.get("strings", [])[: max_items * 2]:
+            add("string", value)
+
+        excerpt = source_text[:40_000]
+        patterns = [
+            ("url", re.compile(r"https?://[^\s'\"`<>]+", re.IGNORECASE)),
+            ("registry", re.compile(r"\b(?:HKLM|HKCU|HKEY_[A-Z_]+)\\[^\s'\"`<>]+", re.IGNORECASE)),
+            ("ip", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+            ("email", re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)),
+            ("domain", re.compile(r"\b(?:[A-Z0-9-]+\.)+[A-Z]{2,}\b", re.IGNORECASE)),
+        ]
+        for kind, pattern in patterns:
+            for match in pattern.findall(excerpt):
+                add(kind, match)
+                if len(items) >= max_items:
+                    break
+            if len(items) >= max_items:
+                break
+
+        return items[:max_items]
+
+    @classmethod
+    def build_evidence_digest(
+        cls,
+        state: Optional[dict],
+        *,
+        source_text: str = "",
+        compact: bool = False,
+    ) -> str:
+        max_items = 4 if compact else 6
+        items = cls.collect_evidence_items(
+            state,
+            source_text=source_text,
+            max_items=max_items,
+        )
+        if not items:
+            return ""
+        rendered = [
+            f"{item['kind']}={item['value']}"
+            for item in items[:max_items]
+        ]
+        return "Evidence anchors: " + " | ".join(rendered)
 
     @staticmethod
     def validate_candidate_code(
@@ -428,6 +700,10 @@ class LLMTransform(BaseTransform):
             syntax_ok = LLMTransform._python_syntax_ok(candidate)
             if not syntax_ok:
                 issues.append("python_syntax_error")
+        elif lang in {"javascript", "js", "jsx", "mjs", "cjs", "typescript", "ts", "tsx"}:
+            syntax_ok = LLMTransform._javascript_syntax_ok(candidate, language=lang)
+            if not syntax_ok:
+                issues.append("javascript_syntax_error")
         elif lang == "json":
             syntax_ok = LLMTransform._json_syntax_ok(candidate)
             if not syntax_ok:
@@ -440,7 +716,7 @@ class LLMTransform(BaseTransform):
             not delimiter_balance_ok
             and lang in {
                 "javascript", "js", "typescript", "ts", "powershell",
-                "ps1", "ps", "csharp", "cs", "java", "php", "go", "rust",
+                "jsx", "tsx", "ps1", "ps", "csharp", "cs", "java", "php", "go", "rust",
             }
         ):
             accepted = False
@@ -464,8 +740,73 @@ class LLMTransform(BaseTransform):
             "workspace_validation": workspace_validation,
         }
 
+    @classmethod
+    def assess_candidate_rewrite(
+        cls,
+        original: str,
+        candidate: str,
+        language: str,
+        state: Optional[dict],
+        *,
+        artifacts: Optional[List[Any]] = None,
+        allow_noop: bool = False,
+        min_readability_delta: Optional[float] = None,
+        require_evidence_retention: bool = True,
+    ) -> Dict[str, Any]:
+        validation = cls.validate_candidate_code(original, candidate, language)
+        issues = validation["issues"]
+
+        readability_before, _ = compute_readability_score(original)
+        readability_after, _ = compute_readability_score(candidate)
+        readability_delta = round(readability_after - readability_before, 1)
+
+        normalized_original = re.sub(r"\s+", "", original)
+        normalized_candidate = re.sub(r"\s+", "", candidate)
+        noop = normalized_original == normalized_candidate
+
+        evidence_items = cls.collect_evidence_items(
+            state,
+            source_text=original,
+            max_items=10,
+        )
+        evidence_haystack = "\n".join(
+            [candidate] + [str(item) for item in (artifacts or []) if item]
+        ).lower()
+        retained = [
+            item for item in evidence_items
+            if item["value"].lower() in evidence_haystack
+        ]
+        critical_kinds = {"url", "registry", "ip", "email", "domain", "literal", "api", "evidence"}
+        required = any(item["kind"] in critical_kinds for item in evidence_items)
+
+        if noop and not allow_noop:
+            issues.append("rewrite_no_effect")
+            validation["accepted"] = False
+
+        if min_readability_delta is not None and readability_delta < min_readability_delta:
+            issues.append("readability_regressed")
+            validation["accepted"] = False
+
+        if require_evidence_retention and required and not retained:
+            issues.append("evidence_dropped")
+            validation["accepted"] = False
+
+        validation["readability_before"] = readability_before
+        validation["readability_after"] = readability_after
+        validation["readability_delta"] = readability_delta
+        validation["noop"] = noop
+        validation["evidence"] = {
+            "required": required,
+            "anchors": evidence_items,
+            "retained": retained,
+            "retained_count": len(retained),
+            "missing_count": max(len(evidence_items) - len(retained), 0),
+        }
+        return validation
+
     @staticmethod
     def _python_syntax_ok(code: str) -> bool:
+        code, _ = normalize_source_anomalies(code)
         try:
             ast.parse(code)
             return True
@@ -473,7 +814,18 @@ class LLMTransform(BaseTransform):
             return False
 
     @staticmethod
+    def _javascript_syntax_ok(code: str, *, language: str = "javascript") -> bool:
+        code, _ = normalize_source_anomalies(code)
+        if not code.strip():
+            return False
+        validation = validate_javascript_source(code, language=language)
+        if validation.get("ok") is True:
+            return True
+        return validation.get("error") in {"node_unavailable", "worker_missing", "tooling_unavailable"}
+
+    @staticmethod
     def _json_syntax_ok(code: str) -> bool:
+        code, _ = normalize_source_anomalies(code)
         try:
             json.loads(code)
             return True
@@ -483,6 +835,7 @@ class LLMTransform(BaseTransform):
     @staticmethod
     def _has_balanced_delimiters(code: str) -> bool:
         """Best-effort delimiter balance check that skips strings/comments."""
+        code, _ = normalize_source_anomalies(code)
         pairs = {"(": ")", "{": "}", "[": "]"}
         closing = {value: key for key, value in pairs.items()}
         stack: List[str] = []

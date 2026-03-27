@@ -377,7 +377,7 @@ _QUICK_CHECK = re.compile(
     r"(?:split|reverse|join|fromCharCode|charCodeAt|atob|btoa|chr|ord|\^)"
     r"[^}]*\})"
     r"|"
-    r"(?:def\s+\w+\s*\([^)]*\)\s*:[^\n]*"
+    r"(?:def\s+\w+\s*\([^)]*\)\s*:(?:\s*\n[ \t]+[^\n]*){0,8}"
     r"(?:split|reverse|join|chr|ord|b64decode|base64|\^))",
     re.DOTALL,
 )
@@ -399,7 +399,7 @@ class StringDecryptor(BaseTransform):
         # Find candidate function names and check call frequency
         for m in re.finditer(r"(?:function\s+(\w+)|def\s+(\w+))", code):
             name = m.group(1) or m.group(2)
-            if name and _count_literal_calls(code, name) > 3:
+            if name and _count_literal_calls(code, name) > 0:
                 return True
         return False
 
@@ -458,6 +458,7 @@ class StringDecryptor(BaseTransform):
         decrypt_funcs: list[dict[str, Any]] = []
         for cand in candidates:
             body_lower = cand["body"].lower()
+            name_lower = cand["name"].lower()
 
             # Skip common utility function names
             if cand["name"] in _UTILITY_NAMES:
@@ -467,6 +468,10 @@ class StringDecryptor(BaseTransform):
             has_xor = bool(_XOR_IN_BODY.search(cand["body"]))
             call_count = _count_literal_calls(code, cand["name"])
             name_looks_obfuscated = bool(_OBFUSCATED_NAME.match(cand["name"]))
+            name_has_decoder_word = any(
+                token in name_lower
+                for token in ("decrypt", "decode", "deobfusc", "unscramble", "unescape")
+            )
 
             # Require MULTIPLE indicators to reduce false positives:
             # - At least 2 decrypt keywords, OR 1 keyword + XOR, OR obfuscated name + keyword
@@ -483,8 +488,16 @@ class StringDecryptor(BaseTransform):
             if indicators < 1:
                 continue
 
-            # Must be called frequently OR have an obfuscated name
-            if call_count <= 3 and not name_looks_obfuscated:
+            # Single-use decrypt helpers are common in loaders. Allow them when
+            # the name/body already provides a strong decode signal.
+            if call_count <= 0:
+                continue
+            if call_count <= 3 and not (
+                name_looks_obfuscated
+                or name_has_decoder_word
+                or keyword_count >= 2
+                or has_xor
+            ):
                 continue
 
             patterns = _classify_body(cand["body"])
@@ -520,6 +533,7 @@ class StringDecryptor(BaseTransform):
         unresolved_count = 0
         all_patterns: set[str] = set()
         all_techniques: set[str] = set()
+        resolved_strings: list[dict[str, str]] = []
 
         for func in decrypt_funcs:
             func_name: str = func["name"]
@@ -580,6 +594,11 @@ class StringDecryptor(BaseTransform):
 
                         # Escape quotes in the resolved value
                         escaped = resolved_value.replace("\\", "\\\\").replace('"', '\\"')
+                        resolved_strings.append({
+                            "function": fn,
+                            "original": m.group(0)[:160],
+                            "decrypted": resolved_value,
+                        })
                         resolved_count += 1
                         return f'"{escaped}"'
 
@@ -622,5 +641,6 @@ class StringDecryptor(BaseTransform):
                 "calls_unresolved": unresolved_count,
                 "patterns": sorted(all_patterns),
                 "detected_techniques": sorted(all_techniques),
+                "decrypted_strings": resolved_strings[:50],
             },
         )

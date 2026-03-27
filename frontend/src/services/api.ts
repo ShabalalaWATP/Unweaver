@@ -10,6 +10,8 @@ import type {
   TransformRecord,
   AnalysisStatus,
   AISummaryReport,
+  AnalystChatMessage,
+  AnalystChatResponse,
   SavedAnalysisSnapshot,
   ProviderSettings,
   ProviderSettingsCreate,
@@ -216,19 +218,18 @@ export async function uploadSample(
 // ════════════════════════════════════════════════════════════════════════
 
 export async function getOriginal(sampleId: string): Promise<string> {
-  return request<string>(`/samples/${sampleId}/original`);
+  const data = await request<{ original_text: string }>(`/samples/${sampleId}/original`);
+  return data.original_text ?? '';
 }
 
 export async function getRecovered(sampleId: string): Promise<string> {
-  return request<string>(`/samples/${sampleId}/recovered`);
+  const data = await request<{ recovered_text: string | null }>(`/samples/${sampleId}/recovered`);
+  return data.recovered_text ?? '';
 }
 
-export async function getDiff(
-  sampleId: string,
-): Promise<{ original: string; recovered: string }> {
-  return request<{ original: string; recovered: string }>(
-    `/samples/${sampleId}/diff`,
-  );
+export async function getDiff(sampleId: string): Promise<string> {
+  const data = await request<{ diff: string }>(`/samples/${sampleId}/diff`);
+  return data.diff ?? '';
 }
 
 export async function getStrings(sampleId: string): Promise<StringEntry[]> {
@@ -286,18 +287,12 @@ export async function getAnalysisState(
     const data = await request<{
       sample_id: string;
       count: number;
-      iterations: { id: string; iteration_number: number; state_json: AnalysisState | string; created_at: string | null }[];
+      iterations: IterationSnapshot[];
     }>(`/samples/${sampleId}/iterations`);
     if (!data.iterations || data.iterations.length === 0) return null;
     // Return the latest iteration's state
     const latest = data.iterations[data.iterations.length - 1];
-    if (!latest.state_json) return null;
-    // state_json may be a serialised JSON string from the DB — parse it.
-    const state: AnalysisState =
-      typeof latest.state_json === 'string'
-        ? JSON.parse(latest.state_json)
-        : latest.state_json;
-    return state;
+    return parseIterationState(latest.state_json);
   } catch {
     return null;
   }
@@ -325,6 +320,16 @@ export async function generateSummary(sampleId: string): Promise<AISummaryReport
   return request<AISummaryReport>(`/samples/${sampleId}/summary`, {
     method: 'POST',
   });
+}
+
+export async function chatWithSample(
+  sampleId: string,
+  messages: AnalystChatMessage[],
+): Promise<AnalystChatResponse> {
+  return request<AnalystChatResponse>(`/samples/${sampleId}/chat`, {
+    method: 'POST',
+    body: JSON.stringify({ messages }),
+  }, 180_000);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -443,8 +448,30 @@ export function getAnalysisWsUrl(sampleId: string): string {
 export interface IterationSnapshot {
   id: string;
   iteration_number: number;
-  state_json: AnalysisState;
+  state_json: AnalysisState | string | null;
+  code_snapshot?: string | null;
+  snapshot_meta?: IterationSnapshotMeta | null;
   created_at: string | null;
+}
+
+export interface IterationSnapshotMeta {
+  captured_at?: string | null;
+  code_length?: number;
+  code_truncated?: boolean;
+}
+
+export function parseIterationState(
+  stateJson: AnalysisState | string | null | undefined,
+): AnalysisState | null {
+  if (!stateJson) return null;
+  if (typeof stateJson !== 'string') {
+    return stateJson;
+  }
+  try {
+    return JSON.parse(stateJson) as AnalysisState;
+  } catch {
+    return null;
+  }
 }
 
 export async function getIterations(sampleId: string): Promise<IterationSnapshot[]> {

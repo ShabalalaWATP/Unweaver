@@ -117,6 +117,94 @@ export interface TransformRecord {
   retry_revert: boolean;
 }
 
+export interface WorkspaceGraphSummary {
+  local_edges?: number;
+  external_edges?: number;
+  cross_file_calls?: number;
+  execution_paths?: number;
+  hotspots?: string[];
+}
+
+export interface WorkspaceCallEdge {
+  source: string;
+  target: string;
+  symbol: string;
+  count: number;
+  call_style: string;
+}
+
+export interface WorkspacePrioritizedFile {
+  path: string;
+  language: string;
+  score: number;
+  reasons: string[];
+  priority_tags: string[];
+  inbound_edges: number;
+  outbound_edges: number;
+  cross_file_call_in: number;
+  cross_file_call_out: number;
+  suspicious_api_hits: number;
+  obfuscation_signal_hits: number;
+  function_count: number;
+  exported_symbol_count: number;
+}
+
+export interface WorkspaceFilePreview {
+  path: string;
+  language: string;
+  priority: string[];
+  size_bytes: number;
+}
+
+export interface WorkspaceSymbolIndex {
+  path: string;
+  symbols: string[];
+}
+
+export interface WorkspaceContext {
+  archive_name?: string;
+  included_files?: number;
+  omitted_files?: number;
+  languages?: string;
+  entry_points?: string[];
+  suspicious_files?: string[];
+  manifest_files?: string[];
+  root_dirs?: string[];
+  prioritized_paths?: string[];
+  dependency_hotspots?: string[];
+  symbol_hotspots?: string[];
+  execution_paths?: string[];
+  local_dependency_count?: number;
+  external_dependency_count?: number;
+  cross_file_call_count?: number;
+  graph_summary?: WorkspaceGraphSummary;
+  cross_file_call_edges?: WorkspaceCallEdge[];
+  prioritized_files?: WorkspacePrioritizedFile[];
+  files_preview?: WorkspaceFilePreview[];
+  recovered_files_preview?: WorkspaceFilePreview[];
+  bundle_note?: string;
+  imports_count?: number;
+  functions_count?: number;
+  languages_by_file?: Record<string, number>;
+  indexed_file_count?: number;
+  bundled_file_count?: number;
+  bundle_file_count?: number;
+  indexed_from_archive?: boolean;
+  analysis_frontier?: string[];
+  bundle_expansion_paths?: string[];
+  remaining_frontier_paths?: string[];
+  llm_focus_paths?: string[];
+  targeted_files?: string[];
+  deobfuscated_files?: string[];
+  added_files_to_bundle?: string[];
+  targeted_file_count?: number;
+  deobfuscated_file_count?: number;
+  file_transform_summary?: Array<Record<string, unknown>>;
+  symbol_literal_files?: WorkspaceSymbolIndex[];
+  defined_symbols?: WorkspaceSymbolIndex[];
+  exported_symbols?: WorkspaceSymbolIndex[];
+}
+
 export interface AnalysisState {
   language: string | null;
   parse_status: string | null;
@@ -129,56 +217,7 @@ export interface AnalysisState {
   recovered_literals: string[];
   transform_history: TransformRecord[];
   evidence_references: string[];
-  workspace_context?: {
-    archive_name?: string;
-    included_files?: number;
-    omitted_files?: number;
-    entry_points?: string[];
-    suspicious_files?: string[];
-    manifest_files?: string[];
-    root_dirs?: string[];
-    dependency_hotspots?: string[];
-    symbol_hotspots?: string[];
-    execution_paths?: string[];
-    local_dependency_count?: number;
-    external_dependency_count?: number;
-    cross_file_call_count?: number;
-    graph_summary?: {
-      local_edges?: number;
-      external_edges?: number;
-      cross_file_calls?: number;
-      execution_paths?: number;
-      hotspots?: string[];
-    };
-    cross_file_call_edges?: Array<{
-      source: string;
-      target: string;
-      symbol: string;
-      count: number;
-      call_style: string;
-    }>;
-    prioritized_files?: Array<{
-      path: string;
-      language: string;
-      score: number;
-      reasons: string[];
-      priority_tags: string[];
-      inbound_edges: number;
-      outbound_edges: number;
-      cross_file_call_in: number;
-      cross_file_call_out: number;
-      suspicious_api_hits: number;
-      obfuscation_signal_hits: number;
-      function_count: number;
-      exported_symbol_count: number;
-    }>;
-    files_preview?: Array<{
-      path: string;
-      language: string;
-      priority: string[];
-      size_bytes: number;
-    }>;
-  };
+  workspace_context?: WorkspaceContext;
   confidence: {
     overall: number;
     naming: number;
@@ -258,6 +297,35 @@ export interface AISummaryReport {
   confidence_score: number | null;
 }
 
+export interface AnalystChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export type AnalystChatRetrievedFileSource =
+  | 'recovered_bundle'
+  | 'original_bundle'
+  | 'archive_scan';
+
+export interface AnalystChatRetrievedFile {
+  path: string;
+  language: string | null;
+  source: AnalystChatRetrievedFileSource;
+  matched_terms: string[];
+  line_ranges: string[];
+  excerpt_truncated: boolean;
+}
+
+export interface AnalystChatResponse {
+  answer: string;
+  provider_name: string;
+  model_name: string;
+  context_truncated: boolean;
+  workspace_search_enabled: boolean;
+  workspace_file_count: number;
+  retrieved_files: AnalystChatRetrievedFile[];
+}
+
 export interface SavedAnalysisSnapshot {
   saved_at: string | null;
   sample_status: SampleStatus | null;
@@ -268,65 +336,7 @@ export interface SavedAnalysisSnapshot {
   recovered_text_length: number;
   confidence_score: number | null;
   analysis_summary: string;
-  workspace_context: {
-    archive_name?: string;
-    included_files?: number;
-    omitted_files?: number;
-    languages?: string;
-    entry_points?: string[];
-    suspicious_files?: string[];
-    manifest_files?: string[];
-    root_dirs?: string[];
-    prioritized_paths?: string[];
-    dependency_hotspots?: string[];
-    symbol_hotspots?: string[];
-    execution_paths?: string[];
-    local_dependency_count?: number;
-    external_dependency_count?: number;
-    cross_file_call_count?: number;
-    graph_summary?: {
-      local_edges?: number;
-      external_edges?: number;
-      cross_file_calls?: number;
-      execution_paths?: number;
-      hotspots?: string[];
-    };
-    cross_file_call_edges?: Array<{
-      source: string;
-      target: string;
-      symbol: string;
-      count: number;
-      call_style: string;
-    }>;
-    prioritized_files?: Array<{
-      path: string;
-      language: string;
-      score: number;
-      reasons: string[];
-      priority_tags: string[];
-      inbound_edges: number;
-      outbound_edges: number;
-      cross_file_call_in: number;
-      cross_file_call_out: number;
-      suspicious_api_hits: number;
-      obfuscation_signal_hits: number;
-      function_count: number;
-      exported_symbol_count: number;
-    }>;
-    bundle_note?: string;
-    files_preview?: Array<{
-      path: string;
-      language: string;
-      priority: string[];
-      size_bytes: number;
-    }>;
-    recovered_files_preview?: Array<{
-      path: string;
-      language: string;
-      priority: string[];
-      size_bytes: number;
-    }>;
-  };
+  workspace_context: WorkspaceContext;
   ai_summary: AISummaryReport | null;
 }
 

@@ -1091,6 +1091,7 @@ class AnalysisResult:
     stop_reason: str = ""
     elapsed_seconds: float = 0.0
     was_stopped: bool = False
+    fatal_error: Optional[str] = None
 
 
 def _residual_obfuscation_markers(
@@ -4730,6 +4731,7 @@ class Orchestrator:
         stop_reason = "Completed normally."
         iterations_run = 0
         was_stopped = False
+        fatal_error: Optional[str] = None
 
         def _emit(event_type: str, data: dict | None = None) -> None:
             """Emit a typed event to the analysis tracker if a callback is set."""
@@ -5201,9 +5203,17 @@ class Orchestrator:
             else:
                 stop_reason = f"Maximum iterations reached ({max_iterations})."
 
-        except Exception:
+        except Exception as exc:
             logger.exception("Orchestrator encountered an unhandled error")
             stop_reason = "Unhandled error during orchestration."
+            fatal_error = (
+                f"{type(exc).__name__}: {exc}"
+                if str(exc)
+                else type(exc).__name__
+            )
+            if self._state_manager is not None:
+                self._state_manager.set_parse_status("failed")
+                self._state_manager.state.iteration_state["fatal_error"] = fatal_error
 
         # ── Final findings generation ────────────────────────────────
         try:
@@ -5236,7 +5246,7 @@ class Orchestrator:
 
         return AnalysisResult(
             sample_id=self.sample_id,
-            success=True,
+            success=fatal_error is None,
             original_code=self.original_code,
             deobfuscated_code=self._state_manager.current_code,
             language=self._state_manager.state.language or self.language,
@@ -5250,6 +5260,7 @@ class Orchestrator:
             stop_reason=stop_reason,
             elapsed_seconds=elapsed,
             was_stopped=was_stopped,
+            fatal_error=fatal_error,
         )
 
     # ------------------------------------------------------------------

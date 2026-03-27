@@ -229,12 +229,24 @@ const s = {
     color: 'var(--text-primary)',
     fontWeight: 600,
   } as React.CSSProperties,
+  helperText: {
+    marginTop: '8px',
+    fontSize: '11px',
+    color: 'var(--text-muted)',
+    lineHeight: '1.55',
+  } as React.CSSProperties,
 };
 
 function getReadabilityColor(val: number): string {
   if (val >= 0.7) return 'var(--success)';
   if (val >= 0.4) return 'var(--warning)';
   return 'var(--danger)';
+}
+
+function countOrNull(value: number | undefined, fallback: number | undefined): number | null {
+  if (typeof value === 'number') return value;
+  if (typeof fallback === 'number') return fallback;
+  return null;
 }
 
 export default function RightPanel({ sample, analysisState, onRefresh }: RightPanelProps) {
@@ -297,6 +309,26 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
     )
     : [];
   const workspaceExecutionPaths = workspaceContext?.execution_paths ?? [];
+  const indexedFileCount = countOrNull(
+    workspaceContext?.indexed_file_count,
+    workspaceContext?.included_files,
+  );
+  const bundledFileCount = countOrNull(
+    workspaceContext?.bundle_file_count ?? workspaceContext?.bundled_file_count,
+    workspaceContext?.included_files,
+  );
+  const targetedFileCount = countOrNull(
+    workspaceContext?.targeted_file_count,
+    workspaceContext?.targeted_files?.length,
+  );
+  const recoveredFileCount = countOrNull(
+    workspaceContext?.deobfuscated_file_count,
+    workspaceContext?.deobfuscated_files?.length,
+  );
+  const deferredHotspotCount = countOrNull(
+    workspaceContext?.remaining_frontier_paths?.length,
+    undefined,
+  );
   const languageLabel = sample.language === 'workspace' ? 'Workspace Bundle' : (sample.language ?? 'Unknown');
 
   const handleReanalyse = useCallback(async () => {
@@ -402,6 +434,11 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
                 </div>
               </div>
             )}
+            {sample.language === 'workspace' && workspaceContext && (
+              <div style={s.helperText}>
+                Confidence reflects the bundled files and targeted hotspots that were analyzed, not every archived file.
+              </div>
+            )}
           </div>
         )}
 
@@ -447,10 +484,36 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
         {sample.language === 'workspace' && workspaceContext && (
           <div className="unweaver-card" style={s.card}>
             <div style={s.sectionTitle}>Workspace</div>
-            <div style={s.statRow}>
-              <span>Included files</span>
-              <span style={s.statValue}>{workspaceContext.included_files ?? 0}</span>
-            </div>
+            {indexedFileCount !== null && (
+              <div style={s.statRow}>
+                <span>Indexed files</span>
+                <span style={s.statValue}>{indexedFileCount}</span>
+              </div>
+            )}
+            {bundledFileCount !== null && (
+              <div style={s.statRow}>
+                <span>Bundled files</span>
+                <span style={s.statValue}>{bundledFileCount}</span>
+              </div>
+            )}
+            {targetedFileCount !== null && (
+              <div style={s.statRow}>
+                <span>Targeted files</span>
+                <span style={s.statValue}>{targetedFileCount}</span>
+              </div>
+            )}
+            {recoveredFileCount !== null && (
+              <div style={s.statRow}>
+                <span>Recovered files</span>
+                <span style={s.statValue}>{recoveredFileCount}</span>
+              </div>
+            )}
+            {deferredHotspotCount !== null && (
+              <div style={s.statRow}>
+                <span>Deferred hotspots</span>
+                <span style={s.statValue}>{deferredHotspotCount}</span>
+              </div>
+            )}
             {'omitted_files' in workspaceContext && (
               <div style={s.statRow}>
                 <span>Omitted files</span>

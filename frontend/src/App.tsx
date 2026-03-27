@@ -1,11 +1,12 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import type { AnalysisState } from '@/types';
-import { useSample, useAnalysisStatus, loadPersistedState, savePersistedState } from '@/hooks/useApi';
+import type { AnalysisState, Project } from '@/types';
+import { useProjects, useSample, useAnalysisStatus, loadPersistedState, savePersistedState } from '@/hooks/useApi';
 import { useToast } from '@/components/common/Toast';
 import * as api from '@/services/api';
 import Sidebar from '@/components/layout/Sidebar';
 import TopBar from '@/components/layout/TopBar';
 import RightPanel from '@/components/layout/RightPanel';
+import AnalystChat from '@/components/layout/AnalystChat';
 import WorkspaceTabs from '@/components/layout/WorkspaceTabs';
 import ProviderSettingsScreen from '@/components/settings/ProviderSettings';
 import traceAtlasGraphic from '@/assets/graphics/trace-atlas.svg';
@@ -188,6 +189,11 @@ export default function App() {
   const [analysisState, setAnalysisState] = useState<AnalysisState | null>(null);
 
   const toast = useToast();
+  const {
+    projects,
+    create: createProject,
+    remove: removeProject,
+  } = useProjects();
 
   // Local flag: set to true immediately when user clicks "Analyse"
   // so polling starts before the sample refetch completes.
@@ -335,14 +341,25 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [selectedSampleId, isRunning, handleStartAnalysis]);
 
+  const getNextProjectAfterDelete = useCallback((id: string): Project | null => {
+    const currentIndex = projects.findIndex((project) => project.id === id);
+    const remaining = projects.filter((project) => project.id !== id);
+    if (remaining.length === 0) return null;
+    if (currentIndex < 0) return remaining[0];
+    return remaining[currentIndex] ?? remaining[currentIndex - 1] ?? remaining[0] ?? null;
+  }, [projects]);
+
   // ── Callbacks for sidebar delete actions ────────────────────────────
   const handleDeleteProject = useCallback((id: string) => {
     if (selectedProjectId === id) {
-      setSelectedProjectId(null);
+      const nextProject = getNextProjectAfterDelete(id);
+      setSelectedProjectId(nextProject?.id ?? null);
       setSelectedSampleId(null);
       setAnalysisState(null);
+      setAnalysisActive(false);
+      setView('workspace');
     }
-  }, [selectedProjectId]);
+  }, [selectedProjectId, getNextProjectAfterDelete]);
 
   const handleDeleteSample = useCallback((id: string) => {
     if (selectedSampleId === id) {
@@ -354,6 +371,9 @@ export default function App() {
   return (
     <div style={styles.container}>
       <Sidebar
+        projects={projects}
+        createProject={createProject}
+        removeProject={removeProject}
         selectedProjectId={selectedProjectId}
         selectedSampleId={selectedSampleId}
         onSelectProject={handleSelectProject}
@@ -368,6 +388,9 @@ export default function App() {
         ) : (
           <>
             <TopBar
+              projects={projects}
+              selectedProjectId={selectedProjectId}
+              onSelectProject={handleSelectProject}
               sample={sample ?? null}
               analysisStatus={analysisStatus}
               onStartAnalysis={handleStartAnalysis}
@@ -434,6 +457,7 @@ export default function App() {
                   onRefresh={refetchSample}
                 />
               )}
+              <AnalystChat sample={sample ?? null} />
             </div>
           </>
         )}

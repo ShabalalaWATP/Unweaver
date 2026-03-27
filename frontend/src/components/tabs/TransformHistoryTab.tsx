@@ -199,7 +199,44 @@ const s = {
     fontSize: '12px',
     gap: '8px',
   } as React.CSSProperties,
+  codePanelMeta: {
+    padding: '8px 12px',
+    borderBottom: '1px solid var(--border)',
+    background: 'var(--bg-secondary)',
+    fontSize: '11px',
+    color: 'var(--text-muted)',
+    lineHeight: '1.5',
+  } as React.CSSProperties,
 };
+
+function formatSnapshotTimestamp(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('en-GB');
+}
+
+function buildSnapshotNote(snapshot: IterationSnapshot | undefined, usedFallback: boolean): string | null {
+  if (!snapshot) {
+    return 'No persisted snapshot was found for this iteration.';
+  }
+  if (usedFallback) {
+    return 'No code snapshot was stored for this iteration. Showing the persisted state payload instead.';
+  }
+
+  const capturedAt = formatSnapshotTimestamp(snapshot.snapshot_meta?.captured_at);
+  if (snapshot.snapshot_meta?.code_truncated) {
+    const shownLength = typeof snapshot.code_snapshot === 'string' ? snapshot.code_snapshot.length : null;
+    const fullLength = snapshot.snapshot_meta?.code_length;
+    const truncation = shownLength !== null && typeof fullLength === 'number'
+      ? `Snapshot truncated to ${shownLength.toLocaleString()} of ${fullLength.toLocaleString()} characters.`
+      : 'Snapshot truncated for storage.';
+    return capturedAt ? `${truncation} Captured ${capturedAt}.` : truncation;
+  }
+  if (capturedAt) {
+    return `Snapshot captured ${capturedAt}.`;
+  }
+  return null;
+}
 
 function MetricChange({ before, after, label }: { before: number; after: number; label: string }) {
   const delta = after - before;
@@ -224,6 +261,7 @@ export default function TransformHistoryTab({ sampleId, analysisState }: Transfo
   const [expandedSet, setExpandedSet] = useState<Set<number>>(new Set());
   const [viewingIteration, setViewingIteration] = useState<number | null>(null);
   const [iterationCode, setIterationCode] = useState<string | null>(null);
+  const [iterationCodeNote, setIterationCodeNote] = useState<string | null>(null);
   const [loadingCode, setLoadingCode] = useState(false);
   const [iterationSnapshots, setIterationSnapshots] = useState<IterationSnapshot[] | null>(null);
 
@@ -257,34 +295,40 @@ export default function TransformHistoryTab({ sampleId, analysisState }: Transfo
   const handleViewCode = useCallback(async (iteration: number) => {
     if (viewingIteration === iteration) {
       setViewingIteration(null);
+      setIterationCodeNote(null);
       return;
     }
 
     setViewingIteration(iteration);
     setLoadingCode(true);
     setIterationCode(null);
+    setIterationCodeNote(null);
 
     try {
       const snapshots = await fetchSnapshots();
       // Find the snapshot matching this iteration
       const snap = snapshots.find((s) => s.iteration_number === iteration);
-      if (snap?.state_json) {
-        // Look for recovered code in the state
-        const state = snap.state_json as unknown as Record<string, unknown>;
-        const code = (state['current_code'] as string | undefined)
-          ?? (state['recovered_code'] as string | undefined)
-          ?? null;
-        if (code) {
-          setIterationCode(code);
-        } else {
-          // Try to reconstruct from analysis_summary or transform outputs
-          setIterationCode(`// Iteration ${iteration} state snapshot\n// No recovered code captured at this iteration.\n\n${JSON.stringify(state, null, 2)}`);
-        }
+      const state = api.parseIterationState(snap?.state_json);
+      const code = typeof snap?.code_snapshot === 'string' && snap.code_snapshot.length > 0
+        ? snap.code_snapshot
+        : null;
+      if (code) {
+        setIterationCode(code);
+        setIterationCodeNote(buildSnapshotNote(snap, false));
+      } else if (state) {
+        setIterationCode(
+          `// Iteration ${iteration} state snapshot\n`
+          + '// No code snapshot was captured at this iteration.\n\n'
+          + `${JSON.stringify(state, null, 2)}`,
+        );
+        setIterationCodeNote(buildSnapshotNote(snap, true));
       } else {
         setIterationCode(`// No snapshot available for iteration ${iteration}`);
+        setIterationCodeNote(buildSnapshotNote(snap, false));
       }
     } catch {
       setIterationCode(`// Failed to load snapshot for iteration ${iteration}`);
+      setIterationCodeNote('Failed to load the persisted iteration snapshot.');
     } finally {
       setLoadingCode(false);
     }
@@ -474,6 +518,11 @@ export default function TransformHistoryTab({ sampleId, analysisState }: Transfo
               <X size={14} />
             </button>
           </div>
+          {iterationCodeNote && (
+            <div style={s.codePanelMeta}>
+              {iterationCodeNote}
+            </div>
+          )}
           <div style={s.codePanelBody as React.CSSProperties}>
             {loadingCode ? (
               <div style={s.loadingCode}>

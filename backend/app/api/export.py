@@ -13,6 +13,7 @@ from fastapi.responses import PlainTextResponse, JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.db_models import (
     FindingRecord,
@@ -24,7 +25,11 @@ from app.models.db_models import (
 )
 from app.services.ingest.workspace_bundle import (
     build_workspace_archive,
+    load_workspace_archive_file_from_path,
+    normalise_workspace_path,
+    parse_workspace_bundle,
     pick_workspace_bundle_text,
+    workspace_bundle_signature,
 )
 from app.services.reports.json_report import generate_json_report
 from app.services.reports.markdown import generate_markdown_report
@@ -143,7 +148,46 @@ async def _gather_report_data(
 
 def _pick_workspace_bundle_text(sample: Sample) -> str | None:
     """Choose the best bundle text available for workspace export."""
-    return pick_workspace_bundle_text(sample.recovered_text, sample.original_text)
+    recovered = sample.recovered_text
+    if recovered:
+        signature = workspace_bundle_signature(recovered)
+        if signature and signature["valid"]:
+            return recovered
+    return pick_workspace_bundle_text(sample.original_text)
+
+
+def _pick_workspace_bundle_for_source(sample: Sample, source: str) -> str | None:
+    """Choose the most appropriate workspace bundle for single-file exports."""
+    if source == "original":
+        return pick_workspace_bundle_text(sample.original_text)
+    return _pick_workspace_bundle_text(sample)
+
+
+def _resolve_workspace_export_file(
+    sample: Sample,
+    *,
+    path: str,
+    source: str,
+) -> tuple[str, str] | None:
+    """Resolve one workspace file from the bundle overlay or original archive."""
+    normalised_path = normalise_workspace_path(path) or path.strip().replace("\\", "/")
+    bundle_text = _pick_workspace_bundle_for_source(sample, source)
+    if bundle_text:
+        for item in parse_workspace_bundle(bundle_text):
+            if item.path == normalised_path:
+                return item.path, item.text
+
+    if sample.content_kind == "archive_bundle" and sample.stored_file_path:
+        archive_file = load_workspace_archive_file_from_path(
+            sample.stored_file_path,
+            member_path=normalised_path,
+            archive_name=sample.filename or None,
+            max_member_bytes=settings.MAX_ARCHIVE_MEMBER_SIZE,
+        )
+        if archive_file is not None:
+            return archive_file.path, archive_file.text
+
+    return None
 
 
 # ── GET /api/samples/{id}/export/deobfuscated ───────────────────────
@@ -167,7 +211,10 @@ async def export_deobfuscated(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="No reconstructed workspace bundle available for export.",
             )
-        archive_bytes = build_workspace_archive(bundle_text)
+        archive_bytes = build_workspace_archive(
+            bundle_text,
+            base_archive_path=sample.stored_file_path if sample.content_kind == "archive_bundle" else None,
+        )
         if original_name.lower().endswith(".zip"):
             download_name = f"deobfuscated_{original_name}"
         else:
@@ -219,30 +266,17 @@ async def export_single_file(
             detail=f"Sample {sample_id} not found",
         )
 
-    bundle_text = sample.recovered_text if source == "recovered" else sample.original_text
-    if not bundle_text:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No bundle text available",
+    resolved = _resolve_workspace_export_file(sample, path=path, source=source)
+    if resolved is not None:
+        resolved_path, content = resolved
+        filename = resolved_path.rsplit("/", 1)[-1] if "/" in resolved_path else resolved_path
+        return Response(
+            content=content,
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
         )
-
-    # Parse the bundle to find the requested file
-    import re
-    file_re = re.compile(
-        r'<<<FILE path="([^"]+)" language="([^"]+)" priority="[^"]*" size=\d+>>>\n'
-        r'([\s\S]*?)\n<<<END FILE>>>',
-    )
-    for match in file_re.finditer(bundle_text):
-        if match.group(1) == path:
-            content = match.group(3)
-            filename = path.rsplit("/", 1)[-1] if "/" in path else path
-            return Response(
-                content=content,
-                media_type="text/plain; charset=utf-8",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                },
-            )
 
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,

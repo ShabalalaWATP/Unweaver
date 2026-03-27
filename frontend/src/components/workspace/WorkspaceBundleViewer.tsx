@@ -197,7 +197,9 @@ function generateFileSummary(
   _language: string,
 ): string | null {
   if (!originalText) return null;
-  if (originalText === recoveredText) return 'No changes — file was already clean.';
+  if (originalText === recoveredText) {
+    return 'No textual changes detected between the bundled original and recovered file.';
+  }
 
   const origLines = originalText.split('\n').length;
   const recLines = recoveredText.split('\n').length;
@@ -231,7 +233,7 @@ function generateFileSummary(
   if (origShortIds > 10 && recShortIds < origShortIds * 0.5) parts.push('Obfuscated identifiers renamed');
 
   if (parts.length === 0 && originalText !== recoveredText) {
-    parts.push('Minor structural cleanup applied');
+    parts.push('Minor structural cleanup detected');
   }
 
   return parts.join('. ') + '.';
@@ -247,6 +249,9 @@ export default function WorkspaceBundleViewer({
 }: WorkspaceBundleViewerProps) {
   const [bundle, setBundle] = useState(() => parseWorkspaceBundle(bundleText));
   const [selectedPath, setSelectedPath] = useState<string | null>(bundle?.files[0]?.path ?? null);
+  const [originalBundle, setOriginalBundle] = useState(() =>
+    accent === 'recovered' && originalBundleText ? parseWorkspaceBundle(originalBundleText) : null,
+  );
 
   useEffect(() => {
     const nextBundle = parseWorkspaceBundle(bundleText);
@@ -260,12 +265,16 @@ export default function WorkspaceBundleViewer({
     });
   }, [bundleText]);
 
+  useEffect(() => {
+    setOriginalBundle(
+      accent === 'recovered' && originalBundleText
+        ? parseWorkspaceBundle(originalBundleText)
+        : null,
+    );
+  }, [accent, originalBundleText]);
+
   const activeFile = bundle?.files.find((file) => file.path === selectedPath) ?? bundle?.files[0] ?? null;
 
-  // Parse original bundle for per-file comparison (recovered mode only)
-  const [originalBundle] = useState(() =>
-    accent === 'recovered' && originalBundleText ? parseWorkspaceBundle(originalBundleText) : null
-  );
   const originalFileMap = originalBundle
     ? Object.fromEntries(originalBundle.files.map((f) => [f.path, f.text]))
     : null;
@@ -421,12 +430,12 @@ export default function WorkspaceBundleViewer({
               activeFile.language,
             );
             if (!summary) return null;
-            const isClean = summary.includes('No changes');
+            const isUnchanged = originalFileMap[activeFile.path] === activeFile.text;
             return (
               <div style={{
                 padding: '10px 16px',
                 borderBottom: '1px solid var(--border)',
-                background: isClean
+                background: isUnchanged
                   ? 'rgba(63,185,80,0.06)'
                   : 'linear-gradient(90deg, rgba(88,166,255,0.08), rgba(88,166,255,0.02))',
                 fontSize: '12px',
@@ -441,13 +450,15 @@ export default function WorkspaceBundleViewer({
                   fontWeight: 700,
                   textTransform: 'uppercase',
                   letterSpacing: '0.08em',
-                  color: isClean ? 'var(--success)' : 'var(--accent)',
+                  color: isUnchanged ? 'var(--success)' : 'var(--accent)',
                   flexShrink: 0,
                   marginTop: '1px',
                 }}>
-                  {isClean ? 'CLEAN' : 'RECOVERED'}
+                  HEURISTIC
                 </span>
-                <span>{summary}</span>
+                <span>
+                  Heuristic diff summary: {summary}
+                </span>
               </div>
             );
           })()}

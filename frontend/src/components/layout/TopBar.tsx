@@ -1,11 +1,14 @@
-import { useState, useCallback } from 'react';
-import { Play, Square, RefreshCw, Download, FileText, FileCode, Loader2 } from 'lucide-react';
-import type { SampleDetail, AnalysisStatus } from '@/types';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { Play, Square, RefreshCw, Download, FileText, FileCode, Loader2, FolderOpen, Search, ChevronDown } from 'lucide-react';
+import type { SampleDetail, AnalysisStatus, Project } from '@/types';
 import StatusBadge from '@/components/common/StatusBadge';
 import * as api from '@/services/api';
 import { parseWorkspaceBundle } from '@/utils/workspaceBundle';
 
 interface TopBarProps {
+  projects: Project[];
+  selectedProjectId: string | null;
+  onSelectProject: (id: string) => void;
   sample: SampleDetail | null;
   analysisStatus: AnalysisStatus | null;
   onStartAnalysis: () => void;
@@ -35,6 +38,108 @@ const s = {
     overflow: 'hidden',
     textOverflow: 'ellipsis',
     whiteSpace: 'nowrap',
+  } as React.CSSProperties,
+  projectButton: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    padding: '6px 10px',
+    borderRadius: '14px',
+    border: '1px solid var(--border)',
+    background: 'rgba(255,255,255,0.04)',
+    color: 'var(--text-secondary)',
+    cursor: 'pointer',
+    transition: 'all var(--transition-fast)',
+    minWidth: 0,
+    maxWidth: 240,
+  } as React.CSSProperties,
+  projectButtonText: {
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    fontSize: '11px',
+    fontWeight: 600,
+    color: 'var(--text-primary)',
+  } as React.CSSProperties,
+  projectSwitcher: {
+    position: 'relative',
+    flexShrink: 0,
+  } as React.CSSProperties,
+  projectMenu: {
+    position: 'absolute',
+    top: 'calc(100% + 10px)',
+    left: 0,
+    width: 320,
+    borderRadius: '18px',
+    border: '1px solid var(--border)',
+    background: 'rgba(17,21,28,0.96)',
+    boxShadow: '0 24px 60px rgba(0, 0, 0, 0.35)',
+    overflow: 'hidden',
+    zIndex: 30,
+    backdropFilter: 'blur(14px) saturate(1.2)',
+    WebkitBackdropFilter: 'blur(14px) saturate(1.2)',
+  } as React.CSSProperties,
+  projectMenuHeader: {
+    padding: '12px',
+    borderBottom: '1px solid var(--border)',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  } as React.CSSProperties,
+  projectMenuLabel: {
+    fontSize: '10px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.12em',
+    color: 'var(--accent-bright)',
+    fontWeight: 700,
+  } as React.CSSProperties,
+  projectSearch: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    borderRadius: '12px',
+    border: '1px solid var(--border)',
+    background: 'var(--bg-tertiary)',
+    padding: '0 10px',
+  } as React.CSSProperties,
+  projectSearchInput: {
+    width: '100%',
+    border: 'none',
+    outline: 'none',
+    background: 'transparent',
+    color: 'var(--text-primary)',
+    padding: '10px 0',
+    fontSize: '12px',
+  } as React.CSSProperties,
+  projectMenuList: {
+    maxHeight: 280,
+    overflowY: 'auto',
+    padding: '8px',
+  } as React.CSSProperties,
+  projectMenuItem: {
+    width: '100%',
+    border: 'none',
+    background: 'transparent',
+    borderRadius: '12px',
+    padding: '10px 12px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    cursor: 'pointer',
+    color: 'var(--text-secondary)',
+    transition: 'all var(--transition-fast)',
+    textAlign: 'left',
+  } as React.CSSProperties,
+  projectMenuItemMeta: {
+    fontSize: '10px',
+    color: 'var(--text-muted)',
+    fontFamily: 'var(--font-mono)',
+  } as React.CSSProperties,
+  projectEmpty: {
+    padding: '16px',
+    fontSize: '12px',
+    color: 'var(--text-muted)',
   } as React.CSSProperties,
   lang: {
     fontSize: '10px',
@@ -159,6 +264,9 @@ const s = {
 };
 
 export default function TopBar({
+  projects,
+  selectedProjectId,
+  onSelectProject,
   sample,
   analysisStatus,
   onStartAnalysis,
@@ -167,10 +275,33 @@ export default function TopBar({
 }: TopBarProps) {
   const [exporting, setExporting] = useState(false);
   const [analyseHover, setAnalyseHover] = useState(false);
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [projectQuery, setProjectQuery] = useState('');
+  const projectMenuRef = useRef<HTMLDivElement | null>(null);
 
   const isRunning = sample?.status === 'running';
   const isPending = sample?.status === 'pending';
   const canStart = sample && !isRunning && !isPending;
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.id === selectedProjectId) ?? null,
+    [projects, selectedProjectId],
+  );
+  const filteredProjects = useMemo(() => {
+    const query = projectQuery.trim().toLowerCase();
+    if (!query) return projects;
+    return projects.filter((project) => project.name.toLowerCase().includes(query));
+  }, [projects, projectQuery]);
+
+  useEffect(() => {
+    if (!projectMenuOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!projectMenuRef.current?.contains(event.target as Node)) {
+        setProjectMenuOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', handlePointerDown);
+    return () => window.removeEventListener('mousedown', handlePointerDown);
+  }, [projectMenuOpen]);
 
   const handleExportMd = useCallback(async () => {
     if (!sample) return;
@@ -230,11 +361,110 @@ export default function TopBar({
     }
   }, [sample]);
 
+  const handleSelectProjectFromMenu = useCallback((id: string) => {
+    onSelectProject(id);
+    setProjectMenuOpen(false);
+    setProjectQuery('');
+  }, [onSelectProject]);
+
+  const projectSwitcher = (
+    <div style={s.projectSwitcher} ref={projectMenuRef}>
+      <button
+        type="button"
+        style={s.projectButton}
+        onClick={() => setProjectMenuOpen((open) => !open)}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.borderColor = 'var(--accent-border)';
+          e.currentTarget.style.background = 'var(--accent-muted)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.borderColor = 'var(--border)';
+          e.currentTarget.style.background = 'rgba(255,255,255,0.04)';
+        }}
+      >
+        <FolderOpen size={13} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+        <span style={s.projectButtonText}>
+          {selectedProject?.name ?? 'Switch Project'}
+        </span>
+        <ChevronDown
+          size={12}
+          style={{
+            color: 'var(--text-muted)',
+            flexShrink: 0,
+            transform: projectMenuOpen ? 'rotate(180deg)' : 'none',
+            transition: 'transform 0.2s ease',
+          }}
+        />
+      </button>
+      {projectMenuOpen && (
+        <div style={s.projectMenu}>
+          <div style={s.projectMenuHeader}>
+            <div style={s.projectMenuLabel}>Project Switcher</div>
+            <div style={s.projectSearch}>
+              <Search size={13} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+              <input
+                style={s.projectSearchInput}
+                value={projectQuery}
+                onChange={(e) => setProjectQuery(e.target.value)}
+                placeholder="Search projects..."
+                autoFocus
+              />
+            </div>
+          </div>
+          <div style={s.projectMenuList}>
+            {filteredProjects.length > 0 ? (
+              filteredProjects.map((project) => {
+                const active = project.id === selectedProjectId;
+                return (
+                  <button
+                    key={project.id}
+                    type="button"
+                    style={{
+                      ...s.projectMenuItem,
+                      ...(active ? { background: 'var(--accent-muted)', color: 'var(--text-primary)' } : {}),
+                    }}
+                    onClick={() => handleSelectProjectFromMenu(project.id)}
+                    onMouseEnter={(e) => {
+                      if (!active) {
+                        e.currentTarget.style.background = 'var(--bg-hover)';
+                        e.currentTarget.style.color = 'var(--text-primary)';
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!active) {
+                        e.currentTarget.style.background = 'transparent';
+                        e.currentTarget.style.color = 'var(--text-secondary)';
+                      }
+                    }}
+                  >
+                    <FolderOpen size={13} style={{ color: active ? 'var(--accent)' : 'var(--text-muted)', flexShrink: 0 }} />
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <span style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '12px', fontWeight: 600 }}>
+                        {project.name}
+                      </span>
+                      <span style={s.projectMenuItemMeta}>
+                        {active ? 'Current project' : 'Open project'}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })
+            ) : (
+              <div style={s.projectEmpty}>No projects match that search.</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
   if (!sample) {
     return (
       <div className="unweaver-glass-bar" style={s.emptyBar}>
+        {projectSwitcher}
+        <div style={s.separator} />
         <span style={{ color: 'var(--text-muted)', fontSize: '12px', fontStyle: 'italic' }}>
-          Select a sample to begin
+          {selectedProject ? 'Select a sample to begin' : 'Select or create a project to begin'}
         </span>
       </div>
     );
@@ -248,6 +478,8 @@ export default function TopBar({
 
   return (
     <div className="unweaver-glass-bar" style={s.root}>
+      {projectSwitcher}
+      <div style={s.separator} />
       <span style={s.title}>{sample.filename}</span>
       {languageLabel && <span style={s.lang}>{languageLabel}</span>}
       {sample.language === 'workspace' && typeof workspaceFileCount === 'number' && (

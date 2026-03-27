@@ -858,6 +858,28 @@ class TestOrchestratorStopRequests:
         )
         assert "\n" in result.deobfuscated_code
 
+    @pytest.mark.asyncio
+    async def test_run_marks_unhandled_errors_as_failures(self, monkeypatch: pytest.MonkeyPatch):
+        def _explode(self):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(StateManager, "advance_iteration", _explode)
+
+        orchestrator = Orchestrator(
+            sample_id="fatal-error-test",
+            original_code="var payload = atob('aGVsbG8=');",
+            language="javascript",
+        )
+
+        result = await orchestrator.run(max_iterations=2)
+
+        assert result.success is False
+        assert result.stop_reason == "Unhandled error during orchestration."
+        assert result.fatal_error == "RuntimeError: boom"
+        assert result.state.parse_status == "failed"
+        assert result.state.iteration_state["fatal_error"] == "RuntimeError: boom"
+        assert result.was_stopped is False
+
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import zipfile
+from types import SimpleNamespace
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.samples import _build_workspace_search_space, _normalise_chat_source_tags
+from app.core.config import settings
+from tests.dotnet_test_utils import build_test_dotnet_assembly
 from app.models.db_models import IterationState, Sample
 
 
@@ -195,6 +200,47 @@ class TestSampleUpload:
         assert data["status"] == "ready"
 
     @pytest.mark.asyncio
+    async def test_upload_dotnet_binary_sample(self, client: AsyncClient):
+        if shutil.which("dotnet") is None:
+            pytest.skip("dotnet unavailable")
+
+        proj_resp = await client.post(
+            "/api/projects",
+            json={"name": "Binary Upload Test"},
+        )
+        project_id = proj_resp.json()["id"]
+        assembly = build_test_dotnet_assembly(
+            """
+            namespace Sample;
+            public class Loader
+            {
+                public static string Beacon()
+                {
+                    return "http://evil.test/a";
+                }
+            }
+            """,
+            "UploadedBinaryAssembly",
+        )
+
+        response = await client.post(
+            f"/api/projects/{project_id}/samples/upload",
+            files={"file": ("payload.dll", io.BytesIO(assembly), "application/octet-stream")},
+        )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["language"] == "dotnet"
+        assert data["content_kind"] == "dotnet_binary"
+        assert data["byte_size"] == len(assembly)
+
+        detail = await client.get(f"/api/samples/{data['id']}")
+        assert detail.status_code == 200
+        payload = detail.json()
+        assert payload["content_kind"] == "dotnet_binary"
+        assert "Binary sample uploaded: payload.dll" in payload["original_text"]
+
+    @pytest.mark.asyncio
     async def test_upload_empty_file_rejected(self, client: AsyncClient):
         """Uploading an empty file should return 400."""
         proj_resp = await client.post(
@@ -349,6 +395,104 @@ class TestSampleUpload:
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
             assert "apps/web/src/main.tsx" in archive.namelist()
             assert "packages/api/src/index.ts" in archive.namelist()
+
+    @pytest.mark.asyncio
+    async def test_export_workspace_merges_recovered_bundle_over_original_archive(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+    ):
+        proj_resp = await client.post("/api/projects", json={"name": "Workspace Merge Export Test"})
+        project_id = proj_resp.json()["id"]
+
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, mode="w") as archive:
+            archive.writestr("apps/web/src/main.tsx", "console.log('original');\n")
+            archive.writestr("packages/api/src/index.ts", "export const ok = true;\n")
+
+        upload = await client.post(
+            f"/api/projects/{project_id}/samples/upload",
+            files={"file": ("repo.zip", io.BytesIO(archive_bytes.getvalue()), "application/zip")},
+        )
+        sample_id = upload.json()["id"]
+
+        sample = await db_session.get(Sample, sample_id)
+        assert sample is not None
+        sample.recovered_text = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 1\n"
+            "omitted_files: 1\n"
+            "languages: typescript=1\n"
+            "entry_points: apps/web/src/main.tsx\n"
+            "suspicious_files: none\n"
+            "manifest_files: none\n"
+            "root_dirs: apps | packages\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="apps/web/src/main.tsx" language="typescript" priority="entrypoint" size=29>>>\n'
+            "console.log('recovered');\n"
+            "<<<END FILE>>>\n"
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/samples/{sample_id}/export/deobfuscated")
+        assert response.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            assert archive.read("apps/web/src/main.tsx").decode() == "console.log('recovered');"
+            assert archive.read("packages/api/src/index.ts").decode() == "export const ok = true;\n"
+
+    @pytest.mark.asyncio
+    async def test_export_workspace_file_falls_back_to_archive_for_omitted_paths(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+    ):
+        proj_resp = await client.post("/api/projects", json={"name": "Workspace Single File Export Test"})
+        project_id = proj_resp.json()["id"]
+
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, mode="w") as archive:
+            archive.writestr("apps/web/src/main.tsx", "console.log('original');\n")
+            archive.writestr("packages/api/src/index.ts", "export const ok = true;\n")
+
+        upload = await client.post(
+            f"/api/projects/{project_id}/samples/upload",
+            files={"file": ("repo.zip", io.BytesIO(archive_bytes.getvalue()), "application/zip")},
+        )
+        sample_id = upload.json()["id"]
+
+        sample = await db_session.get(Sample, sample_id)
+        assert sample is not None
+        sample.recovered_text = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 1\n"
+            "omitted_files: 1\n"
+            "languages: typescript=1\n"
+            "entry_points: apps/web/src/main.tsx\n"
+            "suspicious_files: none\n"
+            "manifest_files: none\n"
+            "root_dirs: apps | packages\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="apps/web/src/main.tsx" language="typescript" priority="entrypoint" size=29>>>\n'
+            "console.log('recovered');\n"
+            "<<<END FILE>>>\n"
+        )
+        await db_session.commit()
+
+        recovered = await client.get(
+            f"/api/samples/{sample_id}/export/file",
+            params={"path": "apps/web/src/main.tsx", "source": "recovered"},
+        )
+        assert recovered.status_code == 200
+        assert recovered.text == "console.log('recovered');"
+
+        omitted = await client.get(
+            f"/api/samples/{sample_id}/export/file",
+            params={"path": "packages/api/src/index.ts", "source": "recovered"},
+        )
+        assert omitted.status_code == 200
+        assert omitted.text == "export const ok = true;\n"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -638,6 +782,46 @@ class TestSampleSubResources:
         assert "transforms" in response.json()
 
     @pytest.mark.asyncio
+    async def test_get_iterations_exposes_code_snapshots(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+    ):
+        sample_id = await self._create_sample(client)
+        db_session.add(
+            IterationState(
+                sample_id=sample_id,
+                iteration_number=2,
+                state_json=json.dumps(
+                    {
+                        "confidence": {"overall": 0.73},
+                        "analysis_summary": "Recovered the primary payload.",
+                        "_code_snapshot": "console.log('decoded');",
+                        "_snapshot_meta": {
+                            "captured_at": "2026-03-27T10:00:00+00:00",
+                            "code_length": 247,
+                            "code_truncated": False,
+                        },
+                    }
+                ),
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/samples/{sample_id}/iterations")
+        assert response.status_code == 200
+        payload = response.json()
+
+        assert payload["count"] == 1
+        snapshot = payload["iterations"][0]
+        assert snapshot["iteration_number"] == 2
+        assert snapshot["code_snapshot"] == "console.log('decoded');"
+        assert snapshot["snapshot_meta"]["code_length"] == 247
+        assert snapshot["snapshot_meta"]["code_truncated"] is False
+        assert "_code_snapshot" not in snapshot["state_json"]
+        assert "_snapshot_meta" not in snapshot["state_json"]
+
+    @pytest.mark.asyncio
     async def test_generate_summary_returns_structured_sections(self, client: AsyncClient):
         sample_id = await self._create_sample(client)
         response = await client.post(f"/api/samples/{sample_id}/summary")
@@ -653,3 +837,350 @@ class TestSampleSubResources:
         detail = await client.get(f"/api/samples/{sample_id}")
         assert detail.status_code == 200
         assert detail.json()["saved_analysis"]["ai_summary"]["summary"] == payload["summary"]
+
+    def test_workspace_search_space_keeps_original_and_recovered_variants_for_same_path(self):
+        sample = Sample(
+            project_id="project-1",
+            filename="repo.zip",
+            content_kind="archive_bundle",
+        )
+        original_bundle = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 1\n"
+            "omitted_files: 0\n"
+            "languages: typescript=1\n"
+            "entry_points: apps/web/src/main.tsx\n"
+            "suspicious_files: none\n"
+            "manifest_files: none\n"
+            "root_dirs: apps\n"
+            "bundle_note: test bundle.\n\n"
+            '<<<FILE path="apps/web/src/main.tsx" language="typescript" priority="entrypoint" size=24>>>\n'
+            "console.log('original');\n"
+            "<<<END FILE>>>\n"
+        )
+        recovered_bundle = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 1\n"
+            "omitted_files: 0\n"
+            "languages: typescript=1\n"
+            "entry_points: apps/web/src/main.tsx\n"
+            "suspicious_files: none\n"
+            "manifest_files: none\n"
+            "root_dirs: apps\n"
+            "bundle_note: recovered bundle.\n\n"
+            '<<<FILE path="apps/web/src/main.tsx" language="typescript" priority="entrypoint" size=25>>>\n'
+            "console.log('recovered');\n"
+            "<<<END FILE>>>\n"
+        )
+
+        candidates = _build_workspace_search_space(
+            sample=sample,
+            original_text=original_bundle,
+            recovered_text=recovered_bundle,
+        )
+
+        matching = [item for item in candidates if item["path"] == "apps/web/src/main.tsx"]
+        assert len(matching) == 2
+        assert {item["source"] for item in matching} == {"original_bundle", "recovered_bundle"}
+        assert {item["text"] for item in matching} == {
+            "console.log('original');",
+            "console.log('recovered');",
+        }
+
+    def test_workspace_search_space_respects_archive_scan_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: pytest.TempPathFactory,
+    ):
+        archive_path = tmp_path / "repo.zip"
+        archive_path.write_bytes(b"placeholder")
+
+        captured: dict[str, object] = {}
+
+        def fake_load_workspace_archive_from_path(
+            path, *, archive_name, max_member_bytes, max_scan_files
+        ):  # type: ignore[no-untyped-def]
+            captured["path"] = path
+            captured["archive_name"] = archive_name
+            captured["max_member_bytes"] = max_member_bytes
+            captured["max_scan_files"] = max_scan_files
+            return SimpleNamespace(files=[])
+
+        monkeypatch.setattr(
+            "app.api.samples.load_workspace_archive_from_path",
+            fake_load_workspace_archive_from_path,
+        )
+
+        sample = Sample(
+            project_id="project-1",
+            filename="repo.zip",
+            content_kind="archive_bundle",
+            stored_file_path=str(archive_path),
+        )
+
+        _build_workspace_search_space(
+            sample=sample,
+            original_text="",
+            recovered_text="",
+        )
+
+        assert captured["path"] == str(archive_path)
+        assert captured["archive_name"] == "repo.zip"
+        assert captured["max_member_bytes"] == settings.MAX_ARCHIVE_MEMBER_SIZE
+        assert captured["max_scan_files"] == settings.MAX_ARCHIVE_SCAN_FILES
+
+    def test_normalise_chat_source_tags_preserves_code_blocks(self):
+        reply = (
+            "Recovered behavior still calls eval.\n\n"
+            "```javascript\n"
+            "console.log('ok');\n"
+            "```\n"
+        )
+
+        tagged = _normalise_chat_source_tags(reply, retrieved_files=[])
+
+        assert "Recovered behavior still calls eval. [recovered]" in tagged
+        assert "```javascript" in tagged
+        assert "console.log('ok');" in tagged
+        assert "console.log('ok'); [recovered]" not in tagged
+
+    @pytest.mark.asyncio
+    async def test_chat_endpoint_uses_sample_context(self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch):
+        sample_id = await self._create_sample(client)
+        await client.post(
+            "/api/providers",
+            json={
+                "name": "chat-provider",
+                "base_url": "http://localhost:11434",
+                "model_name": "chat-model",
+            },
+        )
+
+        captured: dict[str, object] = {}
+
+        async def fake_chat(self, messages, temperature=0.3, max_tokens=None):  # type: ignore[no-untyped-def]
+            captured["messages"] = messages
+            return "<think>hidden</think>Recovered answer.\n\n```javascript\nconsole.log('ok');\n```"
+
+        monkeypatch.setattr("app.api.samples.LLMClient.chat", fake_chat)
+
+        response = await client.post(
+            f"/api/samples/{sample_id}/chat",
+            json={
+                "messages": [
+                    {"role": "user", "content": "What changed in the recovered output?"}
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["provider_name"] == "chat-provider"
+        assert payload["model_name"] == "chat-model"
+        assert "<think>" not in payload["answer"]
+        assert "Recovered answer" in payload["answer"]
+        assert "[recovered]" in payload["answer"]
+        assert payload["workspace_search_enabled"] is False
+        assert payload["workspace_file_count"] == 0
+        assert payload["retrieved_files"] == []
+        prompt_messages = captured["messages"]
+        assert isinstance(prompt_messages, list)
+        assert any("Original code" in message["content"] for message in prompt_messages if isinstance(message, dict))
+        assert any("Recovered code" in message["content"] for message in prompt_messages if isinstance(message, dict))
+        assert any(
+            "cite the source inline" in message["content"]
+            for message in prompt_messages
+            if isinstance(message, dict)
+        )
+        assert any(
+            "Source tag guide" in message["content"]
+            for message in prompt_messages
+            if isinstance(message, dict)
+        )
+
+    @pytest.mark.asyncio
+    async def test_chat_endpoint_retrieves_workspace_file_context(
+        self,
+        client: AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        project = await client.post("/api/projects", json={"name": "Workspace Chat Test"})
+        project_id = project.json()["id"]
+
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, mode="w") as archive:
+            archive.writestr(
+                "apps/web/src/main.tsx",
+                (
+                    "import { decode } from '../../../packages/api/src/decode';\n"
+                    "const token = 'Y29uc29sZS5sb2coJ2hpJyk=';\n"
+                    "const payload = decode(token);\n"
+                    "console.log(payload);\n"
+                ),
+            )
+            archive.writestr(
+                "packages/api/src/decode.ts",
+                (
+                    "export function decode(x: string) {\n"
+                    "  return eval(atob(x));\n"
+                    "}\n"
+                ),
+            )
+            archive.writestr(
+                "packages/api/src/helper.ts",
+                "export const stable = true;\n",
+            )
+
+        upload = await client.post(
+            f"/api/projects/{project_id}/samples/upload",
+            files={"file": ("repo.zip", io.BytesIO(archive_bytes.getvalue()), "application/zip")},
+        )
+        assert upload.status_code == 201
+        sample_id = upload.json()["id"]
+
+        await client.post(
+            "/api/providers",
+            json={
+                "name": "workspace-chat-provider",
+                "base_url": "http://localhost:11434",
+                "model_name": "chat-model",
+            },
+        )
+
+        captured: dict[str, object] = {}
+
+        async def fake_chat(self, messages, temperature=0.3, max_tokens=None):  # type: ignore[no-untyped-def]
+            captured["messages"] = messages
+            return "Workspace answer"
+
+        monkeypatch.setattr("app.api.samples.LLMClient.chat", fake_chat)
+
+        response = await client.post(
+            f"/api/samples/{sample_id}/chat",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Explain what packages/api/src/decode.ts does and how apps/web/src/main.tsx uses it.",
+                    }
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["workspace_search_enabled"] is True
+        assert payload["workspace_file_count"] >= 3
+        retrieved_paths = [item["path"] for item in payload["retrieved_files"]]
+        assert "packages/api/src/decode.ts" in retrieved_paths
+        assert "apps/web/src/main.tsx" in retrieved_paths
+        assert any(item["source"] == "original_bundle" for item in payload["retrieved_files"])
+        assert "[analysis]" in payload["answer"]
+
+        prompt_messages = captured["messages"]
+        assert isinstance(prompt_messages, list)
+        assert any(
+            "Retrieved workspace file excerpts" in message["content"]
+            for message in prompt_messages
+            if isinstance(message, dict)
+        )
+        assert any(
+            "Source tag: [retrieved:original:packages/api/src/decode.ts]" in message["content"]
+            for message in prompt_messages
+            if isinstance(message, dict)
+        )
+        assert any(
+            "packages/api/src/decode.ts" in message["content"] and "return eval(atob(x));" in message["content"]
+            for message in prompt_messages
+            if isinstance(message, dict)
+        )
+
+    @pytest.mark.asyncio
+    async def test_chat_endpoint_retrieves_original_and_recovered_versions_of_same_path(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        project = await client.post("/api/projects", json={"name": "Workspace Compare Test"})
+        project_id = project.json()["id"]
+
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, mode="w") as archive:
+            archive.writestr("apps/web/src/main.tsx", "console.log('original');\n")
+
+        upload = await client.post(
+            f"/api/projects/{project_id}/samples/upload",
+            files={"file": ("repo.zip", io.BytesIO(archive_bytes.getvalue()), "application/zip")},
+        )
+        assert upload.status_code == 201
+        sample_id = upload.json()["id"]
+
+        sample = await db_session.get(Sample, sample_id)
+        assert sample is not None
+        sample.recovered_text = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 1\n"
+            "omitted_files: 0\n"
+            "languages: typescript=1\n"
+            "entry_points: apps/web/src/main.tsx\n"
+            "suspicious_files: none\n"
+            "manifest_files: none\n"
+            "root_dirs: apps\n"
+            "bundle_note: recovered output.\n\n"
+            '<<<FILE path="apps/web/src/main.tsx" language="typescript" priority="entrypoint" size=25>>>\n'
+            "console.log('recovered');\n"
+            "<<<END FILE>>>\n"
+        )
+        await db_session.commit()
+
+        await client.post(
+            "/api/providers",
+            json={
+                "name": "workspace-compare-provider",
+                "base_url": "http://localhost:11434",
+                "model_name": "chat-model",
+            },
+        )
+
+        captured: dict[str, object] = {}
+
+        async def fake_chat(self, messages, temperature=0.3, max_tokens=None):  # type: ignore[no-untyped-def]
+            captured["messages"] = messages
+            return "The recovered file changes the logged string."
+
+        monkeypatch.setattr("app.api.samples.LLMClient.chat", fake_chat)
+
+        response = await client.post(
+            f"/api/samples/{sample_id}/chat",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Compare the original and recovered versions of apps/web/src/main.tsx.",
+                    }
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        matching = [item for item in payload["retrieved_files"] if item["path"] == "apps/web/src/main.tsx"]
+        assert len(matching) == 2
+        assert {item["source"] for item in matching} == {"original_bundle", "recovered_bundle"}
+
+        prompt_messages = captured["messages"]
+        assert isinstance(prompt_messages, list)
+        assert any(
+            "Source tag: [retrieved:original:apps/web/src/main.tsx]" in message["content"]
+            for message in prompt_messages
+            if isinstance(message, dict)
+        )
+        assert any(
+            "Source tag: [retrieved:recovered:apps/web/src/main.tsx]" in message["content"]
+            for message in prompt_messages
+            if isinstance(message, dict)
+        )

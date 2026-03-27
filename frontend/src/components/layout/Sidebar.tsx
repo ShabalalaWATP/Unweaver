@@ -1,14 +1,19 @@
-import { useState, useCallback, useRef } from 'react';
-import { FolderPlus, Upload, ClipboardPaste, Settings, ChevronRight, File, Folder, Sparkles, Trash2, Sun, Moon } from 'lucide-react';
-import { useProjects, useSamples } from '@/hooks/useApi';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { FolderPlus, Upload, ClipboardPaste, Settings, ChevronRight, File, Folder, Sparkles, Trash2, Sun, Moon, MoreHorizontal, AlertTriangle } from 'lucide-react';
+import { useSamples } from '@/hooks/useApi';
 import { useToast } from '@/components/common/Toast';
 import { useTheme } from '@/contexts/ThemeContext';
 import FileUpload from '@/components/common/FileUpload';
 import PasteInput from '@/components/common/PasteInput';
 import { formatDate, truncate } from '@/utils/format';
 import controlRailGraphic from '@/assets/graphics/control-rail.svg';
+import type { Project, SampleStatus } from '@/types';
+import * as api from '@/services/api';
 
 interface SidebarProps {
+  projects: Project[];
+  createProject: (name: string, description?: string) => Promise<Project>;
+  removeProject: (id: string) => Promise<void>;
   selectedProjectId: string | null;
   selectedSampleId: string | null;
   onSelectProject: (id: string) => void;
@@ -23,6 +28,18 @@ type WorkspaceArchiveFile = File & {
   unweaverSourceName?: string;
   unweaverSourceFileCount?: number;
 };
+
+type ProjectSort = 'recent' | 'alpha' | 'samples';
+type SampleFilter = 'all' | SampleStatus | 'saved';
+
+type ProjectStats = {
+  sampleCount: number;
+  lastActivity: string | null;
+  runningCount: number;
+  savedCount: number;
+};
+
+const ARCHIVED_PROJECTS_KEY = 'unweaver-archived-projects';
 
 const s = {
   root: {
@@ -154,6 +171,38 @@ const s = {
     alignItems: 'center',
     justifyContent: 'space-between',
   } as React.CSSProperties,
+  sectionControls: {
+    padding: '0 12px 10px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  } as React.CSSProperties,
+  searchInput: {
+    width: '100%',
+    padding: '8px 10px',
+    fontSize: '12px',
+    background: 'var(--bg-primary)',
+    border: '1px solid var(--border)',
+    borderRadius: '12px',
+    color: 'var(--text-primary)',
+    outline: 'none',
+  } as React.CSSProperties,
+  segmentedRow: {
+    display: 'flex',
+    gap: '6px',
+    flexWrap: 'wrap',
+  } as React.CSSProperties,
+  segmentedBtn: {
+    padding: '5px 8px',
+    fontSize: '10px',
+    fontWeight: 600,
+    borderRadius: '999px',
+    border: '1px solid var(--border)',
+    background: 'var(--bg-tertiary)',
+    color: 'var(--text-secondary)',
+    cursor: 'pointer',
+    transition: 'all 0.15s ease',
+  } as React.CSSProperties,
   list: {
     flex: 1,
     overflowY: 'auto',
@@ -198,6 +247,54 @@ const s = {
     opacity: 0,
     marginLeft: 'auto',
     flexShrink: 0,
+  } as React.CSSProperties,
+  menuBtn: {
+    padding: '4px',
+    borderRadius: '10px',
+    color: 'var(--text-muted)',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    transition: 'all 0.15s',
+    flexShrink: 0,
+    border: 'none',
+    background: 'transparent',
+  } as React.CSSProperties,
+  rowActions: {
+    marginLeft: 'auto',
+    position: 'relative',
+    display: 'flex',
+    alignItems: 'center',
+    flexShrink: 0,
+  } as React.CSSProperties,
+  actionMenu: {
+    position: 'absolute',
+    top: 'calc(100% + 6px)',
+    right: 0,
+    width: 168,
+    padding: '6px',
+    borderRadius: '14px',
+    border: '1px solid var(--border)',
+    background: 'rgba(17,21,28,0.96)',
+    boxShadow: '0 20px 40px rgba(0, 0, 0, 0.32)',
+    zIndex: 20,
+    backdropFilter: 'blur(12px) saturate(1.2)',
+    WebkitBackdropFilter: 'blur(12px) saturate(1.2)',
+  } as React.CSSProperties,
+  actionMenuItem: {
+    width: '100%',
+    padding: '9px 10px',
+    borderRadius: '10px',
+    border: 'none',
+    background: 'transparent',
+    color: 'var(--text-secondary)',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    fontSize: '12px',
+    textAlign: 'left',
+    transition: 'all 0.15s ease',
   } as React.CSSProperties,
   actions: {
     padding: '6px 10px',
@@ -275,6 +372,13 @@ const s = {
     color: 'var(--text-muted)',
     fontFamily: 'var(--font-mono)',
   } as React.CSSProperties,
+  projectMeta: {
+    fontSize: '10px',
+    color: 'var(--text-muted)',
+    fontFamily: 'var(--font-mono)',
+    whiteSpace: 'nowrap',
+    flexShrink: 0,
+  } as React.CSSProperties,
   dropOverlay: {
     position: 'absolute',
     inset: 0,
@@ -291,6 +395,71 @@ const s = {
     pointerEvents: 'none',
     backdropFilter: 'blur(2px)',
   } as React.CSSProperties,
+  confirmOverlay: {
+    position: 'absolute',
+    inset: 0,
+    background: 'var(--overlay-bg)',
+    backdropFilter: 'blur(6px)',
+    WebkitBackdropFilter: 'blur(6px)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 40,
+    padding: '20px',
+  } as React.CSSProperties,
+  confirmModal: {
+    width: '100%',
+    maxWidth: 360,
+    borderRadius: '22px',
+    border: '1px solid var(--border)',
+    background: 'rgba(17,21,28,0.98)',
+    boxShadow: '0 28px 60px rgba(0, 0, 0, 0.35)',
+    overflow: 'hidden',
+  } as React.CSSProperties,
+  confirmHeader: {
+    padding: '16px 18px 12px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    borderBottom: '1px solid var(--border)',
+  } as React.CSSProperties,
+  confirmTitle: {
+    fontSize: '14px',
+    fontWeight: 700,
+    color: 'var(--text-primary)',
+  } as React.CSSProperties,
+  confirmBody: {
+    padding: '16px 18px',
+    fontSize: '12px',
+    lineHeight: '1.6',
+    color: 'var(--text-secondary)',
+  } as React.CSSProperties,
+  confirmActions: {
+    padding: '0 18px 18px',
+    display: 'flex',
+    justifyContent: 'flex-end',
+    gap: '8px',
+  } as React.CSSProperties,
+  confirmCancel: {
+    padding: '8px 12px',
+    borderRadius: '12px',
+    border: '1px solid var(--border)',
+    background: 'var(--bg-tertiary)',
+    color: 'var(--text-secondary)',
+    cursor: 'pointer',
+    fontSize: '12px',
+    fontWeight: 600,
+  } as React.CSSProperties,
+  confirmDelete: {
+    padding: '8px 12px',
+    borderRadius: '12px',
+    border: '1px solid rgba(248,81,73,0.28)',
+    background: 'var(--danger-muted)',
+    color: 'var(--danger)',
+    cursor: 'pointer',
+    fontSize: '12px',
+    fontWeight: 700,
+  } as React.CSSProperties,
 };
 
 const statusColors: Record<string, string> = {
@@ -306,7 +475,29 @@ function isWorkspaceArchiveFile(file: File): file is WorkspaceArchiveFile {
   return (file as WorkspaceArchiveFile).unweaverUploadKind === 'folder-archive';
 }
 
+function loadArchivedProjectIds(): string[] {
+  try {
+    const raw = localStorage.getItem(ARCHIVED_PROJECTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveArchivedProjectIds(ids: string[]) {
+  try {
+    localStorage.setItem(ARCHIVED_PROJECTS_KEY, JSON.stringify(ids));
+  } catch {
+    // ignore storage errors
+  }
+}
+
 export default function Sidebar({
+  projects,
+  createProject,
+  removeProject,
   selectedProjectId,
   selectedSampleId,
   onSelectProject,
@@ -315,7 +506,6 @@ export default function Sidebar({
   onDeleteProject,
   onDeleteSample,
 }: SidebarProps) {
-  const { projects, create, remove: removeProject } = useProjects();
   const { samples, upload, paste, remove: removeSample } = useSamples(selectedProjectId);
   const { toggleTheme, isDark } = useTheme();
   const [showNewProject, setShowNewProject] = useState(false);
@@ -323,14 +513,22 @@ export default function Sidebar({
   const [showUpload, setShowUpload] = useState(false);
   const [showPaste, setShowPaste] = useState(false);
   const [dragOver, setDragOver] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState<{ type: 'project' | 'sample'; id: string } | null>(null);
+  const [openMenu, setOpenMenu] = useState<{ type: 'project' | 'sample'; id: string } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<{ type: 'project' | 'sample'; id: string; label: string } | null>(null);
+  const [projectSearch, setProjectSearch] = useState('');
+  const [projectSort, setProjectSort] = useState<ProjectSort>('recent');
+  const [showArchived, setShowArchived] = useState(false);
+  const [sampleSearch, setSampleSearch] = useState('');
+  const [sampleFilter, setSampleFilter] = useState<SampleFilter>('all');
+  const [archivedProjectIds, setArchivedProjectIds] = useState<string[]>(() => loadArchivedProjectIds());
+  const [projectStats, setProjectStats] = useState<Record<string, ProjectStats>>({});
   const dragCounter = useRef(0);
   const toast = useToast();
 
   const handleCreate = useCallback(async () => {
     if (!newProjectName.trim()) return;
     try {
-      const p = await create(newProjectName.trim());
+      const p = await createProject(newProjectName.trim());
       setNewProjectName('');
       setShowNewProject(false);
       onSelectProject(p.id);
@@ -338,7 +536,7 @@ export default function Sidebar({
     } catch (err) {
       toast.error('Failed to create project');
     }
-  }, [newProjectName, create, onSelectProject, toast]);
+  }, [newProjectName, createProject, onSelectProject, toast]);
 
   const handleUpload = useCallback(
     async (files: File[]) => {
@@ -408,6 +606,7 @@ export default function Sidebar({
       try {
         await removeProject(id);
         onDeleteProject?.(id);
+        setOpenMenu(null);
         setConfirmDelete(null);
         toast.success('Project deleted');
       } catch (err) {
@@ -422,6 +621,7 @@ export default function Sidebar({
       try {
         await removeSample(id);
         onDeleteSample?.(id);
+        setOpenMenu(null);
         setConfirmDelete(null);
         toast.success('Sample deleted');
       } catch (err) {
@@ -430,6 +630,106 @@ export default function Sidebar({
     },
     [removeSample, onDeleteSample, toast],
   );
+
+  useEffect(() => {
+    saveArchivedProjectIds(archivedProjectIds);
+  }, [archivedProjectIds]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadProjectStats = async () => {
+      const entries = await Promise.all(
+        projects.map(async (project) => {
+          try {
+            const projectSamples = await api.listSamples(project.id);
+            const sortedDates = projectSamples
+              .map((sample) => sample.updated_at ?? sample.created_at)
+              .filter((value): value is string => Boolean(value))
+              .sort((a, b) => new Date(b).getTime() - new Date(a).getTime());
+            const stats: ProjectStats = {
+              sampleCount: projectSamples.length,
+              lastActivity: sortedDates[0] ?? null,
+              runningCount: projectSamples.filter((sample) => sample.status === 'running' || sample.status === 'pending').length,
+              savedCount: projectSamples.filter((sample) => Boolean(sample.saved_analysis_at)).length,
+            };
+            return [project.id, stats] as const;
+          } catch {
+            return [project.id, { sampleCount: 0, lastActivity: null, runningCount: 0, savedCount: 0 }] as const;
+          }
+        }),
+      );
+
+      if (!cancelled) {
+        setProjectStats(Object.fromEntries(entries));
+      }
+    };
+
+    if (projects.length === 0) {
+      setProjectStats({});
+      return undefined;
+    }
+
+    loadProjectStats().catch(() => {
+      if (!cancelled) {
+        setProjectStats({});
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projects, samples]);
+
+  const visibleProjects = useMemo(() => {
+    const query = projectSearch.trim().toLowerCase();
+    const filtered = projects
+      .filter((project) => showArchived || !archivedProjectIds.includes(project.id))
+      .filter((project) => (query ? project.name.toLowerCase().includes(query) : true));
+
+    return [...filtered].sort((a, b) => {
+      if (projectSort === 'alpha') {
+        return a.name.localeCompare(b.name);
+      }
+      if (projectSort === 'samples') {
+        const countDiff = (projectStats[b.id]?.sampleCount ?? 0) - (projectStats[a.id]?.sampleCount ?? 0);
+        if (countDiff !== 0) return countDiff;
+      }
+      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    });
+  }, [archivedProjectIds, projectSearch, projectSort, projectStats, projects, showArchived]);
+
+  const filteredSamples = useMemo(() => {
+    const query = sampleSearch.trim().toLowerCase();
+    return samples.filter((sample) => {
+      const matchesQuery = !query
+        || sample.filename.toLowerCase().includes(query)
+        || (sample.language ?? '').toLowerCase().includes(query);
+      if (!matchesQuery) return false;
+      if (sampleFilter === 'all') return true;
+      if (sampleFilter === 'saved') return Boolean(sample.saved_analysis_at);
+      return sample.status === sampleFilter;
+    });
+  }, [sampleFilter, sampleSearch, samples]);
+
+  const toggleArchiveProject = useCallback((projectId: string) => {
+    const isArchived = archivedProjectIds.includes(projectId);
+    if (!isArchived && selectedProjectId === projectId && !showArchived) {
+      const nextProject = projects.find(
+        (project) => project.id !== projectId && !archivedProjectIds.includes(project.id),
+      );
+      if (nextProject) {
+        onSelectProject(nextProject.id);
+      }
+    }
+
+    setArchivedProjectIds((current) => (
+      current.includes(projectId)
+        ? current.filter((id) => id !== projectId)
+        : [...current, projectId]
+    ));
+    setOpenMenu(null);
+  }, [archivedProjectIds, onSelectProject, projects, selectedProjectId, showArchived]);
 
   // ── Drag-and-drop handlers ──────────────────────────────────────
   const handleDragEnter = useCallback((e: React.DragEvent) => {
@@ -486,6 +786,7 @@ export default function Sidebar({
   return (
     <div
       style={s.root}
+      onClick={() => setOpenMenu(null)}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
@@ -559,8 +860,45 @@ export default function Sidebar({
             </button>
           </div>
         )}
+        <div style={s.sectionControls}>
+          <input
+            style={s.searchInput}
+            value={projectSearch}
+            onChange={(e) => setProjectSearch(e.target.value)}
+            placeholder="Search projects..."
+          />
+          <div style={s.segmentedRow}>
+            {([
+              ['recent', 'Recent'],
+              ['alpha', 'A-Z'],
+              ['samples', 'Most samples'],
+            ] as const).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                style={{
+                  ...s.segmentedBtn,
+                  ...(projectSort === value ? { background: 'var(--accent-muted)', color: 'var(--accent)', borderColor: 'var(--accent-border)' } : {}),
+                }}
+                onClick={() => setProjectSort(value)}
+              >
+                {label}
+              </button>
+            ))}
+            <button
+              type="button"
+              style={{
+                ...s.segmentedBtn,
+                ...(showArchived ? { background: 'var(--warning-muted)', color: 'var(--warning)' } : {}),
+              }}
+              onClick={() => setShowArchived((value) => !value)}
+            >
+              {showArchived ? 'Hide archived' : 'Show archived'}
+            </button>
+          </div>
+        </div>
         <div style={s.list}>
-          {projects.map((p) => (
+          {visibleProjects.map((p) => (
             <div
               key={p.id}
               className={`unweaver-nav-item${selectedProjectId === p.id ? ' unweaver-nav-item--active' : ''}`}
@@ -574,17 +912,12 @@ export default function Sidebar({
                   e.currentTarget.style.background = 'var(--bg-hover)';
                   e.currentTarget.style.color = 'var(--text-primary)';
                 }
-                // Show delete button
-                const delBtn = e.currentTarget.querySelector('[data-delete-btn]') as HTMLElement;
-                if (delBtn) delBtn.style.opacity = '1';
               }}
               onMouseLeave={(e) => {
                 if (selectedProjectId !== p.id) {
                   e.currentTarget.style.background = 'transparent';
                   e.currentTarget.style.color = 'var(--text-secondary)';
                 }
-                const delBtn = e.currentTarget.querySelector('[data-delete-btn]') as HTMLElement;
-                if (delBtn) delBtn.style.opacity = '0';
               }}
             >
               <Folder
@@ -598,52 +931,91 @@ export default function Sidebar({
               <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {truncate(p.name, 22)}
               </span>
-              {confirmDelete?.type === 'project' && confirmDelete.id === p.id ? (
-                <span style={{ display: 'flex', gap: '4px', marginLeft: 'auto', flexShrink: 0 }}>
-                  <button
-                    style={{ ...s.iconBtn, color: 'var(--danger)', fontSize: '10px', fontWeight: 600, padding: '1px 4px' }}
-                    onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
-                  >
-                    Yes
-                  </button>
-                  <button
-                    style={{ ...s.iconBtn, color: 'var(--text-muted)', fontSize: '10px', fontWeight: 600, padding: '1px 4px' }}
-                    onClick={(e) => { e.stopPropagation(); setConfirmDelete(null); }}
-                  >
-                    No
-                  </button>
-                </span>
-              ) : (
-                <>
-                  <button
-                    data-delete-btn
-                    style={s.deleteBtn}
-                    title="Delete project"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setConfirmDelete({ type: 'project', id: p.id });
-                    }}
-                    onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--danger)'; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
-                  >
-                    <Trash2 size={11} />
-                  </button>
-                  <ChevronRight
-                    size={10}
-                    style={{
-                      transform: selectedProjectId === p.id ? 'rotate(90deg)' : 'none',
-                      transition: 'transform 0.2s ease',
-                      opacity: 0.3,
-                      flexShrink: 0,
-                    }}
-                  />
-                </>
-              )}
+              <span style={s.projectMeta}>
+                {projectStats[p.id]?.sampleCount ?? 0}
+                {' '}samples
+                {(projectStats[p.id]?.runningCount ?? 0) > 0 ? ` · ${projectStats[p.id]?.runningCount} live` : ''}
+                {(projectStats[p.id]?.savedCount ?? 0) > 0 ? ` · ${projectStats[p.id]?.savedCount} saved` : ''}
+              </span>
+              <span style={s.rowActions}>
+                <button
+                  style={s.menuBtn}
+                  title="Project actions"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOpenMenu((current) => (
+                      current?.type === 'project' && current.id === p.id
+                        ? null
+                        : { type: 'project', id: p.id }
+                    ));
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.color = 'var(--text-primary)';
+                    e.currentTarget.style.background = 'var(--bg-hover)';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.color = 'var(--text-muted)';
+                    e.currentTarget.style.background = 'transparent';
+                  }}
+                >
+                  <MoreHorizontal size={13} />
+                </button>
+                {openMenu?.type === 'project' && openMenu.id === p.id && (
+                  <div style={s.actionMenu} onClick={(e) => e.stopPropagation()}>
+                    <button
+                      style={s.actionMenuItem}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleArchiveProject(p.id);
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = 'var(--bg-hover)';
+                        e.currentTarget.style.color = 'var(--text-primary)';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = 'transparent';
+                        e.currentTarget.style.color = 'var(--text-secondary)';
+                      }}
+                    >
+                      <Folder size={12} />
+                      {archivedProjectIds.includes(p.id) ? 'Unarchive project' : 'Archive project'}
+                    </button>
+                    <button
+                      style={s.actionMenuItem}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setConfirmDelete({ type: 'project', id: p.id, label: p.name });
+                        setOpenMenu(null);
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = 'var(--danger-muted)';
+                        e.currentTarget.style.color = 'var(--danger)';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = 'transparent';
+                        e.currentTarget.style.color = 'var(--text-secondary)';
+                      }}
+                    >
+                      <Trash2 size={12} />
+                      Delete project
+                    </button>
+                  </div>
+                )}
+              </span>
+              <ChevronRight
+                size={10}
+                style={{
+                  transform: selectedProjectId === p.id ? 'rotate(90deg)' : 'none',
+                  transition: 'transform 0.2s ease',
+                  opacity: 0.3,
+                  flexShrink: 0,
+                }}
+              />
             </div>
           ))}
-          {projects.length === 0 && (
+          {visibleProjects.length === 0 && (
             <div style={{ ...s.item, color: 'var(--text-muted)', cursor: 'default', opacity: 0.6 }}>
-              No projects yet
+              {projects.length === 0 ? 'No projects yet' : 'No projects match the current filters'}
             </div>
           )}
         </div>
@@ -654,6 +1026,35 @@ export default function Sidebar({
         <div style={{ ...s.section, flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', position: 'relative' }}>
           <div style={s.sectionHeader}>
             <span>Samples</span>
+          </div>
+          <div style={s.sectionControls}>
+            <input
+              style={s.searchInput}
+              value={sampleSearch}
+              onChange={(e) => setSampleSearch(e.target.value)}
+              placeholder="Search samples..."
+            />
+            <div style={s.segmentedRow}>
+              {([
+                ['all', 'All'],
+                ['running', 'Running'],
+                ['completed', 'Done'],
+                ['failed', 'Failed'],
+                ['saved', 'Saved'],
+              ] as const).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  style={{
+                    ...s.segmentedBtn,
+                    ...(sampleFilter === value ? { background: 'var(--accent-muted)', color: 'var(--accent)', borderColor: 'var(--accent-border)' } : {}),
+                  }}
+                  onClick={() => setSampleFilter(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
           <div style={s.actions}>
             <button
@@ -694,7 +1095,7 @@ export default function Sidebar({
             </button>
           </div>
           <div style={{ ...s.list, flex: 1 }}>
-            {samples.map((sm) => (
+            {filteredSamples.map((sm) => (
               <div
                 key={sm.id}
                 className={`unweaver-nav-item${selectedSampleId === sm.id ? ' unweaver-nav-item--active' : ''}`}
@@ -708,16 +1109,12 @@ export default function Sidebar({
                     e.currentTarget.style.background = 'var(--bg-hover)';
                     e.currentTarget.style.color = 'var(--text-primary)';
                   }
-                  const delBtn = e.currentTarget.querySelector('[data-delete-btn]') as HTMLElement;
-                  if (delBtn) delBtn.style.opacity = '1';
                 }}
                 onMouseLeave={(e) => {
                   if (selectedSampleId !== sm.id) {
                     e.currentTarget.style.background = 'transparent';
                     e.currentTarget.style.color = 'var(--text-secondary)';
                   }
-                  const delBtn = e.currentTarget.querySelector('[data-delete-btn]') as HTMLElement;
-                  if (delBtn) delBtn.style.opacity = '0';
                 }}
               >
                 <div
@@ -733,47 +1130,62 @@ export default function Sidebar({
                 <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {sm.filename}
                 </span>
-                {confirmDelete?.type === 'sample' && confirmDelete.id === sm.id ? (
-                  <span style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
-                    <button
-                      style={{ ...s.iconBtn, color: 'var(--danger)', fontSize: '10px', fontWeight: 600, padding: '1px 4px' }}
-                      onClick={(e) => { e.stopPropagation(); handleDeleteSample(sm.id); }}
-                    >
-                      Yes
-                    </button>
-                    <button
-                      style={{ ...s.iconBtn, color: 'var(--text-muted)', fontSize: '10px', fontWeight: 600, padding: '1px 4px' }}
-                      onClick={(e) => { e.stopPropagation(); setConfirmDelete(null); }}
-                    >
-                      No
-                    </button>
-                  </span>
-                ) : (
-                  <>
-                    <button
-                      data-delete-btn
-                      style={s.deleteBtn}
-                      title="Delete sample"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setConfirmDelete({ type: 'sample', id: sm.id });
-                      }}
-                      onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--danger)'; }}
-                      onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
-                    >
-                      <Trash2 size={11} />
-                    </button>
-                    <span style={s.sampleMeta}>
-                      {sm.language === 'workspace' ? 'bundle' : formatDate(sm.created_at).split(',')[0]}
-                      {sm.saved_analysis_at ? ' · saved' : ''}
-                    </span>
-                  </>
-                )}
+                <span style={s.sampleMeta}>
+                  {sm.language === 'workspace' ? 'bundle' : formatDate(sm.created_at).split(',')[0]}
+                  {sm.saved_analysis_at ? ' · saved' : ''}
+                </span>
+                <span style={s.rowActions}>
+                  <button
+                    style={s.menuBtn}
+                    title="Sample actions"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setOpenMenu((current) => (
+                        current?.type === 'sample' && current.id === sm.id
+                          ? null
+                          : { type: 'sample', id: sm.id }
+                      ));
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.color = 'var(--text-primary)';
+                      e.currentTarget.style.background = 'var(--bg-hover)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.color = 'var(--text-muted)';
+                      e.currentTarget.style.background = 'transparent';
+                    }}
+                  >
+                    <MoreHorizontal size={13} />
+                  </button>
+                  {openMenu?.type === 'sample' && openMenu.id === sm.id && (
+                    <div style={s.actionMenu} onClick={(e) => e.stopPropagation()}>
+                      <button
+                        style={s.actionMenuItem}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setConfirmDelete({ type: 'sample', id: sm.id, label: sm.filename });
+                          setOpenMenu(null);
+                        }}
+                        onMouseEnter={(e) => {
+                          e.currentTarget.style.background = 'var(--danger-muted)';
+                          e.currentTarget.style.color = 'var(--danger)';
+                        }}
+                        onMouseLeave={(e) => {
+                          e.currentTarget.style.background = 'transparent';
+                          e.currentTarget.style.color = 'var(--text-secondary)';
+                        }}
+                      >
+                        <Trash2 size={12} />
+                        Delete sample
+                      </button>
+                    </div>
+                  )}
+                </span>
               </div>
             ))}
-            {samples.length === 0 && (
+            {filteredSamples.length === 0 && (
               <div style={{ ...s.item, color: 'var(--text-muted)', cursor: 'default', opacity: 0.6 }}>
-                {dragOver ? 'Drop files or archives here' : 'No samples'}
+                {dragOver ? 'Drop files or archives here' : 'No samples match the current filters'}
               </div>
             )}
           </div>
@@ -792,6 +1204,51 @@ export default function Sidebar({
           onSubmit={handlePaste}
           onClose={() => setShowPaste(false)}
         />
+      )}
+      {confirmDelete && (
+        <div style={s.confirmOverlay} onClick={() => setConfirmDelete(null)}>
+          <div style={s.confirmModal} onClick={(e) => e.stopPropagation()}>
+            <div style={s.confirmHeader}>
+              <AlertTriangle size={16} color="var(--danger)" />
+              <div style={s.confirmTitle}>
+                Delete {confirmDelete.type === 'project' ? 'project' : 'sample'}?
+              </div>
+            </div>
+            <div style={s.confirmBody}>
+              <strong style={{ color: 'var(--text-primary)' }}>
+                {confirmDelete.label}
+              </strong>
+              {' '}
+              will be permanently removed from the workspace list.
+              {confirmDelete.type === 'project' && (
+                <>
+                  {' '}
+                  This project currently contains {projectStats[confirmDelete.id]?.sampleCount ?? 0} sample(s).
+                </>
+              )}
+            </div>
+            <div style={s.confirmActions}>
+              <button
+                type="button"
+                style={s.confirmCancel}
+                onClick={() => setConfirmDelete(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                style={s.confirmDelete}
+                onClick={() => (
+                  confirmDelete.type === 'project'
+                    ? handleDeleteProject(confirmDelete.id)
+                    : handleDeleteSample(confirmDelete.id)
+                )}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Footer: Settings + Theme toggle */}

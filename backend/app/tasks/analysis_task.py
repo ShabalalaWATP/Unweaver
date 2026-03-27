@@ -13,9 +13,10 @@ Manages the lifecycle of a single sample's deobfuscation analysis:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Dict
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -31,6 +32,7 @@ from app.models.db_models import (
 )
 from app.models.schemas import SampleStatus
 from app.services.reports.saved_analysis import persist_saved_analysis_snapshot
+from app.services.analysis.state_manager import build_state_snapshot_payload
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +169,8 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         tracker["error"] = "Sample not found"
         return
 
-    if not sample.original_text:
+    has_binary_source = bool(sample.content_kind == "dotnet_binary" and sample.stored_file_path)
+    if not sample.original_text and not has_binary_source:
         tracker["status"] = "failed"
         tracker["error"] = "Sample has no code to analyse"
         sample.status = SampleStatus.FAILED.value
@@ -190,12 +193,46 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
 
     tracker["current_action"] = "starting orchestrator"
 
+    analysis_code = sample.original_text
+    analysis_language = sample.language
+    workspace_iterations = getattr(settings, "MAX_WORKSPACE_ITERATIONS", settings.MAX_ITERATIONS)
+    max_iterations = (
+        workspace_iterations
+        if sample.content_kind == "archive_bundle" or sample.language == "workspace"
+        else settings.MAX_ITERATIONS
+    )
+    tracker["total_iterations"] = max_iterations
+    if sample.content_kind == "dotnet_binary":
+        if not sample.stored_file_path:
+            tracker["status"] = "failed"
+            tracker["error"] = "Binary sample has no stored file path"
+            sample.status = SampleStatus.FAILED.value
+            await _safe_commit(db, "mark binary sample as failed")
+            return
+        try:
+            raw_bytes = Path(sample.stored_file_path).read_bytes()
+        except OSError as exc:
+            tracker["status"] = "failed"
+            tracker["error"] = f"Failed to read binary sample: {exc}"
+            sample.status = SampleStatus.FAILED.value
+            await _safe_commit(db, "mark unreadable binary sample as failed")
+            return
+        analysis_code = raw_bytes.decode("latin-1")
+        analysis_language = analysis_language or "dotnet"
+
     orchestrator = Orchestrator(
         sample_id=sample_id,
-        original_code=sample.original_text,
-        language=sample.language,
+        original_code=analysis_code,
+        language=analysis_language,
         db_session=db,
         llm_client=llm_client,
+        analysis_metadata={
+            "content_kind": sample.content_kind,
+            "content_encoding": sample.content_encoding,
+            "stored_file_path": sample.stored_file_path,
+            "byte_size": sample.byte_size,
+            "filename": sample.filename,
+        },
     )
 
     # Progress callback: updates the in-memory tracker as the orchestrator
@@ -214,7 +251,7 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
     result = await orchestrator.run(
         auto_approve_threshold=settings.AUTO_APPROVE_THRESHOLD,
         min_confidence=settings.MIN_CONFIDENCE_THRESHOLD,
-        max_iterations=settings.MAX_ITERATIONS,
+        max_iterations=max_iterations,
         stall_limit=settings.STALL_THRESHOLD,
         progress_callback=_on_progress,
         stop_requested=lambda: bool(tracker.get("stop_requested")),
@@ -223,12 +260,16 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
 
     tracker["current_iteration"] = result.iterations
     tracker["progress_pct"] = 100.0
-    tracker["current_action"] = (
-        f"stopped: {result.stop_reason}"
-        if result.was_stopped else
-        f"completed: {result.stop_reason}"
-    )
-    tracker["status"] = "stopped" if result.was_stopped else "completed"
+    if result.was_stopped:
+        tracker["current_action"] = f"stopped: {result.stop_reason}"
+        tracker["status"] = "stopped"
+    elif result.success:
+        tracker["current_action"] = f"completed: {result.stop_reason}"
+        tracker["status"] = "completed"
+    else:
+        tracker["current_action"] = f"failed: {result.stop_reason}"
+        tracker["status"] = "failed"
+        tracker["error"] = result.fatal_error or result.stop_reason
 
     # ── Persist results in isolated batches ─────────────────────────
     # Re-fetch sample in case the session state drifted during the long
@@ -245,6 +286,8 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         SampleStatus.STOPPED.value
         if result.was_stopped else
         SampleStatus.COMPLETED.value
+        if result.success else
+        SampleStatus.FAILED.value
     )
     await _safe_commit(db, "persist recovered text and status")
 
@@ -318,11 +361,15 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
     # Final iteration state
     if result.state:
         try:
-            db.add(IterationState(
+            await _upsert_iteration_state(
+                db,
                 sample_id=sample_id,
                 iteration_number=result.iterations,
-                state_json=result.state.model_dump_json(),
-            ))
+                state_json=build_state_snapshot_payload(
+                    result.state,
+                    result.deobfuscated_code,
+                ),
+            )
             await _safe_commit(db, "persist final iteration state")
         except Exception:
             logger.exception("Failed to persist final iteration state")
@@ -344,7 +391,7 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         logger.exception("Failed to persist saved analysis snapshot")
 
     # ── Auto-generate AI summary if LLM available ──────────────────
-    if llm_client is not None and sample is not None:
+    if llm_client is not None and sample is not None and result.success:
         tracker["current_action"] = "generating AI summary"
         emit_event(sample_id, "planning", {"detail": "Auto-generating AI summary..."})
         try:
@@ -356,12 +403,15 @@ async def _run_analysis_inner(db: AsyncSession, sample_id: str) -> None:
         except Exception:
             logger.debug("Auto-summary generation failed (non-critical)", exc_info=True)
 
-    tracker["status"] = "stopped" if result.was_stopped else "completed"
-    tracker["current_action"] = (
-        "analysis stopped"
-        if result.was_stopped else
-        "analysis complete"
-    )
+    if result.was_stopped:
+        tracker["status"] = "stopped"
+        tracker["current_action"] = "analysis stopped"
+    elif result.success:
+        tracker["status"] = "completed"
+        tracker["current_action"] = "analysis complete"
+    else:
+        tracker["status"] = "failed"
+        tracker["current_action"] = "analysis failed"
 
 
 async def _load_llm_client(db: AsyncSession):
@@ -427,6 +477,33 @@ async def _clear_previous_analysis_data(db: AsyncSession, sample_id: str) -> Non
         IterationState,
     ):
         await db.execute(delete(model).where(model.sample_id == sample_id))
+
+
+async def _upsert_iteration_state(
+    db: AsyncSession,
+    *,
+    sample_id: str,
+    iteration_number: int,
+    state_json: str,
+) -> None:
+    record = (
+        await db.execute(
+            select(IterationState)
+            .where(IterationState.sample_id == sample_id)
+            .where(IterationState.iteration_number == iteration_number)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        db.add(
+            IterationState(
+                sample_id=sample_id,
+                iteration_number=iteration_number,
+                state_json=state_json,
+            )
+        )
+        return
+    record.state_json = state_json
 
 
 async def _safe_commit(db: AsyncSession, context: str) -> bool:

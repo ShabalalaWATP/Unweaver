@@ -11,8 +11,8 @@ interface FileUploadProps {
   maxArchiveSizeMB?: number;
 }
 
-const MAX_SIZE_DEFAULT = 5; // 5 MB for single files
-const MAX_ARCHIVE_SIZE_DEFAULT = 25; // 25 MB for compressed archives
+const MAX_SIZE_DEFAULT = 20; // 20 MB for single files
+const MAX_ARCHIVE_SIZE_DEFAULT = 128; // 128 MB for compressed archives
 const ACCEPTED_FILE_TYPES = [
   '.zip', '.tar', '.tgz', '.gz',
   '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
@@ -488,7 +488,7 @@ export default function FileUpload({
               {dragging ? 'Drop files or archives here' : 'Drag & drop files or archives'}
             </div>
             <div style={s.hint}>
-              Select one or more files, or package a whole folder locally before upload
+              Select one or more files up to {maxSizeMB} MB, or package a folder locally before upload as an archive up to {maxArchiveSizeMB} MB
             </div>
           </div>
           <div style={s.pickerRow}>

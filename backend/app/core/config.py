@@ -32,14 +32,19 @@ class Settings(BaseSettings):
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "uploads",
     )
-    MAX_FILE_SIZE: int = 5 * 1024 * 1024  # 5 MB
-    MAX_ARCHIVE_FILE_SIZE: int = 25 * 1024 * 1024  # 25 MB compressed upload
-    MAX_ARCHIVE_MEMBER_SIZE: int = 768 * 1024  # 768 KB per extracted text file
-    MAX_BUNDLED_SOURCE_SIZE: int = 8 * 1024 * 1024  # 8 MB synthetic workspace text
-    MAX_ARCHIVE_FILES: int = 80
+    MAX_FILE_SIZE: int = 20 * 1024 * 1024  # 20 MB
+    MAX_ARCHIVE_FILE_SIZE: int = 128 * 1024 * 1024  # 128 MB compressed upload
+    MAX_ARCHIVE_MEMBER_SIZE: int = 4 * 1024 * 1024  # 4 MB per extracted text file
+    MAX_BUNDLED_SOURCE_SIZE: int = 48 * 1024 * 1024  # 48 MB synthetic workspace text
+    MAX_ARCHIVE_FILES: int = 224
+    MAX_ARCHIVE_SCAN_FILES: int = 1500
+    MAX_WORKSPACE_TARGET_FILES: int = 28
+    MAX_WORKSPACE_BUNDLE_ADDITIONS: int = 24
+    MAX_WORKSPACE_LLM_FOCUS_FILES: int = 8
 
     # ── Iterative analysis loop ─────────────────────────────────────────
-    MAX_ITERATIONS: int = 20
+    MAX_ITERATIONS: int = 36
+    MAX_WORKSPACE_ITERATIONS: int = 44
     AUTO_APPROVE_THRESHOLD: float = 0.85
     MIN_CONFIDENCE_THRESHOLD: float = 0.3
     STALL_THRESHOLD: int = 3  # consecutive iterations without progress

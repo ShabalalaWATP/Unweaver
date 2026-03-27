@@ -37,18 +37,28 @@ from app.models.db_models import (
 from app.models.schemas import (
     AISummaryReport,
     AISummarySections,
+    AnalystChatRequest,
+    AnalystChatRetrievedFile,
+    AnalystChatResponse,
     NotesSave,
     SampleDetail,
     SampleResponse,
     SampleStatus,
 )
 from app.services.ingest.workspace_bundle import (
+    WORKSPACE_BUNDLE_HEADER,
     WorkspaceBundleError,
     build_workspace_bundle,
     extract_workspace_context,
     is_archive_upload,
+    load_workspace_archive_from_path,
+    parse_workspace_bundle,
     truncate_workspace_bundle,
     workspace_context_prompt,
+)
+from app.services.transforms.binary_analysis import (
+    binary_preview_text,
+    detect_upload_content_kind,
 )
 from app.services.llm.client import LLMClient, _MAX_TOKENS_MAP
 from app.services.reports.saved_analysis import persist_saved_analysis_snapshot
@@ -73,6 +83,65 @@ _MAX_ARCHIVE_FILE_SIZE = settings.MAX_ARCHIVE_FILE_SIZE
 
 # Characters allowed in sanitised filenames
 _SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9._-]")
+_CHAT_SOURCE_TAG_RE = re.compile(r"\[(?:original|recovered|analysis|retrieved:[^\]]+)\]")
+_WORKSPACE_QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:\\-]{3,}")
+_WORKSPACE_PATH_HINT_RE = re.compile(r"(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+")
+_WORKSPACE_SEARCH_STOPWORDS = {
+    "about",
+    "across",
+    "after",
+    "against",
+    "also",
+    "analysis",
+    "anything",
+    "assistant",
+    "before",
+    "between",
+    "build",
+    "changed",
+    "check",
+    "code",
+    "compare",
+    "could",
+    "current",
+    "does",
+    "each",
+    "entrypoint",
+    "every",
+    "explain",
+    "file",
+    "files",
+    "from",
+    "have",
+    "into",
+    "just",
+    "look",
+    "main",
+    "most",
+    "need",
+    "output",
+    "over",
+    "project",
+    "recovered",
+    "results",
+    "search",
+    "should",
+    "show",
+    "still",
+    "summarize",
+    "that",
+    "their",
+    "them",
+    "there",
+    "they",
+    "this",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+    "workspace",
+}
 
 
 def _sanitize_filename(name: str) -> str:
@@ -87,6 +156,582 @@ def _sanitize_filename(name: str) -> str:
     return name[:255]
 
 
+def _clip_text_for_prompt(text: str, max_chars: int) -> tuple[str, bool]:
+    """Keep full text when possible, otherwise preserve both head and tail."""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, False
+    if max_chars < 160:
+        return text[:max_chars], True
+    head = max_chars // 2
+    tail = max_chars - head - 64
+    clipped = (
+        text[:head].rstrip()
+        + "\n\n... [truncated to fit model context] ...\n\n"
+        + text[-max(0, tail):].lstrip()
+    )
+    return clipped, True
+
+
+def _clip_code_context_for_prompt(text: str, max_chars: int) -> tuple[str, bool]:
+    """Prefer workspace-aware trimming when the text is a bundle."""
+    if text.startswith(WORKSPACE_BUNDLE_HEADER):
+        trimmed = truncate_workspace_bundle(text, max_chars)
+        return trimmed, len(trimmed) < len(text)
+    return _clip_text_for_prompt(text, max_chars)
+
+
+def _workspace_source_family(source: str) -> str:
+    """Collapse retrieval sources into original vs recovered families."""
+    return "recovered" if source == "recovered_bundle" else "original"
+
+
+def _retrieved_source_tag(source: str, path: str) -> str:
+    """Return a prompt-safe retrieval tag for inline source attribution."""
+    source_prefix = {
+        "recovered_bundle": "recovered",
+        "original_bundle": "original",
+        "archive_scan": "archive",
+    }.get(source, "workspace")
+    safe_path = path.replace("]", "%5D")
+    return f"retrieved:{source_prefix}:{safe_path}"
+
+
+def _build_workspace_search_space(
+    *,
+    sample: Sample,
+    original_text: str,
+    recovered_text: str,
+) -> List[Dict[str, Any]]:
+    """Merge recovered/original workspace bundles with the stored archive."""
+    candidates: List[Dict[str, Any]] = []
+    seen_entries: set[tuple[str, str]] = set()
+
+    def add_candidate(
+        *,
+        path: str,
+        language: str | None,
+        text: str,
+        size_bytes: int,
+        priority: List[str],
+        source: str,
+    ) -> None:
+        source_family = _workspace_source_family(source)
+        candidate_key = (path, source_family)
+        if not path or candidate_key in seen_entries or not text:
+            return
+        candidates.append(
+            {
+                "path": path,
+                "language": language or "plaintext",
+                "text": text,
+                "size_bytes": size_bytes,
+                "priority": priority,
+                "source": source,
+            }
+        )
+        seen_entries.add(candidate_key)
+
+    for item in parse_workspace_bundle(recovered_text):
+        add_candidate(
+            path=item.path,
+            language=item.language,
+            text=item.text,
+            size_bytes=item.size_bytes,
+            priority=list(item.priority),
+            source="recovered_bundle",
+        )
+
+    for item in parse_workspace_bundle(original_text):
+        add_candidate(
+            path=item.path,
+            language=item.language,
+            text=item.text,
+            size_bytes=item.size_bytes,
+            priority=list(item.priority),
+            source="original_bundle",
+        )
+
+    if sample.content_kind == "archive_bundle" and sample.stored_file_path and os.path.exists(sample.stored_file_path):
+        try:
+            archive_scan = load_workspace_archive_from_path(
+                sample.stored_file_path,
+                archive_name=sample.filename,
+                max_member_bytes=settings.MAX_ARCHIVE_MEMBER_SIZE,
+                max_scan_files=settings.MAX_ARCHIVE_SCAN_FILES,
+            )
+        except Exception as exc:
+            logger.warning("Workspace chat retrieval failed to index archive %s: %s", sample.id, exc)
+        else:
+            for item in archive_scan.files:
+                add_candidate(
+                    path=item.path,
+                    language=item.language,
+                    text=item.text,
+                    size_bytes=item.size_bytes,
+                    priority=list(item.priority_tags),
+                    source="archive_scan",
+                )
+
+    return candidates
+
+
+def _extract_workspace_query_terms(messages: List[AnalystChatMessage]) -> tuple[List[str], List[str]]:
+    """Extract likely path hints and keywords from recent user turns."""
+    user_text = "\n".join(
+        message.content.strip()
+        for message in messages[-6:]
+        if message.role == "user" and message.content.strip()
+    ).lower()
+    if not user_text:
+        return [], []
+
+    path_terms: List[str] = []
+    keyword_terms: List[str] = []
+    strip_chars = "`'\"()[]{}<>,:;.!?"
+
+    def add_path(raw_value: str) -> None:
+        candidate = raw_value.replace("\\", "/").strip(strip_chars)
+        if not candidate:
+            return
+        if "/" not in candidate:
+            return
+        if candidate not in path_terms:
+            path_terms.append(candidate)
+
+    def add_keyword(raw_value: str) -> None:
+        token = raw_value.strip(strip_chars).lower()
+        if not token or len(token) < 3 or token.isdigit():
+            return
+        if token in _WORKSPACE_SEARCH_STOPWORDS:
+            return
+        if token not in keyword_terms:
+            keyword_terms.append(token)
+
+    for match in _WORKSPACE_PATH_HINT_RE.findall(user_text):
+        add_path(match)
+
+    for raw_token in _WORKSPACE_QUERY_TOKEN_RE.findall(user_text):
+        if "/" in raw_token or "\\" in raw_token:
+            add_path(raw_token)
+            basename = raw_token.replace("\\", "/").rsplit("/", 1)[-1]
+            if "." in basename:
+                add_keyword(basename)
+            continue
+        add_keyword(raw_token)
+
+    return path_terms[:8], keyword_terms[:24]
+
+
+def _score_workspace_candidate(
+    candidate: Dict[str, Any],
+    *,
+    path_terms: List[str],
+    keyword_terms: List[str],
+) -> tuple[float, List[str]]:
+    """Score a workspace file candidate against the current chat question."""
+    path = str(candidate.get("path") or "").lower()
+    text = str(candidate.get("text") or "").lower()
+    source = str(candidate.get("source") or "")
+    priority = {
+        str(item).lower()
+        for item in candidate.get("priority", [])
+        if str(item).strip()
+    }
+
+    score = {
+        "recovered_bundle": 4.0,
+        "original_bundle": 2.5,
+        "archive_scan": 1.0,
+    }.get(source, 0.0)
+    if "entrypoint" in priority:
+        score += 1.2
+    if "suspicious" in priority:
+        score += 1.5
+    if "manifest" in priority:
+        score += 0.7
+
+    matched_terms: List[str] = []
+    basename = path.rsplit("/", 1)[-1]
+
+    for term in path_terms:
+        normalised = term.lower()
+        basename_term = normalised.rsplit("/", 1)[-1]
+        if path == normalised:
+            score += 40.0
+            matched_terms.append(term)
+            continue
+        if path.endswith(normalised):
+            score += 26.0
+            matched_terms.append(term)
+            continue
+        if normalised in path:
+            score += 18.0
+            matched_terms.append(term)
+            continue
+        if basename_term == basename:
+            score += 12.0
+            matched_terms.append(basename_term)
+
+    for term in keyword_terms:
+        if term in path:
+            score += 6.0
+            matched_terms.append(term)
+        if term in text:
+            score += min(text.count(term), 4) * 3.0
+            matched_terms.append(term)
+
+    unique_terms: List[str] = []
+    for term in matched_terms:
+        if term not in unique_terms:
+            unique_terms.append(term)
+    return score, unique_terms
+
+
+def _build_numbered_excerpt(lines: List[str], start: int, end: int) -> str:
+    """Format a line range with line numbers for prompt readability."""
+    return "\n".join(
+        f"{line_no:04d} | {lines[line_no - 1]}"
+        for line_no in range(start + 1, end + 1)
+    )
+
+
+def _infer_fallback_source_tags(
+    line: str,
+    retrieved_files: List[AnalystChatRetrievedFile],
+) -> List[str]:
+    """Infer conservative source tags when the model omits them."""
+    lowered = line.lower()
+    tags: List[str] = []
+
+    for file in retrieved_files[:8]:
+        path = file.path.lower()
+        basename = path.rsplit("/", 1)[-1]
+        if path in lowered or (basename and basename in lowered):
+            tags.append(f"[{_retrieved_source_tag(file.source, file.path)}]")
+
+    if any(token in lowered for token in ("original", "uploaded source", "before deobfuscation")):
+        tags.append("[original]")
+    if any(token in lowered for token in ("recovered", "deobfus", "decoded", "after deobfuscation")):
+        tags.append("[recovered]")
+    if any(
+        token in lowered
+        for token in (
+            "analysis",
+            "finding",
+            "findings",
+            "ioc",
+            "iocs",
+            "indicator",
+            "transform",
+            "confidence",
+            "technique",
+            "suspicious api",
+            "workspace context",
+            "string",
+        )
+    ):
+        tags.append("[analysis]")
+
+    if not tags:
+        tags.append("[analysis]")
+
+    unique_tags: List[str] = []
+    for tag in tags:
+        if tag not in unique_tags:
+            unique_tags.append(tag)
+    return unique_tags
+
+
+def _normalise_chat_source_tags(
+    reply: str,
+    *,
+    retrieved_files: List[AnalystChatRetrievedFile],
+) -> str:
+    """Ensure non-code narrative lines carry at least one source tag."""
+    if not reply.strip():
+        return reply
+
+    lines = reply.splitlines()
+    tagged_lines: List[str] = []
+    in_code_block = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            tagged_lines.append(line)
+            continue
+        if in_code_block or not stripped:
+            tagged_lines.append(line)
+            continue
+        if _CHAT_SOURCE_TAG_RE.search(stripped):
+            tagged_lines.append(line)
+            continue
+        if stripped.startswith("#") or stripped.startswith("|") or stripped.startswith("---"):
+            tagged_lines.append(line)
+            continue
+        if not re.search(r"[A-Za-z]", stripped):
+            tagged_lines.append(line)
+            continue
+
+        tags = _infer_fallback_source_tags(stripped, retrieved_files)
+        tagged_lines.append(f"{line.rstrip()} {' '.join(tags)}")
+
+    return "\n".join(tagged_lines).strip()
+
+
+def _extract_workspace_excerpt(
+    candidate: Dict[str, Any],
+    *,
+    matched_terms: List[str],
+    max_chars: int,
+) -> tuple[str, List[str], bool]:
+    """Extract a compact, prompt-ready excerpt from a workspace file."""
+    text = str(candidate.get("text") or "")
+    lines = text.splitlines()
+    if not text:
+        return "", [], False
+
+    lowered_terms = [term.lower() for term in matched_terms if term and len(term) >= 3]
+    if len(lines) <= 2:
+        clipped, truncated = _clip_text_for_prompt(text, max_chars)
+        return clipped, [], truncated
+
+    if lowered_terms:
+        hit_indexes: List[int] = []
+        for index, line in enumerate(lines):
+            lowered_line = line.lower()
+            if any(term in lowered_line for term in lowered_terms):
+                hit_indexes.append(index)
+
+        if hit_indexes:
+            excerpt_blocks: List[str] = []
+            ranges: List[str] = []
+            used_chars = 0
+            cursor = 0
+            while cursor < len(hit_indexes) and len(excerpt_blocks) < 3:
+                start = max(0, hit_indexes[cursor] - 2)
+                end = min(len(lines), hit_indexes[cursor] + 3)
+                cursor += 1
+                while cursor < len(hit_indexes) and hit_indexes[cursor] <= end + 1:
+                    end = min(len(lines), hit_indexes[cursor] + 3)
+                    cursor += 1
+                block = _build_numbered_excerpt(lines, start, end)
+                extra_chars = len(block) + (5 if excerpt_blocks else 0)
+                if excerpt_blocks and used_chars + extra_chars > max_chars:
+                    return "\n...\n".join(excerpt_blocks), ranges, True
+                if not excerpt_blocks and len(block) > max_chars:
+                    clipped, _ = _clip_text_for_prompt(block, max_chars)
+                    return clipped, [f"L{start + 1}-L{end}"], True
+                excerpt_blocks.append(block)
+                ranges.append(f"L{start + 1}-L{end}")
+                used_chars += extra_chars
+            return "\n...\n".join(excerpt_blocks), ranges, cursor < len(hit_indexes)
+
+    preview_end = min(len(lines), 24)
+    preview = _build_numbered_excerpt(lines, 0, preview_end)
+    clipped, truncated = _clip_text_for_prompt(preview, max_chars)
+    return clipped, [f"L1-L{preview_end}"], truncated or preview_end < len(lines)
+
+
+def _build_workspace_retrieval_context(
+    *,
+    sample: Sample,
+    original_text: str,
+    recovered_text: str,
+    messages: List[AnalystChatMessage],
+    max_chars: int,
+) -> tuple[str, List[AnalystChatRetrievedFile], bool, int]:
+    """Retrieve the most relevant workspace files/snippets for the chat turn."""
+    search_space = _build_workspace_search_space(
+        sample=sample,
+        original_text=original_text,
+        recovered_text=recovered_text,
+    )
+    workspace_file_count = len(search_space)
+    if not search_space or max_chars <= 0:
+        return "", [], False, workspace_file_count
+
+    path_terms, keyword_terms = _extract_workspace_query_terms(messages)
+    scored_candidates = [
+        {
+            "candidate": candidate,
+            "score": score,
+            "matched_terms": matched_terms,
+        }
+        for candidate in search_space
+        for score, matched_terms in [_score_workspace_candidate(
+            candidate,
+            path_terms=path_terms,
+            keyword_terms=keyword_terms,
+        )]
+    ]
+    scored_candidates.sort(
+        key=lambda item: (-float(item["score"]), str(item["candidate"].get("path") or "")),
+    )
+
+    matched_candidates = [
+        item for item in scored_candidates
+        if item["matched_terms"] or float(item["score"]) >= 10.0
+    ]
+    selected_candidates = matched_candidates[:4] or scored_candidates[:4]
+    if path_terms and selected_candidates:
+        selected_keys = {
+            (
+                str(item["candidate"].get("path") or ""),
+                str(item["candidate"].get("source") or ""),
+            )
+            for item in selected_candidates
+        }
+        for term in path_terms:
+            normalised = term.lower()
+            path_variants = [
+                item for item in scored_candidates
+                if (
+                    str(item["candidate"].get("path") or "").lower() == normalised
+                    or str(item["candidate"].get("path") or "").lower().endswith(normalised)
+                )
+            ]
+            if len(path_variants) < 2:
+                continue
+            families = {
+                _workspace_source_family(str(item["candidate"].get("source") or ""))
+                for item in path_variants
+            }
+            if len(families) < 2:
+                continue
+            for item in path_variants:
+                candidate_key = (
+                    str(item["candidate"].get("path") or ""),
+                    str(item["candidate"].get("source") or ""),
+                )
+                if candidate_key in selected_keys:
+                    continue
+                selected_candidates.append(item)
+                selected_keys.add(candidate_key)
+                if len(selected_candidates) >= 6:
+                    break
+            if len(selected_candidates) >= 6:
+                break
+    if not selected_candidates:
+        return "", [], False, workspace_file_count
+
+    per_file_budget = max(1_200, min(3_600, max_chars // max(1, len(selected_candidates))))
+    prompt_sections: List[str] = []
+    retrieved_files: List[AnalystChatRetrievedFile] = []
+    context_truncated = False
+
+    for item in selected_candidates:
+        candidate = item["candidate"]
+        matched_terms = list(item["matched_terms"])[:6]
+        excerpt, line_ranges, excerpt_truncated = _extract_workspace_excerpt(
+            candidate,
+            matched_terms=matched_terms,
+            max_chars=per_file_budget,
+        )
+        if not excerpt:
+            continue
+        source = str(candidate.get("source") or "archive_scan")
+        source_label = {
+            "recovered_bundle": "Recovered workspace file",
+            "original_bundle": "Bundled original file",
+            "archive_scan": "Original archive file",
+        }.get(source, "Workspace file")
+        language = str(candidate.get("language") or "plaintext")
+        path = str(candidate.get("path") or "")
+        source_tag = _retrieved_source_tag(source, path)
+        prompt_sections.append(
+            f"{source_label}: {path}\n"
+            f"Source tag: [{source_tag}]\n"
+            f"Matched terms: {', '.join(matched_terms) if matched_terms else 'workspace priority fallback'}\n"
+            f"Line ranges: {', '.join(line_ranges) if line_ranges else 'excerpt only'}\n"
+            f"Excerpt{' (truncated)' if excerpt_truncated else ''}:\n```{language}\n{excerpt}\n```"
+        )
+        retrieved_files.append(
+            AnalystChatRetrievedFile(
+                path=path,
+                language=language,
+                source=source,
+                matched_terms=matched_terms,
+                line_ranges=line_ranges,
+                excerpt_truncated=excerpt_truncated,
+            )
+        )
+        context_truncated = context_truncated or excerpt_truncated
+
+    if not prompt_sections:
+        return "", [], False, workspace_file_count
+
+    retrieval_context = (
+        f"Workspace search indexed {workspace_file_count} eligible file(s) for this sample.\n"
+        "Retrieved workspace file excerpts for the current question:\n\n"
+        + "\n\n".join(prompt_sections)
+    )
+    return retrieval_context, retrieved_files, context_truncated, workspace_file_count
+
+
+async def _load_preferred_provider(db: AsyncSession) -> ProviderConfig | None:
+    result = await db.execute(
+        select(ProviderConfig)
+        .where(ProviderConfig.is_active == True)  # noqa: E712
+        .order_by(ProviderConfig.created_at.desc())
+        .limit(1)
+    )
+    provider = result.scalar_one_or_none()
+    if provider is not None:
+        return provider
+
+    result = await db.execute(
+        select(ProviderConfig)
+        .order_by(ProviderConfig.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+def _build_llm_client(provider: ProviderConfig) -> tuple[LLMClient, int]:
+    context_window = _MAX_TOKENS_MAP.get(provider.max_tokens_preset, 131_072)
+    return (
+        LLMClient(
+            base_url=provider.base_url,
+            api_key=decrypt_value(provider.api_key_encrypted),
+            model=provider.model_name,
+            max_tokens=4096,
+            context_window=context_window,
+            cert_bundle=provider.cert_bundle_path,
+            use_system_trust=provider.use_system_trust,
+        ),
+        context_window,
+    )
+
+
+def _build_workspace_context_section(latest_workspace_context: Dict[str, Any], original_text: str) -> str:
+    workspace_summary = workspace_context_prompt(original_text)
+    workspace_details: List[str] = []
+    if isinstance(latest_workspace_context, dict):
+        hotspots = latest_workspace_context.get("dependency_hotspots", []) or latest_workspace_context.get("symbol_hotspots", [])
+        execution_paths = latest_workspace_context.get("execution_paths", [])
+        graph_summary = latest_workspace_context.get("graph_summary", {})
+        if hotspots:
+            workspace_details.append(
+                "Workspace hotspots: " + " | ".join(str(item) for item in hotspots[:6])
+            )
+        if execution_paths:
+            workspace_details.append(
+                "Execution paths: " + " | ".join(str(item) for item in execution_paths[:4])
+            )
+        if isinstance(graph_summary, dict) and graph_summary.get("cross_file_calls"):
+            workspace_details.append(
+                f"Cross-file calls: {graph_summary['cross_file_calls']}"
+            )
+    if not workspace_summary and not workspace_details:
+        return ""
+    return (
+        f"Workspace context:\n{workspace_summary}\n"
+        + ("\n".join(workspace_details) + "\n\n" if workspace_details else "\n")
+    )
+
+
 def _combine_summary_sections(sections: Dict[str, str]) -> str:
     ordered_sections = [
         ("Deobfuscation Analysis", sections.get("deobfuscation_analysis", "")),
@@ -99,6 +744,49 @@ def _combine_summary_sections(sections: Dict[str, str]) -> str:
         for title, body in ordered_sections
         if body and body.strip()
     )
+
+
+def _parse_iteration_state_json(state_json: Any) -> Dict[str, Any] | None:
+    if isinstance(state_json, dict):
+        return dict(state_json)
+    if isinstance(state_json, str):
+        try:
+            parsed = json.loads(state_json)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _serialise_iteration_record(record: IterationState) -> Dict[str, Any]:
+    payload = _parse_iteration_state_json(record.state_json)
+    state_json = (
+        {
+            key: value
+            for key, value in payload.items()
+            if key not in {"_code_snapshot", "_snapshot_meta"}
+        }
+        if payload is not None
+        else record.state_json
+    )
+    code_snapshot = (
+        payload.get("_code_snapshot")
+        if payload is not None and isinstance(payload.get("_code_snapshot"), str)
+        else None
+    )
+    snapshot_meta = (
+        payload.get("_snapshot_meta")
+        if payload is not None and isinstance(payload.get("_snapshot_meta"), dict)
+        else {}
+    )
+    return {
+        "id": record.id,
+        "iteration_number": record.iteration_number,
+        "state_json": state_json,
+        "code_snapshot": code_snapshot,
+        "snapshot_meta": snapshot_meta,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
 
 
 def _infer_likely_intent(
@@ -323,6 +1011,8 @@ async def upload_sample(
         )
 
     sample_language = language
+    content_kind = "archive_bundle" if archive_upload else "text"
+    content_encoding = None
     if archive_upload:
         try:
             bundle = build_workspace_bundle(
@@ -339,17 +1029,31 @@ async def upload_sample(
             )
         original_text = bundle.bundle_text
         sample_language = bundle.language
+        content_encoding = "workspace_bundle"
     else:
-        try:
-            original_text = content_bytes.decode("utf-8")
-        except UnicodeDecodeError:
+        content_kind = detect_upload_content_kind(safe_name, content_bytes)
+        if content_kind == "dotnet_binary":
+            original_text = binary_preview_text(safe_name, content_kind, len(content_bytes))
+            sample_language = "dotnet"
+            content_encoding = "binary"
+        elif content_kind == "pe_binary":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Native binary uploads currently support .NET assemblies only.",
+            )
+        else:
             try:
-                original_text = content_bytes.decode("latin-1")
+                original_text = content_bytes.decode("utf-8")
+                content_encoding = "utf-8"
             except UnicodeDecodeError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="File could not be decoded as UTF-8 or Latin-1 text",
-                )
+                try:
+                    original_text = content_bytes.decode("latin-1")
+                    content_encoding = "latin-1"
+                except UnicodeDecodeError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="File could not be decoded as UTF-8 or Latin-1 text",
+                    )
 
     # Optionally persist the raw file to disk
     upload_dir = settings.ensure_upload_dir()
@@ -368,6 +1072,10 @@ async def upload_sample(
         filename=safe_name,
         original_text=original_text,
         language=sample_language,
+        content_kind=content_kind,
+        content_encoding=content_encoding,
+        stored_file_path=str(disk_path),
+        byte_size=len(content_bytes),
         status=SampleStatus.READY.value,
     )
     db.add(sample)
@@ -712,15 +1420,7 @@ async def get_iterations(
     return {
         "sample_id": sample_id,
         "count": len(records),
-        "iterations": [
-            {
-                "id": r.id,
-                "iteration_number": r.iteration_number,
-                "state_json": r.state_json,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in records
-        ],
+        "iterations": [_serialise_iteration_record(r) for r in records],
     }
 
 
@@ -842,29 +1542,9 @@ async def generate_summary(
     recovered_text = sample.recovered_text or ""
     original_snippet = truncate_workspace_bundle(original_text, 2000)
     recovered_snippet = truncate_workspace_bundle(recovered_text, 2000)
-    workspace_summary = workspace_context_prompt(original_text)
-    workspace_details: List[str] = []
-    if isinstance(latest_workspace_context, dict):
-        hotspots = latest_workspace_context.get("dependency_hotspots", []) or latest_workspace_context.get("symbol_hotspots", [])
-        execution_paths = latest_workspace_context.get("execution_paths", [])
-        graph_summary = latest_workspace_context.get("graph_summary", {})
-        if hotspots:
-            workspace_details.append(
-                "Workspace hotspots: " + " | ".join(str(item) for item in hotspots[:6])
-            )
-        if execution_paths:
-            workspace_details.append(
-                "Execution paths: " + " | ".join(str(item) for item in execution_paths[:4])
-            )
-        if isinstance(graph_summary, dict) and graph_summary.get("cross_file_calls"):
-            workspace_details.append(
-                f"Cross-file calls: {graph_summary['cross_file_calls']}"
-            )
-    workspace_context_section = (
-        f"Workspace context:\n{workspace_summary}\n"
-        + ("\n".join(workspace_details) + "\n\n" if workspace_details else "\n")
-        if workspace_summary or workspace_details
-        else ""
+    workspace_context_section = _build_workspace_context_section(
+        latest_workspace_context,
+        original_text,
     )
 
     context = (
@@ -887,20 +1567,7 @@ async def generate_summary(
     )
 
     # Load LLM client
-    result = await db.execute(
-        select(ProviderConfig)
-        .where(ProviderConfig.is_active == True)  # noqa: E712
-        .order_by(ProviderConfig.created_at.desc())
-        .limit(1)
-    )
-    provider = result.scalar_one_or_none()
-    if provider is None:
-        result = await db.execute(
-            select(ProviderConfig)
-            .order_by(ProviderConfig.created_at.desc())
-            .limit(1)
-        )
-        provider = result.scalar_one_or_none()
+    provider = await _load_preferred_provider(db)
 
     if provider is None:
         summary = _build_fallback_ai_summary(
@@ -938,16 +1605,7 @@ async def generate_summary(
         confidence_score=confidence_score,
     )
 
-    context_window = _MAX_TOKENS_MAP.get(provider.max_tokens_preset, 131_072)
-    client = LLMClient(
-        base_url=provider.base_url,
-        api_key=decrypt_value(provider.api_key_encrypted),
-        model=provider.model_name,
-        max_tokens=4096,
-        context_window=context_window,
-        cert_bundle=provider.cert_bundle_path,
-        use_system_trust=provider.use_system_trust,
-    )
+    client, _ = _build_llm_client(provider)
 
     prompt = (
         "You are a senior reverse engineer writing a structured deobfuscation assessment. "
@@ -1027,3 +1685,222 @@ async def generate_summary(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"LLM request failed: {type(exc).__name__}: {exc}",
         )
+
+
+# ── POST /api/samples/{id}/chat ────────────────────────────────────
+@router.post(
+    "/samples/{sample_id}/chat",
+    response_model=AnalystChatResponse,
+)
+async def chat_about_sample(
+    sample_id: str,
+    payload: AnalystChatRequest,
+    db: AsyncSession = Depends(get_db),
+) -> AnalystChatResponse:
+    """Ask the configured LLM questions about a sample and its recovered output."""
+    sample = await db.get(Sample, sample_id)
+    if sample is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Sample {sample_id} not found",
+        )
+
+    provider = await _load_preferred_provider(db)
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No AI provider is configured for analyst chat",
+        )
+
+    transforms = (await db.execute(
+        select(TransformHistory)
+        .where(TransformHistory.sample_id == sample_id)
+        .order_by(TransformHistory.iteration)
+    )).scalars().all()
+    findings = (await db.execute(
+        select(FindingRecord)
+        .where(FindingRecord.sample_id == sample_id)
+    )).scalars().all()
+    iocs = (await db.execute(
+        select(IOCRecord)
+        .where(IOCRecord.sample_id == sample_id)
+    )).scalars().all()
+    strings = (await db.execute(
+        select(StringRecord)
+        .where(StringRecord.sample_id == sample_id)
+    )).scalars().all()
+    iter_state_row = (await db.execute(
+        select(IterationState)
+        .where(IterationState.sample_id == sample_id)
+        .order_by(IterationState.iteration_number.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    detected_techniques: List[str] = []
+    suspicious_apis: List[str] = []
+    confidence_score: float | None = None
+    latest_workspace_context: Dict[str, Any] = {}
+    if iter_state_row and iter_state_row.state_json:
+        state_data = _parse_iteration_state_json(iter_state_row.state_json)
+        if isinstance(state_data, dict):
+            detected_techniques = state_data.get("detected_techniques", []) or []
+            suspicious_apis = state_data.get("suspicious_apis", []) or []
+            confidence_score = state_data.get("confidence", {}).get("overall")
+            latest_workspace_context = state_data.get("workspace_context", {}) or {}
+
+    client, context_window = _build_llm_client(provider)
+    original_text = sample.original_text or ""
+    recovered_text = sample.recovered_text or ""
+    workspace_sample = (
+        sample.content_kind == "archive_bundle"
+        or original_text.startswith(WORKSPACE_BUNDLE_HEADER)
+        or recovered_text.startswith(WORKSPACE_BUNDLE_HEADER)
+    )
+
+    # Reserve space for instructions, transcript, and reply before filling code context.
+    code_budget = max(16_000, min(context_window * 3 // 2, 180_000))
+    retrieval_budget = max(0, int(code_budget * 0.34)) if workspace_sample else 0
+    original_budget = max(6_000, int(code_budget * (0.26 if workspace_sample else 0.45)))
+    recovered_budget = max(6_000, int(code_budget * (0.24 if workspace_sample else 0.45)))
+    original_context, original_truncated = _clip_code_context_for_prompt(original_text, original_budget)
+    recovered_context, recovered_truncated = _clip_code_context_for_prompt(recovered_text, recovered_budget)
+    retrieved_workspace_context = ""
+    retrieved_files: List[AnalystChatRetrievedFile] = []
+    workspace_search_enabled = False
+    workspace_file_count = 0
+    retrieval_truncated = False
+    if workspace_sample:
+        retrieved_workspace_context, retrieved_files, retrieval_truncated, workspace_file_count = _build_workspace_retrieval_context(
+            sample=sample,
+            original_text=original_text,
+            recovered_text=recovered_text,
+            messages=payload.messages,
+            max_chars=retrieval_budget,
+        )
+        workspace_search_enabled = workspace_file_count > 0
+    context_truncated = original_truncated or recovered_truncated or retrieval_truncated
+
+    workspace_context_section = _build_workspace_context_section(
+        latest_workspace_context,
+        original_text,
+    )
+    transform_summary = "\n".join(
+        f"- iter {transform.iteration}: {transform.action} ({'success' if transform.success and not transform.retry_revert else 'reverted' if transform.retry_revert else 'failed'})"
+        for transform in transforms[:20]
+    ) or "- none recorded"
+    finding_summary = "\n".join(
+        f"- [{finding.severity}] {finding.title}: {finding.description}"
+        for finding in findings[:12]
+    ) or "- none recorded"
+    ioc_summary = "\n".join(
+        f"- {ioc.type}: {ioc.value}"
+        for ioc in iocs[:20]
+    ) or "- none recorded"
+    string_summary = "\n".join(
+        f"- {truncate_workspace_bundle(string.value, 140)}"
+        for string in strings[:12]
+        if string.value
+    ) or "- none recorded"
+
+    system_prompt = (
+        "You are Unweaver's analyst chat. Answer questions about the uploaded sample, "
+        "the original code, the recovered code, and the analysis artifacts. "
+        "Use only the provided sample context, retrieved workspace excerpts, and transcript. "
+        "If the recovered output is incomplete, say so clearly. "
+        "Distinguish carefully between original and recovered code; do not blur them together unless they materially match. "
+        "For workspace uploads, retrieved file excerpts are the strongest project-level evidence available for this turn. "
+        "If the user asks about files that were not retrieved or are unavailable, say so clearly. "
+        "For concrete claims, cite the source inline using short tags such as [original], [recovered], [analysis], "
+        "or [retrieved:recovered:path/to/file], [retrieved:original:path/to/file], or [retrieved:archive:path/to/file]. "
+        "If a claim depends on multiple sources, cite all relevant tags. "
+        "If the evidence is partial, say so and cite the closest available source rather than overstating certainty. "
+        "Never reveal chain-of-thought, hidden reasoning, or <think> tags. "
+        "Do not narrate internal analysis steps. "
+        "Render answers in clean Markdown for the in-app chat UI. "
+        "You may use short headings, bullet lists, numbered lists, tables, blockquotes for caveats, "
+        "and fenced code blocks with language tags. "
+        "Use formatting deliberately to improve readability, not decoration. "
+        "Do not use raw HTML. "
+        "When quoting code, use fenced code blocks with a language tag when obvious. "
+        "Prefer concise, technically grounded answers."
+    )
+    sample_context_parts = [
+        f"Sample filename: {sample.filename}\n"
+        f"Language: {sample.language or 'unknown'}\n"
+        f"Status: {sample.status}\n"
+        f"Original length: {len(original_text)} chars\n"
+        f"Recovered length: {len(recovered_text)} chars\n"
+        f"Recovered confidence: {confidence_score}\n"
+        f"Detected techniques: {detected_techniques or ['none recorded']}\n"
+        f"Suspicious APIs: {suspicious_apis or ['none recorded']}\n"
+        "Source tag guide: [original] = uploaded source, [recovered] = deobfuscated output, "
+        "[analysis] = transforms/findings/IOCs/strings/workspace context, "
+        "[retrieved:recovered:path] = recovered workspace file excerpt, "
+        "[retrieved:original:path] = bundled original workspace file excerpt, "
+        "[retrieved:archive:path] = original archive file excerpt.\n\n",
+        workspace_context_section,
+    ]
+    if retrieved_workspace_context:
+        sample_context_parts.append(f"{retrieved_workspace_context}\n\n")
+    sample_context_parts.extend(
+        [
+            "Transform history:\n",
+            f"{transform_summary}\n\n",
+            "Findings:\n",
+            f"{finding_summary}\n\n",
+            "IOCs:\n",
+            f"{ioc_summary}\n\n",
+            "Recovered strings:\n",
+            f"{string_summary}\n\n",
+            f"Original code{' (truncated)' if original_truncated else ''}:\n```{sample.language or ''}\n{original_context}\n```\n\n",
+            f"Recovered code{' (truncated)' if recovered_truncated else ''}:\n```{sample.language or ''}\n{recovered_context}\n```",
+        ]
+    )
+    sample_context = "".join(sample_context_parts)
+
+    transcript = [
+        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": sample_context},
+        *[
+            {"role": message.role, "content": message.content.strip()}
+            for message in payload.messages[-16:]
+            if message.content.strip()
+        ],
+    ]
+
+    if not any(message["role"] == "user" for message in transcript):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one user message is required",
+        )
+
+    try:
+        reply = await client.chat(
+            messages=transcript,
+            temperature=0.2,
+            max_tokens=1800,
+        )
+    except Exception as exc:
+        logger.error("Failed to generate analyst chat reply: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"LLM request failed: {type(exc).__name__}: {exc}",
+        )
+
+    cleaned_reply = re.sub(r"<think>[\s\S]*?</think>", "", reply, flags=re.IGNORECASE).strip()
+    if not cleaned_reply:
+        cleaned_reply = "No final answer was returned by the model."
+    cleaned_reply = _normalise_chat_source_tags(
+        cleaned_reply,
+        retrieved_files=retrieved_files,
+    )
+
+    return AnalystChatResponse(
+        answer=cleaned_reply,
+        provider_name=provider.name,
+        model_name=provider.model_name,
+        context_truncated=context_truncated,
+        workspace_search_enabled=workspace_search_enabled,
+        workspace_file_count=workspace_file_count,
+        retrieved_files=retrieved_files,
+    )

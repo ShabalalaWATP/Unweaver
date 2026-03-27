@@ -88,6 +88,10 @@ async def _ensure_runtime_columns(conn) -> None:
     _MIGRATIONS = [
         ("samples", "saved_analysis_json", "ALTER TABLE samples ADD COLUMN saved_analysis_json JSON"),
         ("samples", "saved_analysis_at", "ALTER TABLE samples ADD COLUMN saved_analysis_at DATETIME"),
+        ("samples", "content_kind", "ALTER TABLE samples ADD COLUMN content_kind VARCHAR(64) NOT NULL DEFAULT 'text'"),
+        ("samples", "content_encoding", "ALTER TABLE samples ADD COLUMN content_encoding VARCHAR(64)"),
+        ("samples", "stored_file_path", "ALTER TABLE samples ADD COLUMN stored_file_path VARCHAR(2048)"),
+        ("samples", "byte_size", "ALTER TABLE samples ADD COLUMN byte_size INTEGER"),
     ]
 
     for table, column, ddl in _MIGRATIONS:

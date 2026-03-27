@@ -9,6 +9,7 @@ and supports state rollback for backtracking.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,26 @@ from app.models.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+_CODE_SNAPSHOT_LIMIT = 50_000
+
+
+def build_state_snapshot_payload(
+    state: AnalysisState,
+    code: str,
+    *,
+    captured_at: datetime | None = None,
+) -> str:
+    """Serialise analysis state with a bounded code snapshot for the UI."""
+    timestamp = captured_at or datetime.now(timezone.utc)
+    payload = state.model_dump()
+    payload["_code_snapshot"] = code[:_CODE_SNAPSHOT_LIMIT]
+    payload["_snapshot_meta"] = {
+        "captured_at": timestamp.isoformat(),
+        "code_length": len(code),
+        "code_truncated": len(code) > _CODE_SNAPSHOT_LIMIT,
+    }
+    return json.dumps(payload)
 
 
 class StateSnapshot:
@@ -302,34 +323,44 @@ class StateManager:
     async def persist_snapshot(self) -> None:
         """Persist the current state snapshot to the database.
 
-        This is a no-op when no db_session is available.  The actual
-        ORM model will be provided by ``app.models.db_models`` once it
-        exists; for now we store the JSON payload and log.
+        This is a no-op when no db_session is available.
         """
         if self.db_session is None:
             return
 
         try:
-            payload = {
-                "sample_id": self.sample_id,
-                "iteration": self.current_iteration,
-                "state_json": self.state.model_dump(),
-                "code_snapshot": self.current_code[:50_000],  # cap size
-                "overall_confidence": self.overall_confidence,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            # If the session has an ``execute`` method (SQLAlchemy AsyncSession),
-            # store as raw insert. Otherwise just log.
-            if hasattr(self.db_session, "execute"):
-                logger.debug(
-                    "Persisting snapshot for sample %s iteration %d",
-                    self.sample_id,
-                    self.current_iteration,
+            from sqlalchemy import select
+
+            from app.models.db_models import IterationState
+
+            state_json = build_state_snapshot_payload(
+                self.state,
+                self.current_code,
+            )
+            logger.debug(
+                "Persisting snapshot for sample %s iteration %d",
+                self.sample_id,
+                self.current_iteration,
+            )
+            existing = (
+                await self.db_session.execute(
+                    select(IterationState)
+                    .where(IterationState.sample_id == self.sample_id)
+                    .where(IterationState.iteration_number == self.current_iteration)
+                    .limit(1)
                 )
-                # Actual INSERT will go here when ORM models are ready.
-                # For now, we just commit the intent.
+            ).scalar_one_or_none()
+            if existing is None:
+                self.db_session.add(
+                    IterationState(
+                        sample_id=self.sample_id,
+                        iteration_number=self.current_iteration,
+                        state_json=state_json,
+                    )
+                )
             else:
-                logger.debug("DB session has no execute method; skipping persist")
+                existing.state_json = state_json
+            await self.db_session.flush()
         except Exception:
             logger.exception("Failed to persist state snapshot")
 

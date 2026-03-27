@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import type { AISummaryReport, AnalysisState, SampleDetail } from '@/types';
+import type { AISummaryReport, AnalysisState, SampleDetail, WorkspaceContext } from '@/types';
 import * as api from '@/services/api';
 import reportCascadeGraphic from '@/assets/graphics/report-cascade.svg';
 
@@ -237,6 +237,17 @@ const s = {
     color: 'var(--text-muted)',
     fontStyle: 'italic',
   } as React.CSSProperties,
+  coverageNote: {
+    fontSize: '11px',
+    color: 'var(--text-muted)',
+    lineHeight: '1.6',
+    marginTop: '10px',
+  } as React.CSSProperties,
+  failureBody: {
+    fontSize: '12px',
+    color: 'var(--danger)',
+    lineHeight: '1.6',
+  } as React.CSSProperties,
 };
 
 function getConfidenceColor(v: number): string {
@@ -249,15 +260,37 @@ function getStatusBadge(status: string): { color: string; bg: string } {
   switch (status) {
     case 'ready':
       return { color: 'var(--warning)', bg: 'var(--warning-muted)' };
+    case 'pending':
+      return { color: 'var(--accent)', bg: 'var(--accent-muted)' };
     case 'completed':
       return { color: 'var(--success)', bg: 'var(--success-muted)' };
     case 'failed':
       return { color: 'var(--danger)', bg: 'var(--danger-muted)' };
+    case 'stopped':
+      return { color: 'var(--warning)', bg: 'var(--warning-muted)' };
     case 'running':
       return { color: 'var(--accent)', bg: 'var(--accent-muted)' };
     default:
       return { color: 'var(--text-muted)', bg: 'var(--bg-tertiary)' };
   }
+}
+
+function buildWorkspaceCoverage(context: WorkspaceContext | null | undefined) {
+  if (!context) return [];
+
+  const stats = [
+    { label: 'Indexed Files', value: context.indexed_file_count ?? null },
+    { label: 'Bundled Files', value: context.bundle_file_count ?? context.bundled_file_count ?? context.included_files ?? null },
+    { label: 'Targeted Files', value: context.targeted_file_count ?? context.targeted_files?.length ?? null },
+    { label: 'Recovered Files', value: context.deobfuscated_file_count ?? context.deobfuscated_files?.length ?? null },
+    { label: 'Deferred Hotspots', value: context.remaining_frontier_paths?.length ?? null },
+    { label: 'Omitted Files', value: context.omitted_files ?? null },
+    { label: 'LLM Focus Files', value: context.llm_focus_paths?.length ?? null },
+  ];
+
+  return stats.filter(
+    (item): item is { label: string; value: number } => typeof item.value === 'number',
+  );
 }
 
 export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
@@ -304,6 +337,9 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
   const techniques = analysisState?.detected_techniques ?? [];
   const suggestions = analysisState?.llm_suggestions ?? [];
   const iterState = analysisState?.iteration_state;
+  const workspaceContext = analysisState?.workspace_context ?? savedAnalysis?.workspace_context ?? null;
+  const workspaceCoverage = buildWorkspaceCoverage(workspaceContext);
+  const fatalError = typeof iterState?.fatal_error === 'string' ? iterState.fatal_error : null;
   const statusBadge = getStatusBadge(sample.status);
 
   const successCount = transforms.filter((t) => t.success && !t.retry_revert).length;
@@ -339,6 +375,30 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
           </div>
         </div>
       </div>
+
+      {fatalError && (
+        <div className="unweaver-card" style={{ ...s.card, borderLeft: '3px solid var(--danger)' }}>
+          <div style={s.cardTitle}>Run Failure</div>
+          <div style={s.failureBody}>{fatalError}</div>
+        </div>
+      )}
+
+      {sample.language === 'workspace' && workspaceCoverage.length > 0 && (
+        <div className="unweaver-card" style={s.card}>
+          <div style={s.cardTitle}>Workspace Coverage</div>
+          <div style={s.metricGrid}>
+            {workspaceCoverage.map((item) => (
+              <div key={item.label} style={s.metric}>
+                <div style={s.metricValue}>{item.value}</div>
+                <div style={s.metricLabel}>{item.label}</div>
+              </div>
+            ))}
+          </div>
+          <div style={s.coverageNote}>
+            Confidence reflects the bundled files and targeted hotspots that were actually analyzed. It is not proof that every archived file was fully recovered.
+          </div>
+        </div>
+      )}
 
       {/* AI Summary */}
       <div className="unweaver-card unweaver-glow-border" style={s.card}>

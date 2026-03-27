@@ -106,6 +106,8 @@ class SampleResponse(BaseModel):
     project_id: str
     filename: str
     language: Optional[str] = None
+    content_kind: str = "text"
+    byte_size: Optional[int] = None
     status: SampleStatus = SampleStatus.READY
     saved_analysis_at: Optional[datetime] = None
     created_at: datetime
@@ -127,6 +129,42 @@ class AISummaryReport(BaseModel):
     summary: str
     sections: AISummarySections
     confidence_score: Optional[float] = None
+
+
+class AnalystChatMessage(BaseModel):
+    """Single message in the analyst chat transcript."""
+
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1)
+
+
+class AnalystChatRequest(BaseModel):
+    """Chat payload sent from the analyst UI."""
+
+    messages: List[AnalystChatMessage] = Field(default_factory=list)
+
+
+class AnalystChatRetrievedFile(BaseModel):
+    """Workspace file context pulled into a chat answer."""
+
+    path: str
+    language: Optional[str] = None
+    source: Literal["recovered_bundle", "original_bundle", "archive_scan"]
+    matched_terms: List[str] = Field(default_factory=list)
+    line_ranges: List[str] = Field(default_factory=list)
+    excerpt_truncated: bool = False
+
+
+class AnalystChatResponse(BaseModel):
+    """Assistant reply for the analyst chat panel."""
+
+    answer: str
+    provider_name: str
+    model_name: str
+    context_truncated: bool = False
+    workspace_search_enabled: bool = False
+    workspace_file_count: int = 0
+    retrieved_files: List[AnalystChatRetrievedFile] = Field(default_factory=list)
 
 
 class SavedAnalysisSnapshot(BaseModel):
@@ -156,6 +194,8 @@ class SampleDetail(BaseModel):
     original_text: str
     recovered_text: Optional[str] = None
     language: Optional[str] = None
+    content_kind: str = "text"
+    byte_size: Optional[int] = None
     status: SampleStatus = SampleStatus.READY
     analyst_notes: Optional[str] = None
     saved_analysis: Optional[SavedAnalysisSnapshot] = None

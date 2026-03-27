@@ -1,8 +1,8 @@
 # Unweaver
 
-An agentic code deobfuscation workbench for malware analysts and security researchers. Unweaver combines 35+ deterministic transforms with an LLM-assisted orchestration loop to iteratively recover readable source from obfuscated JavaScript, TypeScript, Python, PowerShell, and C#/.NET scripts — including AES/RC4 decryption, rolling XOR recovery, Base32/Base85 decoding, reflection chain resolution, and multi-layer unwrapping (8+ nested encoding layers).
+An agentic code deobfuscation workbench for malware analysts and security researchers. Unweaver combines 35+ deterministic transforms with an LLM-assisted orchestration loop to iteratively recover readable source from obfuscated JavaScript, TypeScript, Python, and PowerShell, plus perform static .NET assembly analysis and pseudo-source reconstruction where possible. The deepest deterministic recovery paths today are JavaScript/TypeScript, Python, and PowerShell; workspace/codebase rewriting is narrower than general repository inspection and is bounded by prioritisation limits.
 
-Paste or upload hostile code, hit Analyse, and watch the multi-pass engine strip away obfuscation layers — without ever executing the code.
+Paste or upload hostile code, hit Analyse, and watch the multi-pass engine strip away obfuscation layers. Most analysis is static; the JavaScript runtime-encoder path uses a tightly constrained local Node VM worker for constructor-chain families such as JSFuck, JJEncode, and AAEncode.
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue)
 ![React](https://img.shields.io/badge/React-18-61dafb)
@@ -37,13 +37,15 @@ Unweaver is a web application that takes obfuscated code (malware scripts, packe
 1. **Detects** the language and obfuscation techniques used — fingerprints 10+ known obfuscator tools (javascript-obfuscator, JSFuck, JJEncode, PyArmor, Invoke-Obfuscation, ConfuserEx, SmartAssembly, etc.)
 2. **Decodes** multiple encoding layers — Base64 (8 nested layers, URL-safe), Base32, Base85/Ascii85, hex (5 formats), Unicode escapes, HTML entities, URL encoding, PowerShell EncodedCommand (UTF-16LE)
 3. **Decrypts** encrypted payloads — AES-CBC/ECB (128/192/256-bit), RC4, XOR (single-byte, multi-byte Kasiski, rolling/rotating, CBC-like chaining, crib-dragging with 12+ default cribs)
-4. **Simplifies** obfuscated code — constant folding, control flow unflattening (switch dispatcher + state machine tracing), junk code removal, JavaScript array resolver, .NET/PowerShell reflection chain resolution, Python pickle/marshal/zlib chain decoding
-5. **Uses AI** (optional) to classify obfuscation type, plan transform strategy with multi-turn refinement, select transforms intelligently, reflect on failures, assess confidence, rename variables semantically, and auto-generate analysis summaries
+4. **Simplifies** obfuscated code — constant folding, control flow unflattening (switch dispatcher + state machine tracing), junk code removal, JavaScript array resolver, automatic JavaScript hard-mode escalation for layered/runtime-heavy samples, .NET/PowerShell reflection chain resolution, Python pickle/marshal/zlib chain decoding
+5. **Uses AI** (optional) to classify obfuscation type, plan transform strategy with multi-turn refinement, escalate earlier on hard JavaScript where semantic recovery matters, pull focused workspace hotspot context from stored archives, power an analyst chat that compares original and recovered code with inline source tags, reflect on failures, assess confidence, rename identifiers more readably, and auto-generate analysis summaries
 6. **Scores** each result — blended heuristic + LLM confidence assessment (60/40), readability metrics, auto-rollback on regression, stall-resistant decode scheduling for multi-layer samples
 7. **Extracts** IOCs (URLs, IPs, emails, file paths, registry keys, mutexes, hashes), strings, and severity-ranked security findings with evidence linking
-8. **Presents** results in a dark/light analyst workbench — Monaco editor, per-file workspace browser with recovery summaries, per-file diffs, finding-to-code navigation, structured decision log, and auto-generated AI reports
+8. **Presents** results in a dark/light analyst workbench — Monaco editor, per-file workspace browser with heuristic change summaries, per-file diffs, finding-to-code navigation, structured decision log, and auto-generated AI reports
 
-Everything happens statically — **no code is ever executed**.
+Analysis is predominantly static. The main exception is the JavaScript runtime-encoder decoder, which can run a captured sample inside a short-lived local Node `vm` worker with the permission model enabled, patched `eval`/`Function`/timer hooks, no network or child-process access, and tight timeouts.
+
+Workspace and monorepo uploads are handled as bounded, prioritised bundles. Unweaver does not attempt an exhaustive whole-repo rewrite in one pass; it profiles the archive, selects likely entrypoints and hotspots, targets a limited set of files, and expands the active bundle iteratively when the remaining frontier still looks valuable.
 
 ---
 
@@ -115,18 +117,19 @@ Each iteration of the backend analysis engine runs through:
 
 | Category | Capabilities |
 |----------|-------------|
-| **Languages** | JavaScript, TypeScript, Python, PowerShell, C#/.NET — extensible |
+| **Languages** | Strongest deterministic support: JavaScript/TypeScript/JSX/TSX, Python, and PowerShell. .NET assemblies are handled via static inspection and pseudo-source reconstruction, not full general decompilation. |
 | **Encoding transforms** | Base64 (8 nested layers, URL-safe variant), Base32 (standard + hex), Base85/Ascii85, hex (5 formats), Unicode escapes, octal, HTML entities, URL percent-encoding |
 | **Crypto transforms** | AES-CBC/ECB decryption (128/192/256-bit keys), RC4 decryption, XOR recovery (single-byte brute force, multi-byte Kasiski, rolling/rotating XOR, CBC-like chaining, crib-dragging), string decryption (ROT13, Caesar, reverse, charcode offset) |
 | **Code transforms** | Constant folding (`String.fromCharCode`, `chr()`, `parseInt`, `Math.*`), junk code removal (opaque predicates, unreachable code, no-ops), control flow unflattening (switch dispatcher, string-split, state machine tracing), JavaScript array resolver, safe expression evaluation, deterministic variable renaming |
 | **Language-specific** | PowerShell (`-EncodedCommand`, backtick/caret escapes, format strings, `-replace` chains), Python (`exec`/`codecs`/`chr()` sequences, pickle/marshal/zlib chain detection and safe string extraction), .NET/PowerShell reflection chain resolution (`GetMethod`+`Invoke`, `Activator.CreateInstance`, `Assembly.Load` chains, `[scriptblock]::Create`) |
 | **LLM transforms** | LLM-powered deobfuscation, variable/function renaming, code summarisation, multi-layer unwrapping, obfuscation classification, transform selection, failure reflection, confidence assessment, multi-turn planning |
 | **IOC extraction** | URLs, IPs (v4/v6), emails, file paths, registry keys, mutexes, hashes (MD5, SHA1, SHA256), defanged indicator support |
-| **Analysis engine** | Priority queue with auto-approve, per-iteration state snapshots with rollback, LLM-assessed confidence (60% heuristic / 40% LLM blend), stall-resistant decode scheduling, multi-layer re-decode (up to 5 re-runs per decoder), readability scoring, typed WebSocket events for real-time progress |
+| **Analysis engine** | Priority queue with auto-approve, persisted per-iteration state and code snapshots with rollback, truthful failure handling for fatal orchestrator errors, LLM-assessed confidence (60% heuristic / 40% LLM blend), stall-resistant decode scheduling, multi-layer re-decode (up to 5 re-runs per decoder), archive-backed workspace profiling, bounded hotspot-focused workspace rewrites, readability scoring, typed WebSocket events for real-time progress |
 | **LLM integration** | OpenAI-compatible (OpenAI, Azure, vLLM, Ollama, LM Studio), context-window-aware truncation (128K-200K), dynamic response token budgeting, `max_completion_tokens` default with `max_tokens` fallback, custom CA cert bundles, encrypted API key storage (Fernet AES-128-CBC + HMAC-SHA256) |
-| **UI** | Dark and light themes, Monaco editor with syntax highlighting, per-file workspace browser with recovery summaries, per-file diff viewer for workspace bundles, finding-to-code navigation, severity-filtered findings, structured decision log (Notebook tab), confidence gauge, analyst notes |
+| **Analyst chat** | Docked or expanded in-app chat using the same provider endpoint as the rest of the app, markdown-rendered answers with copyable code blocks, hidden thinking stripped, and retrieval-backed workspace context across original bundle files, recovered bundle files, and stored archive excerpts for the active sample |
+| **UI** | Dark and light themes, Monaco editor with syntax highlighting, per-file workspace browser with heuristic change summaries, per-file diff viewer for workspace bundles, finding-to-code navigation, severity-filtered findings, structured decision log (Notebook tab), confidence gauge, analyst notes, searchable project switching, archive/hide controls, and stronger delete/selection flows |
 | **AI Summary** | Auto-generated after analysis completes, few-shot calibrated prompts, structured sections (deobfuscation analysis, original intent, actual behavior, confidence assessment) |
-| **Export** | Download individual recovered files, full workspace as ZIP, Markdown reports, JSON reports |
+| **Export** | Download individual recovered files, full workspace as ZIP (merging recovered bundle files back over the original uploaded archive when available), Markdown reports, JSON reports |
 
 ---
 
@@ -350,8 +353,16 @@ All settings use the `UNWEAVER_` prefix. Place them in a `.env` file in the `bac
 |----------|---------|-------------|
 | `UNWEAVER_DATABASE_URL` | `sqlite+aiosqlite:///./unweaver.db` | Database connection string |
 | `UNWEAVER_UPLOAD_DIR` | `backend/uploads` | Directory for uploaded files |
-| `UNWEAVER_MAX_FILE_SIZE` | `5242880` (5 MB) | Maximum upload size in bytes |
-| `UNWEAVER_MAX_ITERATIONS` | `20` | Maximum deobfuscation loop iterations |
+| `UNWEAVER_MAX_FILE_SIZE` | `20971520` (20 MB) | Maximum upload or pasted-text size in bytes |
+| `UNWEAVER_MAX_ARCHIVE_FILE_SIZE` | `134217728` (128 MB) | Maximum compressed archive upload size in bytes |
+| `UNWEAVER_MAX_ARCHIVE_MEMBER_SIZE` | `4194304` (4 MB) | Maximum extracted text size per file inside an archive |
+| `UNWEAVER_MAX_BUNDLED_SOURCE_SIZE` | `50331648` (48 MB) | Maximum synthetic workspace bundle size after archive expansion |
+| `UNWEAVER_MAX_ARCHIVE_FILES` | `224` | Maximum bundled files preserved in the active workspace text |
+| `UNWEAVER_MAX_ARCHIVE_SCAN_FILES` | `1500` | Maximum eligible files indexed from a stored archive for workspace graphing and AI focus |
+| `UNWEAVER_MAX_WORKSPACE_TARGET_FILES` | `28` | Maximum files targeted in a single workspace deterministic pass |
+| `UNWEAVER_MAX_WORKSPACE_BUNDLE_ADDITIONS` | `24` | Maximum new files added from the archive into an active workspace rewrite |
+| `UNWEAVER_MAX_ITERATIONS` | `36` | Maximum deobfuscation loop iterations for single files |
+| `UNWEAVER_MAX_WORKSPACE_ITERATIONS` | `44` | Maximum deobfuscation loop iterations for workspace/codebase uploads |
 | `UNWEAVER_AUTO_APPROVE_THRESHOLD` | `0.85` | Confidence threshold for auto-approving transforms |
 | `UNWEAVER_MIN_CONFIDENCE_THRESHOLD` | `0.3` | Minimum confidence to enqueue an action |
 | `UNWEAVER_STALL_THRESHOLD` | `3` | No-progress iterations before stopping |
@@ -378,7 +389,7 @@ Projects group related samples. Click the **"+"** button in the sidebar.
 
 ### 2. Add Samples
 
-- **Upload** — drag-and-drop an obfuscated file (up to 5 MB)
+- **Upload** — drag-and-drop an obfuscated file (up to 20 MB) or archive/codebase bundle (up to 128 MB)
 - **Paste** — paste code directly into the text area
 
 ### 3. Configure an LLM Provider (Optional)
@@ -390,7 +401,7 @@ Click the **gear icon** in the sidebar. Add an OpenAI-compatible endpoint:
 - **API Key**: stored securely, masked in all responses
 - **Max Tokens**: 128k or 200k preset
 
-Click **"Test Connection"** to verify. The deterministic engine works fully without an LLM — the AI integration adds planning intelligence, variable naming, and summary generation.
+Click **"Test Connection"** to verify. The deterministic engine works fully without an LLM — the AI integration adds planning intelligence, earlier hard-mode JavaScript recovery, more readable identifier naming, and summary generation.
 
 ### 4. Run Analysis
 
@@ -420,11 +431,28 @@ Navigate the **9 workspace tabs**:
 | **Findings** | Severity-ranked security findings |
 | **Notebook** | Internal orchestrator state, LLM suggestions, and decision log |
 
-### 6. Generate AI Summary
+The **Transforms** timeline now exposes persisted code snapshots for each stored iteration, and fatal backend errors are surfaced as failures instead of being reported as successful completions.
+
+### 6. Ask Analyst Chat
+
+Click **"Ask AI"** in the bottom-right corner to open the docked analyst chat. For the active sample it can see:
+
+- the original uploaded code
+- the recovered/deobfuscated output
+- findings, IOCs, recovered strings, transform history, and workspace context
+- retrieval-backed workspace excerpts from recovered files, bundled original files, and stored archive files when the sample is a codebase upload
+
+For workspace samples, the chat can compare original and recovered variants of the same path, search the active sample's indexed files, and cite claims inline with tags such as `[original]`, `[recovered]`, `[analysis]`, and `[retrieved:original:path/to/file]`.
+
+### 7. Generate AI Summary
 
 On the **Summary** tab, click **"Generate Summary"** to produce an LLM-written analysis report covering what the code does, what obfuscation was used, and what was recovered.
 
-### 7. Export Reports
+### 8. Organise Projects
+
+The sidebar supports searchable project switching, project sorting, archive/hide for older projects, clearer delete confirmation, and automatic fallback selection after deleting the active project.
+
+### 9. Export Reports
 
 Use the export buttons to download:
 
@@ -462,7 +490,8 @@ All endpoints are under `/api`. Interactive docs at `/docs` (Swagger) and `/redo
 | `GET` | `/api/samples/{id}/iocs` | Get extracted IOCs |
 | `GET` | `/api/samples/{id}/findings` | Get analysis findings |
 | `GET` | `/api/samples/{id}/transforms` | Get transform history |
-| `GET` | `/api/samples/{id}/iterations` | Get iteration state snapshots |
+| `GET` | `/api/samples/{id}/iterations` | Get iteration state snapshots and persisted code snapshots |
+| `POST` | `/api/samples/{id}/chat` | Ask the analyst chat about the active sample and retrieved workspace context |
 | `POST` | `/api/samples/{id}/summary` | Generate AI analysis summary |
 | `PUT` | `/api/samples/{id}/notes` | Save analyst notes |
 | `DELETE` | `/api/samples/{id}` | Delete a sample |
@@ -472,7 +501,7 @@ All endpoints are under `/api`. Interactive docs at `/docs` (Swagger) and `/redo
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/api/samples/{id}/analyze` | Start deobfuscation analysis |
-| `GET` | `/api/samples/{id}/analysis/status` | Poll analysis progress |
+| `GET` | `/api/samples/{id}/analysis/status` | Poll analysis progress with truthful terminal status reporting |
 | `POST` | `/api/samples/{id}/analysis/stop` | Request cancellation |
 
 ### LLM Providers
@@ -541,7 +570,7 @@ pytest -v
 pytest tests/test_transforms.py -v
 ```
 
-Current backend suite: `282` passing tests covering API endpoints, transform correctness, workspace bundles, orchestrator logic, reports, WebSocket flows, and LLM provider handling.
+Current backend suite: `288` passing tests covering API endpoints, transform correctness, workspace bundles, orchestrator logic, reports, WebSocket flows, and LLM provider handling.
 
 ---
 
@@ -560,8 +589,11 @@ Works fully offline once installed:
 
 Requires a **local** OpenAI-compatible endpoint on the isolated network:
 
-- LLM-assisted deobfuscation / renaming / summaries
-- LLM planning, transform selection, and reflection
+- LLM-assisted deobfuscation transforms
+- LLM-assisted variable/function renaming
+- Analyst chat and retrieval-backed workspace Q&A
+- AI summary generation
+- LLM-driven stop decisions
 
 ### Recommended Air-Gapped Linux Install
 
@@ -725,9 +757,9 @@ If `UNWEAVER_SECRET_KEY` is omitted, Unweaver generates one locally and stores i
 
 ## Security Notes
 
-- **No code execution** — all analysis is static pattern matching, string decoding, and LLM inference
+- **Mostly static analysis** — nearly all transforms operate without execution; the JavaScript runtime-encoder decoder is the exception and runs inside a locked-down local Node VM worker with permission restrictions, patched runtime hooks, and short timeouts
 - **API keys** are encrypted at rest using Fernet symmetric encryption and masked in all API responses
-- **File uploads** are sanitised: filenames stripped of directory components, size capped at 5 MB
+- **File uploads** are sanitised: filenames stripped of directory components, capped at 20 MB for direct files/text and 128 MB for archives, with per-member, per-bundle, and archive-index limits for workspace expansion
 - **CORS** is configurable via `UNWEAVER_CORS_ORIGINS` environment variable; defaults to localhost origins
 - **Custom CA certificates** supported for enterprise TLS inspection environments
 - **No secrets in logs** — API keys are masked in all log output
@@ -744,7 +776,7 @@ If `UNWEAVER_SECRET_KEY` is omitted, Unweaver generates one locally and stores i
 | LLM Client | httpx (async), OpenAI-compatible chat/completions, context-window-aware, dynamic token budgeting |
 | Crypto | Fernet AES-128-CBC (API key encryption), AES-CBC/ECB + RC4 (payload decryption), pure-Python RC4 |
 | Styling | CSS custom properties with dark/light theme system |
-| Testing | pytest, pytest-asyncio, httpx AsyncClient (198+ tests) |
+| Testing | pytest, pytest-asyncio, httpx AsyncClient (288+ tests) |
 | Containers | Docker, Docker Compose |
 
 ---

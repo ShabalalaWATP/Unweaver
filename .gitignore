@@ -4,6 +4,7 @@ __pycache__/
 node_modules/
 dist/
 .env
+.unweaver_secret
 *.pem
 *.crt
 data/
@@ -15,3 +16,5 @@ venv/
 package-lock.json
 !frontend/package-lock.json
 !backend/app/services/transforms/js_tooling/package-lock.json
+backend/app/services/transforms/dotnet_worker/bin/
+backend/app/services/transforms/dotnet_worker/obj/

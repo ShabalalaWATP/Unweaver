@@ -18,6 +18,7 @@ from app.core.config import settings
 from app.services.ingest.workspace_bundle import (
     ParsedWorkspaceFile,
     load_workspace_archive_from_path,
+    normalise_workspace_path,
     overlay_workspace_files,
     parse_workspace_bundle,
     rebuild_workspace_bundle,
@@ -148,6 +149,52 @@ def _is_syntax_healthy(language: str, code: str) -> bool:
     return _balanced_delimiters(cleaned)
 
 
+def _coerce_workspace_file_addition(
+    item: Any,
+    *,
+    fallback_language: str,
+) -> Optional[ParsedWorkspaceFile]:
+    if not isinstance(item, dict):
+        return None
+
+    path = normalise_workspace_path(str(item.get("path") or ""))
+    if not path:
+        return None
+
+    text = str(item.get("text") or "")
+    if not text.strip():
+        return None
+
+    language = str(item.get("language") or fallback_language or "plaintext").strip().lower()
+    priority_raw = item.get("priority", [])
+    if isinstance(priority_raw, str):
+        priority = (priority_raw.strip(),) if priority_raw.strip() else ()
+    elif isinstance(priority_raw, (list, tuple)):
+        priority = tuple(
+            str(entry).strip()
+            for entry in priority_raw
+            if str(entry).strip()
+        )
+    else:
+        priority = ()
+
+    if not _is_syntax_healthy(language, text):
+        return None
+
+    try:
+        size_bytes = int(item.get("size_bytes") or len(text.encode("utf-8")))
+    except (TypeError, ValueError):
+        size_bytes = len(text.encode("utf-8"))
+
+    return ParsedWorkspaceFile(
+        path=path,
+        language=language,
+        priority=priority,
+        size_bytes=size_bytes,
+        text=text,
+    )
+
+
 class WorkspaceFileDeobfuscator(BaseTransform):
     name = "WorkspaceFileDeobfuscator"
     description = "Run deterministic deobfuscation against prioritized workspace files."
@@ -256,6 +303,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         rewritten_files: List[ParsedWorkspaceFile] = []
         changed_files: List[str] = []
         added_files: List[str] = []
+        synthetic_additions: Dict[str, ParsedWorkspaceFile] = {}
         file_transform_summary: List[Dict[str, Any]] = []
         aggregate_details = self._initial_aggregate_details()
 
@@ -270,7 +318,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                 python_modules=python_modules,
                 symbol_literals=symbol_literals,
             )
-            transformed_file, summary, details = self._process_file(
+            transformed_file, summary, details, additions = self._process_file(
                 file=file,
                 global_state=state,
                 imported_literals=imported_literals,
@@ -278,6 +326,15 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             rewritten_files.append(transformed_file)
             file_transform_summary.append(summary)
             self._merge_transform_details(aggregate_details, details, file.path)
+            self._register_workspace_additions(
+                additions=additions,
+                synthetic_additions=synthetic_additions,
+                added_files=added_files,
+                file_transform_summary=file_transform_summary,
+                aggregate_details=aggregate_details,
+                symbol_literals=symbol_literals,
+                origin_path=file.path,
+            )
             symbol_literals[file.path] = extract_literal_bindings(
                 transformed_file.text,
                 transformed_file.language,
@@ -299,7 +356,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                 python_modules=python_modules,
                 symbol_literals=symbol_literals,
             )
-            transformed_file, summary, details = self._process_file(
+            transformed_file, summary, details, additions = self._process_file(
                 file=file,
                 global_state=state,
                 imported_literals=imported_literals,
@@ -307,6 +364,15 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             rewritten_files.append(transformed_file)
             file_transform_summary.append(summary)
             self._merge_transform_details(aggregate_details, details, file.path)
+            self._register_workspace_additions(
+                additions=additions,
+                synthetic_additions=synthetic_additions,
+                added_files=added_files,
+                file_transform_summary=file_transform_summary,
+                aggregate_details=aggregate_details,
+                symbol_literals=symbol_literals,
+                origin_path=file.path,
+            )
             symbol_literals[file.path] = extract_literal_bindings(
                 transformed_file.text,
                 transformed_file.language,
@@ -315,6 +381,9 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             added_files.append(file.path)
             if transformed_file.text != file.text:
                 changed_files.append(file.path)
+
+        if synthetic_additions:
+            rewritten_files.extend(synthetic_additions.values())
 
         if not changed_files and not added_files:
             return TransformResult(
@@ -503,10 +572,11 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         file: ParsedWorkspaceFile,
         global_state: dict,
         imported_literals: Dict[str, Any],
-    ) -> Tuple[ParsedWorkspaceFile, Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[ParsedWorkspaceFile, Dict[str, Any], Dict[str, Any], List[ParsedWorkspaceFile]]:
         current = file.text
         transformed = 0
         details = self._initial_aggregate_details()
+        workspace_additions: Dict[str, ParsedWorkspaceFile] = {}
         local_state = deepcopy(global_state)
         local_state["workspace_file_path"] = file.path
         local_state["language"] = file.language
@@ -543,6 +613,11 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                 summary["applied_transforms"].append(transform.name)
                 transformed += 1
                 current = candidate
+                for addition in self._workspace_file_additions_from_details(
+                    result.details or {},
+                    fallback_language=file.language,
+                ):
+                    workspace_additions[addition.path] = addition
 
         summary["changed"] = current != file.text
         if summary["changed"]:
@@ -558,7 +633,66 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             ),
             summary,
             details,
+            list(workspace_additions.values()),
         )
+
+    def _workspace_file_additions_from_details(
+        self,
+        details: Dict[str, Any],
+        *,
+        fallback_language: str,
+    ) -> List[ParsedWorkspaceFile]:
+        additions = details.get("workspace_file_additions", [])
+        if not isinstance(additions, list):
+            return []
+        parsed: List[ParsedWorkspaceFile] = []
+        for item in additions:
+            addition = _coerce_workspace_file_addition(
+                item,
+                fallback_language=fallback_language,
+            )
+            if addition is not None:
+                parsed.append(addition)
+        return parsed
+
+    def _register_workspace_additions(
+        self,
+        *,
+        additions: Sequence[ParsedWorkspaceFile],
+        synthetic_additions: Dict[str, ParsedWorkspaceFile],
+        added_files: List[str],
+        file_transform_summary: List[Dict[str, Any]],
+        aggregate_details: Dict[str, Any],
+        symbol_literals: Dict[str, Dict[str, Any]],
+        origin_path: str,
+    ) -> None:
+        if not additions:
+            return
+
+        for addition in additions:
+            if addition.path in synthetic_additions or addition.path in added_files:
+                continue
+            if len(added_files) >= self._MAX_BUNDLE_ADDITIONS:
+                break
+
+            synthetic_additions[addition.path] = addition
+            added_files.append(addition.path)
+            aggregate_details["evidence_references"].append(addition.path)
+            symbol_literals[addition.path] = extract_literal_bindings(
+                addition.text,
+                addition.language,
+            )
+            file_transform_summary.append(
+                {
+                    "path": addition.path,
+                    "language": addition.language,
+                    "changed": True,
+                    "synthetic": True,
+                    "source_bundle": origin_path,
+                    "applied_transforms": ["bundle_module_materialization"],
+                    "rejected_transforms": [],
+                }
+            )
 
     def _build_workspace_literal_index(
         self,
@@ -733,6 +867,8 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         context["targeted_files"] = target_paths
         context["deobfuscated_files"] = changed_files
         context["added_files_to_bundle"] = added_files
+        if added_files:
+            context["bundle_expansion_paths"] = added_files[:32]
         context["file_transform_summary"] = file_transform_summary[:12]
         context["targeted_file_count"] = len(target_paths)
         context["deobfuscated_file_count"] = len(changed_files)

@@ -905,13 +905,14 @@ def rebuild_workspace_bundle(
         or (original_included + int(original_context.get("omitted_files") or 0))
         or len(files)
     )
-    omitted_files = max(original_total - len(files), 0)
+    effective_total = max(original_total, len(files))
+    omitted_files = max(effective_total - len(files), 0)
 
     metadata = _build_workspace_metadata(
         archive_name=str(original_context.get("archive_name") or "workspace.zip"),
         files=files,
         omitted_files=omitted_files,
-        total_candidate_files=original_total,
+        total_candidate_files=effective_total,
         skipped_files=original_context.get("skipped_files"),
         total_members=original_context.get("total_members"),
         omitted_preview=list(original_context.get("omitted_preview", [])),

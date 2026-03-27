@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # ── LLM defaults (can be overridden per-provider in DB) ─────────────
     DEFAULT_LLM_MAX_TOKENS: int = 4096
 
+    # ── Embedded JS tooling bootstrap ────────────────────────────────────
+    JS_TOOLING_AUTO_INSTALL: bool = True
+    JS_TOOLING_OFFLINE: bool = False
+    JS_TOOLING_NPM_CACHE_DIR: str = ""
+    JS_TOOLING_INSTALL_TIMEOUT_SECONDS: int = 180
+
     def ensure_upload_dir(self) -> Path:
         """Create the upload directory if it does not exist and return its Path."""
         p = Path(self.UPLOAD_DIR)

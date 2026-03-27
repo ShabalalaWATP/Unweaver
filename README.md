@@ -49,42 +49,65 @@ Everything happens statically — **no code is ever executed**.
 
 ## Architecture
 
+Unweaver has five runtime layers:
+
+1. **Frontend workbench** — React 18 + Vite + Monaco on port `5173` in dev mode. It renders the original/recovered editors, per-file workspace browser, diff view, findings, notebook, and exports.
+2. **FastAPI backend** — REST + WebSocket API on port `8000`. This owns uploads, projects, persistence, orchestration, exports, and report generation.
+3. **Deterministic transform layer** — the main Python transform stack: decoders, crypto recovery, PowerShell/Python/C# analyzers, literal propagation, workspace profiling, and safe file-by-file workspace rewriting.
+4. **Specialist workers** — a Node-backed JavaScript worker for modern JS/TS parsing and validation (`@babel/parser`), AST array resolution, and bundle unpacking/deobfuscation (`webcrack`), plus the optional .NET helper for assembly inspection.
+5. **State + storage** — SQLite stores projects, samples, providers, transforms, strings, IOCs, findings, notes, and iteration state.
+
 ```
-+----------------------------------------------+
-|               React Frontend                 |
-|   Vite - TypeScript - Monaco Editor - Diff   |
-|   Dark/Light themes - 9 workspace tabs       |
-|              Port 3000 (dev)                 |
-+------------------+---------------------------+
-                   |  REST / JSON
-                   |  (proxied via Vite)
-+------------------v---------------------------+
-|               FastAPI Backend                |
-|            Port 8000 - async                 |
-+----------+-----------+-----------------------+
-| Transform|Orchestrator|   LLM Client         |
-| Pipeline | (agentic   |   (OpenAI-compatible) |
-| (35+     |  multi-    |   context-window-aware|
-|  actions)|  pass)     |   dynamic budgeting   |
-+----------+-----------+-----------------------+
-|           SQLite (aiosqlite)                 |
-|   projects - samples - transforms - IOCs     |
-|   findings - strings - providers - state     |
-+----------------------------------------------+
++-----------------------------------------------------------+
+| React Frontend (Vite, TypeScript, Monaco)                 |
+| Dev port 5173 - Summary, Original, Recovered, Diff, etc.  |
++---------------------------+-------------------------------+
+                            |
+                            | REST + WebSocket
+                            v
++-----------------------------------------------------------+
+| FastAPI Backend                                             |
+| Uploads - API - Reports - Export - Provider Management      |
++--------------------+----------------------+----------------+
+                     |                      |
+                     v                      v
+        +-------------------------+   +---------------------+
+        | Orchestrator + Queue    |   | SQLite              |
+        | Planner - Selector      |   | Projects, samples,  |
+        | Execute - Verify - Stop |   | transforms, IOCs,   |
+        | Workspace bundle aware   |   | findings, state     |
+        +-----------+-------------+   +---------------------+
+                    |
+                    v
+     +-----------------------------------------------+
+     | Transform Layer                                |
+     | Python deterministic transforms                |
+     | Node JS worker: Babel parser + webcrack       |
+     | Optional .NET worker                           |
+     +-----------------------------------------------+
 ```
+
+### Main Data Flow
+
+1. **Ingest** — single scripts stay as plain text; archives are scanned and turned into a bounded `UNWEAVER_WORKSPACE_BUNDLE` that preserves file boundaries, priorities, and manifest metadata.
+2. **Plan** — the orchestrator fingerprints the sample, builds a workspace context, and chooses the next deterministic or LLM-assisted action.
+3. **Transform** — deterministic transforms run first where possible. JavaScript now takes an AST-first path for parsing/validation and can route bundle-heavy inputs through `webcrack`.
+4. **Validate** — candidates are syntax-checked, scored, and rejected if they regress readability or structure.
+5. **Reconcile** — strings, IOCs, findings, confidence, transform history, and workspace bundle state are merged back into the canonical analysis state.
+6. **Present / Export** — the frontend shows the recovered source, per-file changes, bundle expansions, findings, and reports; exports can emit recovered text, ZIPs, Markdown, or JSON.
 
 ### 8-Stage Analysis Loop
 
-Each iteration of the analysis engine runs through:
+Each iteration of the backend analysis engine runs through:
 
-1. **Planner** — surveys the code, detects language and obfuscation techniques, recommends prioritised actions. LLM-assisted when available (multi-turn planning with refinement on stalls), deterministic fallback. On iteration 1, runs LLM obfuscation classification to identify the tool/technique and recommend a strategy.
-2. **Action Selector** — feeds recommendations into a priority queue, pops the best action. When LLM is available and 3+ candidates exist, asks the LLM to choose the most promising transform given current state and history.
-3. **Pre-flight Validator** — checks preconditions: language compatibility, input size, retry cap, conflict detection
-4. **Executor** — runs the selected transform in a thread executor (deterministic) or awaits async (LLM). Dynamic response token budgeting based on input size and task type.
-5. **Post-processor** — normalises output: strips BOM, removes control characters, normalises line endings, collapses blank lines
-6. **Verifier** — measures improvement via readability heuristics, string recovery, IOC extraction, and confidence delta
-7. **State Reconciler** — merges extracted data into canonical state; updates confidence (blended 60% heuristic + 40% LLM assessment), readability, and transform history; auto-rollback on regression. Decode transforms that succeed don't count as stalls (multi-layer aware). On failure with stalling, triggers LLM reflection ("why did this fail? what should we try instead?").
-8. **Stop Decision** — checks 11 termination conditions including LLM consultation on borderline cases, readability plateau detection, and multi-layer stall resistance
+1. **Planner** — surveys the code, detects language and obfuscation techniques, and recommends prioritised actions. When an LLM is configured, the planner can refine strategy across stalled iterations.
+2. **Action Selector** — feeds candidate actions into a priority queue and picks the best next transform. The selector is workspace-aware and can bias toward suspicious or entrypoint files.
+3. **Pre-flight Validator** — checks language compatibility, size budgets, retry caps, workspace structure, and transform prerequisites.
+4. **Executor** — runs deterministic transforms in-process or dispatches specialist workers / LLM transforms as needed.
+5. **Post-processor** — normalises line endings, control characters, BOMs, and workspace bundle structure.
+6. **Verifier** — measures readability change, syntax health, recovered strings, IOCs, and confidence delta.
+7. **State Reconciler** — merges accepted changes, updates confidence, tracks failures, records transform history, and preserves rollback-safe state.
+8. **Stop Decision** — exits on high confidence, readability plateau, exhausted actions, or repeated safe failures.
 
 ---
 
@@ -152,11 +175,17 @@ source venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
+# Install the embedded JavaScript tooling used for
+# JS/TS syntax validation, AST transforms, and webcrack
+python -m app.services.transforms.js_tooling
+
 # Start the server
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 The backend creates `unweaver.db` (SQLite) and an `uploads/` directory automatically on first start.
+
+`UNWEAVER_JS_TOOLING_AUTO_INSTALL=true` can bootstrap the JS tooling on first use, but for CI, Docker, and production deployments the explicit bootstrap step above is the recommended path.
 
 To run in the background:
 
@@ -172,13 +201,13 @@ Open a new terminal:
 cd frontend
 
 # Install dependencies
-npm install
+npm ci
 
 # Start the dev server (proxies /api to localhost:8000)
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+Open [http://localhost:5173](http://localhost:5173) in your browser.
 
 ### Production Build (Optional)
 
@@ -267,6 +296,7 @@ cd backend
 python -m venv venv
 .\venv\Scripts\Activate
 pip install -r requirements.txt
+python -m app.services.transforms.js_tooling
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -274,11 +304,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```powershell
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+Open [http://localhost:5173](http://localhost:5173).
 
 ---
 
@@ -293,6 +323,8 @@ cd Unweaver
 # Build and start both services
 docker compose up --build
 ```
+
+The backend image now installs Node 20 and the embedded JS tooling during build, and the compose backend command re-checks that tooling at container start so bind-mounted development checkouts still retain the JS parser / `webcrack` path.
 
 | Service | URL |
 |---------|-----|
@@ -496,6 +528,9 @@ source venv/bin/activate
 # Install test dependencies
 pip install pytest pytest-asyncio httpx
 
+# Ensure the JS parser / webcrack worker is present for JS-focused tests
+python -m app.services.transforms.js_tooling
+
 # Run all tests
 pytest
 
@@ -506,173 +541,167 @@ pytest -v
 pytest tests/test_transforms.py -v
 ```
 
-The suite covers 198+ tests across API endpoints, transform correctness, orchestrator logic, and LLM provider handling.
+Current backend suite: `282` passing tests covering API endpoints, transform correctness, workspace bundles, orchestrator logic, reports, WebSocket flows, and LLM provider handling.
 
 ---
 
 ## Air-Gapped Deployment
 
-Unweaver is designed to work in isolated, air-gapped environments with no internet access. All frontend assets (Monaco Editor, fonts, icons) are bundled locally with no CDN dependencies.
+Unweaver is designed to work in isolated environments. All frontend assets are local, and the deterministic analysis path is fully offline once Python packages and the two npm dependency trees have been transferred.
 
-### What works fully offline
+### Offline Feature Matrix
 
-- All 30+ deterministic transforms (base64, hex, XOR, PowerShell, Python, constant folding, etc.)
-- File upload, paste, and workspace bundle analysis
-- IOC extraction, string extraction, findings generation
-- All 9 workspace tabs, diff viewer, export (JSON/Markdown)
-- SQLite database (zero external dependencies)
-- Dark/light theme, keyboard shortcuts
+Works fully offline once installed:
 
-### What requires a local LLM
+- deterministic transforms, workspace bundles, IOC extraction, findings, and exports
+- JavaScript parsing / validation / AST cleanup through the embedded Node worker
+- specialist bundled-JS deobfuscation through `webcrack`
+- SQLite persistence, notes, diffs, and all UI tabs
 
-These features need an OpenAI-compatible API endpoint running on your network:
+Requires a **local** OpenAI-compatible endpoint on the isolated network:
 
-- LLM-assisted deobfuscation transforms
-- LLM-assisted variable/function renaming
-- AI summary generation
-- LLM-driven stop decisions
+- LLM-assisted deobfuscation / renaming / summaries
+- LLM planning, transform selection, and reflection
 
-### Setting up a local LLM provider
+### Recommended Air-Gapped Linux Install
 
-**Option 1: Ollama (recommended for simplicity)**
+Use a connected Linux machine with the same CPU architecture and a comparable libc / Node runtime as the target system.
+
+**Step 1: Prepare transfer artifacts on a connected machine**
 
 ```bash
-# On the air-gapped machine (pre-download the model on a connected machine first)
-ollama serve
-ollama run llama3.1:8b  # or any model you've transferred
+git clone https://github.com/ShabalalaWATP/Unweaver.git
+cd Unweaver
 
-# In Unweaver settings, configure:
-#   Base URL: http://localhost:11434
-#   Model:    llama3.1:8b
-#   API Key:  (leave empty)
+# Python wheelhouse
+python3 -m venv .prep-venv
+source .prep-venv/bin/activate
+pip download -r backend/requirements.txt -d airgap/python-wheels
+
+# Frontend dependencies (deterministic because frontend/package-lock.json is committed)
+cd frontend
+npm ci
+tar czf ../airgap/frontend-node_modules.tgz node_modules package.json package-lock.json
+cd ..
+
+# Embedded backend JS tooling (@babel/parser + webcrack)
+cd backend/app/services/transforms/js_tooling
+npm ci
+tar czf ../../../../../airgap/js-tooling-node_modules.tgz node_modules package.json package-lock.json
+cd ../../../../..
 ```
 
-**Option 2: vLLM (recommended for performance)**
+Transfer the repo checkout plus the `airgap/` directory to the isolated Linux machine via approved media.
+
+**Step 2: Install system prerequisites on the air-gapped Linux machine**
+
+Install these from your approved internal repo / mirror / package media:
+
+- Python `3.12+`
+- `python3-venv`
+- Node.js `20+`
+- `tar`
+- optionally `git`, `nginx`, or a local static file server
+
+**Step 3: Install the backend offline**
+
+```bash
+cd Unweaver/backend
+python3 -m venv venv
+source venv/bin/activate
+pip install --no-index --find-links=../airgap/python-wheels -r requirements.txt
+```
+
+**Step 4: Install the frontend and embedded JS tooling offline**
+
+```bash
+# Frontend
+cd ../frontend
+tar xzf ../airgap/frontend-node_modules.tgz
+
+# Backend JS tooling
+cd ../backend/app/services/transforms/js_tooling
+tar xzf ../../../../../airgap/js-tooling-node_modules.tgz
+cd ../../../../..
+```
+
+At this point the backend already has the Babel parser + `webcrack` available with no network access. If you prefer transferring an npm cache instead of `node_modules`, run the embedded bootstrapper instead:
+
+```bash
+cd backend
+source venv/bin/activate
+UNWEAVER_JS_TOOLING_OFFLINE=true \
+python -m app.services.transforms.js_tooling --cache-dir /path/to/transferred/npm-cache
+```
+
+**Step 5: Run the services**
+
+```bash
+# Backend
+cd backend
+source venv/bin/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# Frontend (development server)
+cd ../frontend
+npm run dev -- --host
+```
+
+Or build the frontend once and serve static assets:
+
+```bash
+cd frontend
+npm run build
+npx serve dist -l 5173
+```
+
+### Air-Gapped Docker Deployment
+
+If Docker is allowed in your environment, prebuild the images on a connected machine, then transfer the image tarball:
+
+```bash
+# Connected machine
+docker compose build
+docker save unweaver-backend unweaver-frontend | gzip > unweaver-images.tar.gz
+
+# Air-gapped machine
+docker load < unweaver-images.tar.gz
+UNWEAVER_CORS_ORIGINS="*" docker compose up
+```
+
+The backend image now already contains Node 20 and the embedded JS tooling. The compose backend command also re-runs the local bootstrap check so a bind-mounted development checkout does not lose the JS worker path.
+
+### Local LLM Options Inside an Isolated Network
+
+**Ollama**
+
+```bash
+ollama serve
+ollama run llama3.1:8b
+```
+
+**vLLM**
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
   --model /path/to/model \
   --port 8001
-
-# In Unweaver settings, configure:
-#   Base URL: http://localhost:8001
-#   Model:    (your model name)
-#   API Key:  (leave empty)
 ```
 
-**Option 3: LM Studio**
+**LM Studio**
 
-1. Download and install LM Studio on the air-gapped machine
-2. Load a model (GGUF format, transferred via USB/share)
-3. Start the local server (default port 1234)
-4. Configure in Unweaver: Base URL `http://localhost:1234`
+1. Transfer the installer and GGUF model to the isolated workstation.
+2. Start the local server.
+3. Point Unweaver at that local OpenAI-compatible endpoint.
 
-### Network and CORS configuration
-
-For air-gapped deployments where the server hostname is not `localhost`:
+### Network, CORS, and Secrets
 
 ```bash
-# Set CORS to allow all origins (safe on isolated networks)
 export UNWEAVER_CORS_ORIGINS="*"
-
-# Or specify your internal hostname
-export UNWEAVER_CORS_ORIGINS="http://analyst-workstation:3000,http://10.0.0.5:3000"
+export UNWEAVER_SECRET_KEY="your-persistent-secret-key"
 ```
 
-### API key encryption
-
-API keys are encrypted at rest using Fernet (AES-128-CBC + HMAC-SHA256). Set a persistent secret:
-
-```bash
-export UNWEAVER_SECRET_KEY="your-secret-key-here"
-```
-
-If no secret is set, a key is auto-generated and stored in `.unweaver_secret`.
-
-### Air-gapped setup WITHOUT Docker (pip + npm mirrors)
-
-When Docker is not available, transfer dependencies via USB/share:
-
-**Step 1: On a connected machine, download all dependencies**
-
-```bash
-# Clone the repo
-git clone https://github.com/ShabalalaWATP/Unweaver.git
-cd Unweaver
-
-# Download Python packages to a local directory
-cd backend
-pip download -r requirements.txt -d ./pip-packages/
-
-# Download npm packages (creates a tarball)
-cd ../frontend
-npm pack  # or use: npm install && tar czf node_modules.tar.gz node_modules/
-```
-
-**Step 2: Transfer to the air-gapped machine**
-
-Copy the entire `Unweaver/` directory including `backend/pip-packages/` and `frontend/node_modules.tar.gz` via USB, network share, or approved transfer media.
-
-**Step 3: Install on the air-gapped machine**
-
-```bash
-# Backend (Linux)
-cd backend
-python3 -m venv venv
-source venv/bin/activate
-pip install --no-index --find-links=./pip-packages/ -r requirements.txt
-
-# Backend (Windows)
-cd backend
-python -m venv venv
-.\venv\Scripts\Activate
-pip install --no-index --find-links=.\pip-packages\ -r requirements.txt
-
-# Frontend (both platforms)
-cd frontend
-tar xzf node_modules.tar.gz   # or copy node_modules/ directly
-npm run build                   # build production assets
-```
-
-**Step 4: Run**
-
-```bash
-# Backend
-cd backend
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-# Frontend (serve production build)
-cd frontend
-npx serve dist -l 3000
-# Or use nginx to serve dist/ and proxy /api to :8000
-```
-
-### Using internal package mirrors
-
-If your air-gapped network has internal PyPI/npm mirrors:
-
-```bash
-# pip with internal mirror
-pip install -r requirements.txt --index-url https://pypi.internal.corp/simple/ --trusted-host pypi.internal.corp
-
-# npm with internal registry
-npm config set registry https://npm.internal.corp/
-npm install
-```
-
-### Docker deployment (air-gapped)
-
-Pre-build images on a connected machine, export, and transfer:
-
-```bash
-# On connected machine
-docker compose build
-docker save unweaver-backend unweaver-frontend | gzip > unweaver-images.tar.gz
-
-# On air-gapped machine
-docker load < unweaver-images.tar.gz
-UNWEAVER_CORS_ORIGINS="*" docker compose up
-```
+If `UNWEAVER_SECRET_KEY` is omitted, Unweaver generates one locally and stores it in `.unweaver_secret`.
 
 ---
 

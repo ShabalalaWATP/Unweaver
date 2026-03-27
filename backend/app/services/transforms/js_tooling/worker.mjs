@@ -330,110 +330,402 @@ function unwrapIifeFunction(expression) {
   return null;
 }
 
-function detectRotationDirection(functionNode, arrayParamName) {
-  let direction = null;
-  walkWithoutNestedFunctions(functionNode.body, (node) => {
-    if (direction || node.type !== "CallExpression") {
-      return;
+function memberPropertyName(node) {
+  if (node?.type !== "MemberExpression") {
+    return null;
+  }
+  return node.computed ? getLiteralString(node.property) : node.property?.name ?? null;
+}
+
+function extractDirectRotation(node) {
+  if (node?.type !== "CallExpression") {
+    return null;
+  }
+  const callee = node.callee;
+  if (callee?.type !== "MemberExpression" || node.arguments.length !== 1) {
+    return null;
+  }
+  if (callee.object?.type !== "Identifier") {
+    return null;
+  }
+  const outerProperty = memberPropertyName(callee);
+  const nested = node.arguments[0];
+  if (nested?.type !== "CallExpression") {
+    return null;
+  }
+  const nestedCallee = nested.callee;
+  if (nestedCallee?.type !== "MemberExpression") {
+    return null;
+  }
+  if (!isIdentifier(nestedCallee.object, callee.object.name)) {
+    return null;
+  }
+  const innerProperty = memberPropertyName(nestedCallee);
+  if (outerProperty === "push" && innerProperty === "shift") {
+    return {
+      direction: "left",
+      targetName: callee.object.name,
+    };
+  }
+  if (outerProperty === "unshift" && innerProperty === "pop") {
+    return {
+      direction: "right",
+      targetName: callee.object.name,
+    };
+  }
+  return null;
+}
+
+function collectHelperDefinitions(functionNode) {
+  const helpers = new Map();
+  const statements = functionNode.body?.type === "BlockStatement" ? functionNode.body.body || [] : [];
+  for (const statement of statements) {
+    if (statement?.type === "FunctionDeclaration" && isIdentifier(statement.id)) {
+      helpers.set(statement.id.name, statement);
+      continue;
     }
-    const callee = node.callee;
-    if (callee?.type !== "MemberExpression" || !callee.computed) {
-      return;
+    if (statement?.type !== "VariableDeclaration") {
+      continue;
     }
-    if (!isIdentifier(callee.object, arrayParamName)) {
-      return;
+    for (const declaration of statement.declarations || []) {
+      if (!isIdentifier(declaration.id)) {
+        continue;
+      }
+      const init = declaration.init;
+      if (init?.type === "FunctionExpression" || init?.type === "ArrowFunctionExpression") {
+        helpers.set(declaration.id.name, init);
+      }
     }
-    const outerProperty = getLiteralString(callee.property);
-    if (outerProperty == null || node.arguments.length !== 1) {
-      return;
-    }
-    const nested = node.arguments[0];
-    if (nested?.type !== "CallExpression") {
-      return;
-    }
-    const nestedCallee = nested.callee;
-    if (nestedCallee?.type !== "MemberExpression" || !nestedCallee.computed) {
-      return;
-    }
-    if (!isIdentifier(nestedCallee.object, arrayParamName)) {
-      return;
-    }
-    const innerProperty = getLiteralString(nestedCallee.property);
-    if (outerProperty === "push" && innerProperty === "shift") {
-      direction = "left";
-    } else if (outerProperty === "unshift" && innerProperty === "pop") {
-      direction = "right";
-    }
-  });
-  if (direction) {
-    return direction;
+  }
+  return helpers;
+}
+
+function primitiveTargetSummary(direction, targetType, value) {
+  return targetType === "param"
+    ? { kind: "primitive", direction, targetType, targetIndex: value }
+    : { kind: "primitive", direction, targetType, targetName: value };
+}
+
+function loopTargetSummary(direction, countParamIndex, targetType, value) {
+  return targetType === "param"
+    ? { kind: "loop", direction, countParamIndex, targetType, targetIndex: value }
+    : { kind: "loop", direction, countParamIndex, targetType, targetName: value };
+}
+
+function sameTarget(left, right) {
+  if (!left || !right || left.targetType !== right.targetType) {
+    return false;
+  }
+  if (left.targetType === "param") {
+    return left.targetIndex === right.targetIndex;
+  }
+  return left.targetName === right.targetName;
+}
+
+function mergeRotationSummary(existing, incoming) {
+  if (!incoming) {
+    return existing;
+  }
+  if (!existing) {
+    return incoming;
+  }
+  if (
+    existing.kind !== incoming.kind
+    || existing.direction !== incoming.direction
+    || !sameTarget(existing, incoming)
+  ) {
+    return null;
+  }
+  if (existing.kind === "loop" && existing.countParamIndex !== incoming.countParamIndex) {
+    return null;
+  }
+  return existing;
+}
+
+function mapSummaryToCaller(summary, callArguments, callerParams) {
+  if (!summary) {
+    return null;
+  }
+  if (summary.targetType === "captured") {
+    return summary.kind === "loop"
+      ? loopTargetSummary(summary.direction, summary.countParamIndex, "captured", summary.targetName)
+      : primitiveTargetSummary(summary.direction, "captured", summary.targetName);
   }
 
+  const argument = callArguments?.[summary.targetIndex];
+  if (!isIdentifier(argument)) {
+    return null;
+  }
+  const callerParamIndex = callerParams.findIndex((param) => isIdentifier(param, argument.name));
+  if (callerParamIndex >= 0) {
+    return summary.kind === "loop"
+      ? loopTargetSummary(summary.direction, summary.countParamIndex, "param", callerParamIndex)
+      : primitiveTargetSummary(summary.direction, "param", callerParamIndex);
+  }
+  return summary.kind === "loop"
+    ? loopTargetSummary(summary.direction, summary.countParamIndex, "captured", argument.name)
+    : primitiveTargetSummary(summary.direction, "captured", argument.name);
+}
+
+function summarizePrimitiveHelper(name, functionNode, helpers, memo = new Map(), active = new Set()) {
+  if (memo.has(name)) {
+    return memo.get(name);
+  }
+  if (active.has(name)) {
+    return null;
+  }
+
+  active.add(name);
+  const params = Array.isArray(functionNode.params) ? functionNode.params : [];
+  let summary = null;
+
   walkWithoutNestedFunctions(functionNode.body, (node) => {
-    if (direction || node.type !== "CallExpression") {
+    if (summary === null && node?.type !== "CallExpression") {
       return;
     }
-    const callee = node.callee;
-    if (callee?.type !== "MemberExpression" || callee.computed) {
+    if (node?.type !== "CallExpression") {
       return;
     }
-    if (!isIdentifier(callee.object, arrayParamName)) {
+
+    const direct = extractDirectRotation(node);
+    if (direct) {
+      const paramIndex = params.findIndex((param) => isIdentifier(param, direct.targetName));
+      const next = paramIndex >= 0
+        ? primitiveTargetSummary(direct.direction, "param", paramIndex)
+        : primitiveTargetSummary(direct.direction, "captured", direct.targetName);
+      summary = mergeRotationSummary(summary, next);
       return;
     }
-    const outerProperty = callee.property?.name;
-    if (!outerProperty || node.arguments.length !== 1) {
+
+    if (!isIdentifier(node.callee) || !helpers.has(node.callee.name)) {
       return;
     }
-    const nested = node.arguments[0];
-    if (nested?.type !== "CallExpression") {
-      return;
-    }
-    const nestedCallee = nested.callee;
-    if (nestedCallee?.type !== "MemberExpression" || nestedCallee.computed) {
-      return;
-    }
-    if (!isIdentifier(nestedCallee.object, arrayParamName)) {
-      return;
-    }
-    const innerProperty = nestedCallee.property?.name;
-    if (outerProperty === "push" && innerProperty === "shift") {
-      direction = "left";
-    } else if (outerProperty === "unshift" && innerProperty === "pop") {
-      direction = "right";
+    const helperSummary = summarizePrimitiveHelper(
+      node.callee.name,
+      helpers.get(node.callee.name),
+      helpers,
+      memo,
+      active,
+    );
+    const mapped = mapSummaryToCaller(helperSummary, node.arguments || [], params);
+    summary = mergeRotationSummary(summary, mapped);
+  });
+
+  active.delete(name);
+  memo.set(name, summary);
+  return summary;
+}
+
+function collectReferencedIdentifiers(node) {
+  const names = new Set();
+  walkWithoutNestedFunctions(node, (current) => {
+    if (current?.type === "Identifier") {
+      names.add(current.name);
     }
   });
-  return direction;
+  return names;
+}
+
+function findPrimitiveSummaryInScope(node, params, helpers, primitiveMemo) {
+  let summary = null;
+  walkWithoutNestedFunctions(node, (current) => {
+    if (summary === null && current?.type !== "CallExpression") {
+      return;
+    }
+    if (current?.type !== "CallExpression") {
+      return;
+    }
+    const direct = extractDirectRotation(current);
+    if (direct) {
+      const paramIndex = params.findIndex((param) => isIdentifier(param, direct.targetName));
+      const next = paramIndex >= 0
+        ? primitiveTargetSummary(direct.direction, "param", paramIndex)
+        : primitiveTargetSummary(direct.direction, "captured", direct.targetName);
+      summary = mergeRotationSummary(summary, next);
+      return;
+    }
+    if (!isIdentifier(current.callee) || !helpers.has(current.callee.name)) {
+      return;
+    }
+    const helperSummary = summarizePrimitiveHelper(
+      current.callee.name,
+      helpers.get(current.callee.name),
+      helpers,
+      primitiveMemo,
+      new Set(),
+    );
+    const mapped = mapSummaryToCaller(helperSummary, current.arguments || [], params);
+    summary = mergeRotationSummary(summary, mapped);
+  });
+  return summary;
+}
+
+function loopCountParamIndex(loopNode, params) {
+  const names = new Set();
+  if (loopNode.test) {
+    for (const name of collectReferencedIdentifiers(loopNode.test)) {
+      names.add(name);
+    }
+  }
+  if (loopNode.update) {
+    for (const name of collectReferencedIdentifiers(loopNode.update)) {
+      names.add(name);
+    }
+  }
+  if (loopNode.left) {
+    for (const name of collectReferencedIdentifiers(loopNode.left)) {
+      names.add(name);
+    }
+  }
+  return params.findIndex((param) => isIdentifier(param) && names.has(param.name));
+}
+
+function summarizeLoopHelper(name, functionNode, helpers, primitiveMemo, memo = new Map()) {
+  if (memo.has(name)) {
+    return memo.get(name);
+  }
+
+  const params = Array.isArray(functionNode.params) ? functionNode.params : [];
+  let summary = null;
+  walkWithoutNestedFunctions(functionNode.body, (node) => {
+    if (summary === null && !/^(?:While|DoWhile|For)Statement$/.test(node?.type || "")) {
+      return;
+    }
+    if (!/^(?:While|DoWhile|For)Statement$/.test(node?.type || "")) {
+      return;
+    }
+
+    const countParamIndex = loopCountParamIndex(node, params);
+    if (countParamIndex < 0) {
+      return;
+    }
+    const primitive = findPrimitiveSummaryInScope(node.body || node, params, helpers, primitiveMemo);
+    if (!primitive) {
+      return;
+    }
+    const next = primitive.targetType === "param"
+      ? loopTargetSummary(primitive.direction, countParamIndex, "param", primitive.targetIndex)
+      : loopTargetSummary(primitive.direction, countParamIndex, "captured", primitive.targetName);
+    summary = mergeRotationSummary(summary, next);
+  });
+
+  memo.set(name, summary);
+  return summary;
+}
+
+function summaryTargetsArray(summary, arrayParamName) {
+  if (!summary) {
+    return false;
+  }
+  if (summary.targetType === "param") {
+    return summary.targetIndex === 0;
+  }
+  return summary.targetName === arrayParamName;
+}
+
+function findRotationPlan(iife) {
+  const fnParams = Array.isArray(iife.fn.params) ? iife.fn.params : [];
+  if (!fnParams.length || !isIdentifier(fnParams[0])) {
+    return null;
+  }
+
+  const helpers = collectHelperDefinitions(iife.fn);
+  const primitiveMemo = new Map();
+  const loopMemo = new Map();
+  const arrayParamName = fnParams[0].name;
+  const secondArgValue = evaluateNumeric(iife.call.arguments?.[1], {});
+  const env = {};
+  if (secondArgValue != null && isIdentifier(fnParams[1])) {
+    env[fnParams[1].name] = secondArgValue;
+  }
+
+  const rootLoop = (() => {
+    const params = Array.isArray(iife.fn.params) ? iife.fn.params : [];
+    let summary = null;
+    walkWithoutNestedFunctions(iife.fn.body, (node) => {
+      if (summary === null && !/^(?:While|DoWhile|For)Statement$/.test(node?.type || "")) {
+        return;
+      }
+      if (!/^(?:While|DoWhile|For)Statement$/.test(node?.type || "")) {
+        return;
+      }
+      const countParamIndex = loopCountParamIndex(node, params);
+      if (countParamIndex < 0) {
+        return;
+      }
+      const primitive = findPrimitiveSummaryInScope(node.body || node, params, helpers, primitiveMemo);
+      if (!primitive) {
+        return;
+      }
+      const next = primitive.targetType === "param"
+        ? loopTargetSummary(primitive.direction, countParamIndex, "param", primitive.targetIndex)
+        : loopTargetSummary(primitive.direction, countParamIndex, "captured", primitive.targetName);
+      summary = mergeRotationSummary(summary, next);
+    });
+    return summary;
+  })();
+
+  if (
+    rootLoop
+    && rootLoop.countParamIndex === 1
+    && summaryTargetsArray(rootLoop, arrayParamName)
+    && secondArgValue != null
+  ) {
+    return {
+      direction: rootLoop.direction,
+      count: secondArgValue,
+      helpers,
+    };
+  }
+
+  let plan = null;
+  walkWithoutNestedFunctions(iife.fn.body, (node) => {
+    if (plan || node?.type !== "CallExpression" || !isIdentifier(node.callee) || !helpers.has(node.callee.name)) {
+      return;
+    }
+    const loopSummary = summarizeLoopHelper(
+      node.callee.name,
+      helpers.get(node.callee.name),
+      helpers,
+      primitiveMemo,
+      loopMemo,
+    );
+    if (!loopSummary) {
+      return;
+    }
+    const mapped = mapSummaryToCaller(loopSummary, node.arguments || [], fnParams);
+    if (!mapped || !summaryTargetsArray(mapped, arrayParamName)) {
+      return;
+    }
+    const countNode = node.arguments?.[loopSummary.countParamIndex];
+    const count = evaluateNumeric(countNode, env);
+    if (count == null) {
+      return;
+    }
+    plan = {
+      direction: mapped.direction,
+      count,
+      helpers,
+    };
+  });
+  return plan;
 }
 
 function detectRotationDirectionAnyDepth(functionNode, arrayParamName) {
-  let direction = null;
-  walk(functionNode.body, (node) => {
-    if (direction || node.type !== "CallExpression") {
-      return;
+  const helpers = collectHelperDefinitions(functionNode);
+  const primitiveMemo = new Map();
+  const loopMemo = new Map();
+  for (const [name, helperNode] of helpers.entries()) {
+    const primitive = summarizePrimitiveHelper(name, helperNode, helpers, primitiveMemo, new Set());
+    if (summaryTargetsArray(primitive, arrayParamName)) {
+      return primitive.direction;
     }
-    const callee = node.callee;
-    if (callee?.type === "MemberExpression" && isIdentifier(callee.object, arrayParamName)) {
-      const outerProperty = callee.computed ? getLiteralString(callee.property) : callee.property?.name;
-      if (!outerProperty || node.arguments.length !== 1) {
-        return;
-      }
-      const nested = node.arguments[0];
-      if (nested?.type !== "CallExpression") {
-        return;
-      }
-      const nestedCallee = nested.callee;
-      if (nestedCallee?.type !== "MemberExpression" || !isIdentifier(nestedCallee.object, arrayParamName)) {
-        return;
-      }
-      const innerProperty = nestedCallee.computed ? getLiteralString(nestedCallee.property) : nestedCallee.property?.name;
-      if (outerProperty === "push" && innerProperty === "shift") {
-        direction = "left";
-      } else if (outerProperty === "unshift" && innerProperty === "pop") {
-        direction = "right";
-      }
+    const loop = summarizeLoopHelper(name, helperNode, helpers, primitiveMemo, loopMemo);
+    if (summaryTargetsArray(loop, arrayParamName)) {
+      return loop.direction;
     }
-  });
-  return direction;
+  }
+  return null;
 }
 
 function extractLookupIndex(node, paramName) {
@@ -651,7 +943,7 @@ function resolveArrays(code, language = "") {
       if (!iife) {
         return;
       }
-      const [firstArg, secondArg] = iife.call.arguments || [];
+      const [firstArg] = iife.call.arguments || [];
       if (!isIdentifier(firstArg) || !arrays.has(firstArg.name)) {
         return;
       }
@@ -665,26 +957,22 @@ function resolveArrays(code, language = "") {
         sources.push(code.slice(node.start, node.end));
         helperSourcesByArray.set(firstArg.name, sources);
       }
-      const direction = detectRotationDirection(iife.fn, fnParams[0].name);
-      if (!direction) {
+      const plan = findRotationPlan(iife);
+      if (!plan) {
         return;
       }
-      const count = evaluateNumeric(secondArg, {});
-      if (count == null) {
-        return;
-      }
-      arrays.set(firstArg.name, rotateArray(arrays.get(firstArg.name), count, direction));
+      arrays.set(firstArg.name, rotateArray(arrays.get(firstArg.name), plan.count, plan.direction));
       rotationEdits.push({ start: node.start, end: node.end, replacement: "" });
       rotationMatches.push({
         array: firstArg.name,
-        count,
-        direction,
+        count: plan.count,
+        direction: plan.direction,
       });
       staticRewrites.push({
         type: "rotation_runtime_removed",
         array: firstArg.name,
-        direction,
-        count,
+        direction: plan.direction,
+        count: plan.count,
       });
     }
   });
@@ -881,6 +1169,45 @@ function looksLikeBundle(code) {
   );
 }
 
+function sanitizeBundleModulePath(value) {
+  const text = String(value || "").replace(/\\/g, "/").trim();
+  if (!text) {
+    return "";
+  }
+  const segments = text.split("/").filter((segment) => segment && segment !== ".");
+  const cleaned = [];
+  for (const segment of segments) {
+    if (segment === "..") {
+      continue;
+    }
+    cleaned.push(segment);
+  }
+  return cleaned.join("/");
+}
+
+function extractBundleModules(bundle) {
+  if (!bundle?.modules || typeof bundle.modules.values !== "function") {
+    return [];
+  }
+  const modules = [];
+  let index = 0;
+  for (const module3 of bundle.modules.values()) {
+    const code = typeof module3?.code === "string" ? module3.code : "";
+    if (!code.trim()) {
+      index += 1;
+      continue;
+    }
+    modules.push({
+      id: String(module3?.id ?? index),
+      path: sanitizeBundleModulePath(module3?.path),
+      isEntry: Boolean(module3?.isEntry),
+      code,
+    });
+    index += 1;
+  }
+  return modules;
+}
+
 async function runWebcrack(code) {
   const result = await webcrack(code, {
     jsx: true,
@@ -889,16 +1216,18 @@ async function runWebcrack(code) {
     unminify: true,
     mangle: false,
   });
+  const modules = extractBundleModules(result.bundle);
 
   return {
     ok: true,
-    changed: result.code !== code,
+    changed: result.code !== code || modules.length > 0,
     output: result.code,
     bundle: result.bundle
       ? {
           type: result.bundle.type,
           entryId: result.bundle.entryId,
           moduleCount: typeof result.bundle.modules?.size === "number" ? result.bundle.modules.size : null,
+          modules,
         }
       : null,
     heuristics: {

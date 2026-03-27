@@ -13,3 +13,5 @@ venv/
 *.egg-info/
 .pytest_cache/
 package-lock.json
+!frontend/package-lock.json
+!backend/app/services/transforms/js_tooling/package-lock.json

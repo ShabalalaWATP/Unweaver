@@ -14,9 +14,11 @@ import base64
 import io
 import shutil
 import zipfile
+from unittest.mock import patch
 
 import pytest
 
+import app.services.transforms.javascript_bundle_deobfuscator as javascript_bundle_deobfuscator_module
 from app.services.ingest.workspace_bundle import scan_workspace_archive
 from tests.dotnet_test_utils import (
     build_resx,
@@ -627,6 +629,31 @@ class TestJavaScriptArrayResolver:
             item["type"] for item in result.details["static_rewrites"]
         ]
 
+    def test_resolves_nested_rotation_helper_chain(self):
+        resolver = JavaScriptArrayResolver()
+        code = (
+            "var _0xabc = ['c', 'a', 'b'];\n"
+            "(function(_0xarr, _0xcount) {\n"
+            "    function _0xstep(_0xvalue) {\n"
+            "        _0xvalue['push'](_0xvalue['shift']());\n"
+            "    }\n"
+            "    var _0xrotate = function(_0xloop) {\n"
+            "        while (--_0xloop) {\n"
+            "            _0xstep(_0xarr);\n"
+            "        }\n"
+            "    };\n"
+            "    _0xrotate(_0xcount);\n"
+            "}(_0xabc, 0x2));\n"
+            "console.log(_0xabc[0]);\n"
+        )
+
+        result = resolver.apply(code, "javascript", {})
+
+        assert result.success is True
+        assert 'console.log("b");' in result.output
+        assert "_0xstep(_0xarr)" not in result.output
+        assert "deterministic_array_rotation_fold" in result.details["detected_techniques"]
+
 
 class TestJavaScriptBundleDeobfuscator:
     def test_webcrack_reformats_bundle_like_javascript(self):
@@ -649,6 +676,56 @@ class TestJavaScriptBundleDeobfuscator:
         assert "\n" in result.output
         assert "function __webpack_require__(id)" in result.output
         assert "javascript_bundle_deobfuscation" in result.details["detected_techniques"]
+
+    def test_materializes_extracted_modules_without_requiring_top_level_rewrite(self):
+        transform = JavaScriptBundleDeobfuscator()
+        code = "(()=>{console.log(__webpack_require__(1));})();"
+
+        with patch.object(
+            javascript_bundle_deobfuscator_module,
+            "run_webcrack",
+            return_value={
+                "ok": True,
+                "output": code,
+                "bundle": {
+                    "type": "webpack",
+                    "entryId": "1",
+                    "moduleCount": 2,
+                    "modules": [
+                        {
+                            "id": "1",
+                            "path": "src/index.js",
+                            "isEntry": True,
+                            "code": "console.log('entry');\n",
+                        },
+                        {
+                            "id": "2",
+                            "path": "src/utils.js",
+                            "isEntry": False,
+                            "code": "export const value = 1;\n",
+                        },
+                    ],
+                },
+                "heuristics": {"bundleLike": True},
+            },
+        ), patch.object(
+            javascript_bundle_deobfuscator_module,
+            "validate_javascript_source",
+            return_value={"ok": True},
+        ):
+            result = transform.apply(
+                code,
+                "javascript",
+                {"workspace_file_path": "dist/app.bundle.js"},
+            )
+
+        assert result.success is True
+        assert result.details["bundle_module_paths"] == [
+            "dist/app.bundle.js.__webcrack__/src/index.js",
+            "dist/app.bundle.js.__webcrack__/src/utils.js",
+        ]
+        assert len(result.details["workspace_file_additions"]) == 2
+        assert "bundle_module_tree_materialization" in result.details["detected_techniques"]
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -6,8 +6,8 @@ This transform focuses on deterministic "post-decoder" cleanup:
   - propagate resolved literals into later expressions
   - prune trivially dead branches once conditions become constant
 
-Python uses a real AST rewrite. JavaScript / TypeScript uses guarded
-token-aware heuristics so the transform can still run without a JS parser.
+Python uses a real AST rewrite. JavaScript / TypeScript uses an ESTree
+parser when available and falls back to guarded token-aware heuristics.
 """
 
 from __future__ import annotations
@@ -19,11 +19,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .base import BaseTransform, TransformResult
-
-try:  # pragma: no cover - exercised through transform behavior
-    import esprima
-except ImportError:  # pragma: no cover - fallback path
-    esprima = None
+from .js_tooling import parse_javascript_ast
+from .source_preprocessor import normalize_source_anomalies
 
 _UNKNOWN = object()
 _SIMPLE_LITERAL_TYPES = (str, int, float, bool, type(None))
@@ -742,7 +739,7 @@ def _js_node_source(code: str, node: Any) -> str:
 
 def _iter_js_child_nodes(node: Any) -> Iterable[Tuple[str, Any]]:
     for field, value in vars(node).items():
-        if field in {"type", "range", "errors", "sourceType"}:
+        if field in {"type", "range", "errors", "sourceType", "start", "end", "loc"}:
             continue
         if hasattr(value, "type"):
             yield field, value
@@ -978,8 +975,16 @@ def _evaluate_js_ast_expr(node: Any, env: Dict[str, Any]) -> Any:
 
 
 class _JavaScriptAstSimplifier:
-    def __init__(self, code: str, imported_literals: Dict[str, Any]) -> None:
-        self.code = code
+    def __init__(
+        self,
+        code: str,
+        imported_literals: Dict[str, Any],
+        *,
+        language: str = "javascript",
+    ) -> None:
+        cleaned, _ = normalize_source_anomalies(code)
+        self.code = cleaned
+        self.language = language
         self.imported_literals = {
             key: value
             for key, value in imported_literals.items()
@@ -988,17 +993,7 @@ class _JavaScriptAstSimplifier:
         self.stats = _JavaScriptAstStats()
 
     def simplify(self) -> Optional[TransformResult]:
-        if esprima is None:
-            return None
-
-        program = None
-        for parser in (esprima.parseModule, esprima.parseScript):
-            try:
-                program = parser(self.code, {"range": True, "tolerant": True})
-                break
-            except Exception:
-                continue
-
+        program = parse_javascript_ast(self.code, language=self.language)
         if program is None:
             return None
 
@@ -1639,7 +1634,7 @@ def extract_literal_bindings(
     imported_literals: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     lang = (language or "").lower().strip()
-    if lang in {"javascript", "js", "typescript", "ts", ""}:
+    if lang in {"javascript", "js", "jsx", "typescript", "ts", "tsx", ""}:
         return _extract_js_literal_bindings(
             code,
             imported_literals=imported_literals,
@@ -1658,7 +1653,7 @@ class LiteralPropagator(BaseTransform):
 
     def can_apply(self, code: str, language: str, state: dict) -> bool:
         lang = (language or "").lower().strip()
-        if lang in {"javascript", "js", "typescript", "ts", ""}:
+        if lang in {"javascript", "js", "jsx", "typescript", "ts", "tsx", ""}:
             return bool(re.search(r"\bconst\s+[A-Za-z_$][\w$]*\s*=|\bif\s*\(", code))
         if lang in {"python", "py"}:
             return bool(re.search(r"^\s*[A-Za-z_]\w*\s*=|\bif\b|\bwhile\b", code, re.MULTILINE))
@@ -1669,8 +1664,12 @@ class LiteralPropagator(BaseTransform):
         imported_literals = state.get("imported_literals", {})
         if not isinstance(imported_literals, dict):
             imported_literals = {}
-        if lang in {"javascript", "js", "typescript", "ts", ""}:
-            return self._apply_javascript(code, imported_literals)
+        if lang in {"javascript", "js", "typescript", "ts", "tsx", "jsx", ""}:
+            return self._apply_javascript(
+                code,
+                imported_literals,
+                language=lang or "javascript",
+            )
         if lang in {"python", "py"}:
             return self._apply_python(code, imported_literals)
         return TransformResult(
@@ -1681,8 +1680,18 @@ class LiteralPropagator(BaseTransform):
             details={},
         )
 
-    def _apply_javascript(self, code: str, imported_literals: Dict[str, Any]) -> TransformResult:
-        ast_result = self._apply_javascript_ast(code, imported_literals)
+    def _apply_javascript(
+        self,
+        code: str,
+        imported_literals: Dict[str, Any],
+        *,
+        language: str = "javascript",
+    ) -> TransformResult:
+        ast_result = self._apply_javascript_ast(
+            code,
+            imported_literals,
+            language=language,
+        )
         if ast_result and ast_result.success:
             _, constants = _collect_js_constants(ast_result.output, imported_literals)
             cleaned, removed = _remove_unused_js_declarations(ast_result.output, constants)
@@ -1713,10 +1722,16 @@ class LiteralPropagator(BaseTransform):
         self,
         code: str,
         imported_literals: Dict[str, Any],
+        *,
+        language: str = "javascript",
     ) -> Optional[TransformResult]:
-        if (esprima is None) or not code.strip():
+        if not code.strip():
             return None
-        simplifier = _JavaScriptAstSimplifier(code, imported_literals)
+        simplifier = _JavaScriptAstSimplifier(
+            code,
+            imported_literals,
+            language=language,
+        )
         return simplifier.simplify()
 
     def _apply_javascript_heuristic(
@@ -1783,13 +1798,30 @@ class LiteralPropagator(BaseTransform):
         try:
             tree = ast.parse(code)
         except SyntaxError:
-            return TransformResult(
-                success=False,
-                output=code,
-                confidence=0.0,
-                description="Python source is not parseable for AST literal propagation.",
-                details={},
-            )
+            cleaned, counts = normalize_source_anomalies(code)
+            if cleaned == code:
+                return TransformResult(
+                    success=False,
+                    output=code,
+                    confidence=0.0,
+                    description="Python source is not parseable for AST literal propagation.",
+                    details={},
+                )
+            try:
+                tree = ast.parse(cleaned)
+                code = cleaned
+            except SyntaxError:
+                return TransformResult(
+                    success=False,
+                    output=code,
+                    confidence=0.0,
+                    description="Python source is not parseable for AST literal propagation.",
+                    details={
+                        "preprocessing": {
+                            "anomaly_counts": counts,
+                        }
+                    },
+                )
 
         simplifier = _PythonLiteralSimplifier()
         simplified_tree = simplifier.simplify_with_seed(tree, imported_literals)

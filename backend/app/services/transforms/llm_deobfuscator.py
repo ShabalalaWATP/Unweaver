@@ -27,8 +27,17 @@ Rules:
 - Decode encoded strings, resolve dynamic lookups, inline constants.
 - Replace meaningless variable/function names with descriptive ones based on
   what the code does (e.g. downloadUrl, decryptPayload, registryKey).
+- For JavaScript/TypeScript, prefer conventional handwritten names:
+  use stringTable / resolveString / decodeString where appropriate,
+  booleans with is/has/should, plural collection names, callback/handler
+  verbs, and Element suffixes for DOM nodes when the role is clear.
 - Flatten unnecessarily nested control flow.
 - Remove dead code and junk no-op statements.
+- When the sample shows hard JavaScript obfuscation, prioritise collapsing
+  helper wrappers, string-array resolvers, constructor/eval chains,
+  control-flow dispatchers, and self-defending / debugger / domain-lock
+  scaffolding only when those guards are analysis-hostile wrappers rather
+  than business logic.
 - Add short inline comments explaining non-obvious operations.
 - Return JSON with exactly these fields:
   {
@@ -59,7 +68,7 @@ class LLMDeobfuscator(LLMTransform):
     ) -> List[Dict[str, str]]:
         truncated = self.truncate_code(code, max_chars=self._max_code_chars())
         lang = language or state.get("language", "unknown")
-        context = self.build_state_context(state)
+        context = self.build_state_context(state, code=code)
         workspace = self.build_workspace_context(code)
 
         return [
@@ -133,7 +142,16 @@ class LLMDeobfuscator(LLMTransform):
                 details={"len_ratio": len_ratio},
             )
 
-        validation = self.validate_candidate_code(code, cleaned, language)
+        validation = self.assess_candidate_rewrite(
+            code,
+            cleaned,
+            language,
+            state,
+            artifacts=decoded_artifacts + remaining_uncertainties,
+            allow_noop=False,
+            min_readability_delta=-3.0,
+            require_evidence_retention=True,
+        )
         if not validation["accepted"]:
             return TransformResult(
                 success=False,

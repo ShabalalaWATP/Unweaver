@@ -52,6 +52,7 @@ from .readability_scorer import ReadabilityScorer, compute_readability_score
 from .rename_suggester import RenameSuggester
 from .workspace_profiler import WorkspaceProfiler
 from .workspace_file_deobfuscator import WorkspaceFileDeobfuscator
+from .source_preprocessor import SourcePreprocessor
 
 # Decoding transforms
 from .base64_decoder import Base64Decoder
@@ -63,6 +64,9 @@ from .string_decryptor import StringDecryptor
 from .literal_propagator import LiteralPropagator
 
 # Language-specific decoders
+from .javascript_encoder_decoder import JavaScriptEncoderDecoder
+from .javascript_bundle_deobfuscator import JavaScriptBundleDeobfuscator
+from .js_packer_unpacker import JavaScriptPackerUnpacker
 from .js_resolvers import JavaScriptArrayResolver
 from .powershell_decoder import PowerShellDecoder
 from .python_decoder import PythonDecoder
@@ -74,6 +78,7 @@ from .deterministic_renamer import DeterministicRenamer
 # Extended decoders
 from .base32_base85_decoder import Base32Base85Decoder
 from .crypto_decryptor import CryptoDecryptor
+from .dotnet_assembly_analyzer import DotNetAssemblyAnalyzer
 from .reflection_resolver import ReflectionResolver
 from .python_serialization_decoder import PythonSerializationDecoder
 
@@ -96,6 +101,7 @@ __all__ = [
     "RenameSuggester",
     "WorkspaceProfiler",
     "WorkspaceFileDeobfuscator",
+    "SourcePreprocessor",
     # Decoding
     "Base64Decoder",
     "HexDecoder",
@@ -105,6 +111,9 @@ __all__ = [
     "StringDecryptor",
     "LiteralPropagator",
     # Language-specific
+    "JavaScriptEncoderDecoder",
+    "JavaScriptBundleDeobfuscator",
+    "JavaScriptPackerUnpacker",
     "JavaScriptArrayResolver",
     "PowerShellDecoder",
     "PythonDecoder",
@@ -114,6 +123,7 @@ __all__ = [
     # Extended decoders
     "Base32Base85Decoder",
     "CryptoDecryptor",
+    "DotNetAssemblyAnalyzer",
     "ReflectionResolver",
     "PythonSerializationDecoder",
     # Cleanup
@@ -122,6 +132,7 @@ __all__ = [
 
 # Convenience: a default pipeline ordering for deobfuscation
 DEFAULT_PIPELINE = [
+    SourcePreprocessor,
     LanguageDetector,
     ReadabilityScorer,
     ObfuscationFingerprinter,
@@ -132,6 +143,9 @@ DEFAULT_PIPELINE = [
     Base64Decoder,
     HexDecoder,
     StringDecryptor,
+    JavaScriptEncoderDecoder,
+    JavaScriptBundleDeobfuscator,
+    JavaScriptPackerUnpacker,
     PowerShellDecoder,
     PythonDecoder,
     JavaScriptArrayResolver,
@@ -140,6 +154,7 @@ DEFAULT_PIPELINE = [
     XorRecovery,
     Base32Base85Decoder,
     CryptoDecryptor,
+    DotNetAssemblyAnalyzer,
     ReflectionResolver,
     PythonSerializationDecoder,
     ControlFlowUnflattener,

@@ -24,6 +24,7 @@ from app.services.transforms.deterministic_renamer import (
     _safe_rename,
 )
 from app.services.transforms.llm_base import LLMTransform
+from app.services.transforms.source_preprocessor import beautify_source, detect_minified_source
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,13 @@ Rules:
   single-letter variables used many times, etc.).
 - Suggest names based on how the identifier is actually used in the code.
 - Use camelCase for variables/functions, PascalCase for classes.
+- Prefer JSNice-style readability for JavaScript/TypeScript:
+  booleans should start with is/has/should, arrays should use plural nouns,
+  callbacks should read like callback/onX/handleX, DOM nodes should end in
+  Element when clear, and string-table helpers should become names like
+  stringTable, resolveString, decodeString, or decryptString when supported
+  by the evidence.
+- Avoid meaningless numbered suffixes unless needed to prevent collisions.
 - Return your answer as a JSON object mapping old names to new names.
 - Only include identifiers you are confident about (≥70% sure).
 - Maximum 30 renames per response.
@@ -68,7 +76,7 @@ class LLMRenamer(LLMTransform):
     ) -> List[Dict[str, str]]:
         truncated = self.truncate_code(code, max_chars=self._max_code_chars())
         lang = language or state.get("language", "unknown")
-        context = self.build_state_context(state)
+        context = self.build_state_context(state, code=code)
         workspace = self.build_workspace_context(code)
 
         return [
@@ -147,6 +155,7 @@ class LLMRenamer(LLMTransform):
             "workspace_validation": None,
         }
         if applied > 0:
+            new_code, beautifier = self._maybe_beautify_output(new_code, language)
             validation = self.validate_candidate_code(code, new_code, language)
             if not validation["accepted"]:
                 return TransformResult(
@@ -171,6 +180,7 @@ class LLMRenamer(LLMTransform):
                 "renames_suggested": len(valid_renames),
                 "suggestions": valid_renames,
                 "validation": validation,
+                "beautifier": beautifier if applied > 0 else "none",
             },
         )
 
@@ -214,3 +224,20 @@ class LLMRenamer(LLMTransform):
             )
 
         return rebuild_workspace_bundle(bundle_text, rewritten_files), applied_names
+
+    @staticmethod
+    def _maybe_beautify_output(code: str, language: str) -> Tuple[str, str]:
+        lang = (language or "").lower().strip()
+        if lang not in {"javascript", "js", "typescript", "ts"}:
+            return code, "none"
+        if code.lstrip().startswith("UNWEAVER_WORKSPACE_BUNDLE v1"):
+            return code, "none"
+
+        profile = detect_minified_source(code, language)
+        if not profile.get("likely") and profile.get("max_line_length", 0) < 140:
+            return code, "none"
+
+        beautified, engine = beautify_source(code, language)
+        if beautified and beautified != code:
+            return beautified, engine
+        return code, "none"

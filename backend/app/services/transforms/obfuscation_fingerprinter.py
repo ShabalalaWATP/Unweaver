@@ -189,7 +189,7 @@ _PS_ENCODED = _Signature(
     language="powershell",
     patterns=[
         re.compile(r"-(?:EncodedCommand|enc)\s+[A-Za-z0-9+/=]{20,}", re.IGNORECASE),
-        re.compile(r"\[System\.Convert\]::FromBase64String", re.IGNORECASE),
+        re.compile(r"\[(?:System\.)?Convert\]::FromBase64String", re.IGNORECASE),
         re.compile(r"\[System\.Text\.Encoding\]::Unicode\.GetString", re.IGNORECASE),
     ],
     min_matches=1,
@@ -262,6 +262,31 @@ _ALL_SIGNATURES: list[_Signature] = [
     _DOTFUSCATOR,
 ]
 
+_TOOL_TECHNIQUE_MAP = {
+    "JJEncode": "jjencode_encoding",
+    "AAEncode": "aaencode_encoding",
+    "JSFuck": "jsfuck_encoding",
+    "Dean Edwards Packer": "dean_edwards_packer",
+}
+
+_GENERIC_TECHNIQUES: list[tuple[str, re.Pattern[str]]] = [
+    ("base64_encoding", re.compile(r"(?:atob\s*\(|b64decode\s*\(|FromBase64String\s*\(|[A-Za-z0-9+/]{20,}={0,2})", re.IGNORECASE)),
+    ("hex_encoding", re.compile(r"(?:\\x[0-9a-fA-F]{2}){4,}|(?:0x[0-9a-fA-F]{2}\s*,?\s*){4,}|(?:[0-9a-fA-F]{2}){16,}")),
+    ("char_code_construction", re.compile(r"(?:String\.fromCharCode|\bchr\s*\(|\bChr\s*\(|\[char\]\s*)", re.IGNORECASE)),
+    ("string_concatenation", re.compile(r"""(?:["'][^"'\\]{0,8}["']\s*(?:\+|&|\.)\s*){3,}""")),
+    ("eval_exec", re.compile(r"\b(?:eval|exec|Invoke-Expression|IEX|Execute|ExecuteGlobal)\s*[\(]", re.IGNORECASE)),
+    ("variable_renaming", re.compile(r"\b(?:_0x[a-fA-F0-9]{4,}|[Il]{6,}|_[A-Za-z0-9]{1,4})\b")),
+    ("array_indexing", re.compile(r"\b\w+\s*\[\s*(?:0x[0-9a-fA-F]+|\d+)\s*\]", re.IGNORECASE)),
+    ("xor_encryption", re.compile(r"(?:\^|\bxor\b|-bxor\b)", re.IGNORECASE)),
+    ("dean_edwards_packer", re.compile(r"eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[dr]\s*\)", re.IGNORECASE)),
+    ("control_flow_flattening", re.compile(r"(?:while\s*\(\s*(?:true|!0|1)\s*\)\s*\{?\s*switch|for\s*\(\s*;\s*;\s*\)\s*\{?\s*switch)", re.IGNORECASE)),
+    ("junk_code", re.compile(r"(?:if\s*\(\s*false\s*\)|if\s*\(\s*0\s*\)|if\s*\(\s*!\s*1\s*\)|\bpass\b|void\s*\(?\s*0\s*\)?)", re.IGNORECASE)),
+    ("reflection", re.compile(r"(?:GetType|GetMethod|Reflection|Assembly\.Load|Type\.GetMethod|Activator\.CreateInstance|\[scriptblock\]::Create|getattr\s*\()", re.IGNORECASE)),
+    ("string_encryption", re.compile(r"(?:decrypt|decipher|decode|unscramble)\s*\(", re.IGNORECASE)),
+    ("powershell_encoded_command", re.compile(r"-(?:EncodedCommand|enc)\s+[A-Za-z0-9+/=]{20,}", re.IGNORECASE)),
+    ("python_serialization", re.compile(r"(?:pickle|marshal)\.loads\s*\(|zlib\.decompress\s*\(", re.IGNORECASE)),
+]
+
 
 class ObfuscationFingerprinter(BaseTransform):
     name = "obfuscation_fingerprinter"
@@ -274,6 +299,7 @@ class ObfuscationFingerprinter(BaseTransform):
 
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
         detections: list[dict[str, Any]] = []
+        detected_techniques: list[str] = []
         lang = (language or "").lower().strip()
 
         for sig in _ALL_SIGNATURES:
@@ -305,6 +331,9 @@ class ObfuscationFingerprinter(BaseTransform):
                     0.95,
                     0.50 + 0.15 * match_count
                 )
+                mapped = _TOOL_TECHNIQUE_MAP.get(sig.tool)
+                if mapped:
+                    detected_techniques.append(mapped)
                 detections.append({
                     "tool": sig.tool,
                     "language": sig.language,
@@ -315,7 +344,13 @@ class ObfuscationFingerprinter(BaseTransform):
                     "pattern_details": matched_patterns,
                 })
 
-        if not detections:
+        for technique_name, pattern in _GENERIC_TECHNIQUES:
+            if pattern.search(code):
+                detected_techniques.append(technique_name)
+
+        detected_techniques = list(dict.fromkeys(detected_techniques))
+
+        if not detections and not detected_techniques:
             return TransformResult(
                 success=False,
                 output=code,
@@ -328,21 +363,33 @@ class ObfuscationFingerprinter(BaseTransform):
 
         state.setdefault("obfuscation_signatures", []).extend(detections)
 
-        best = detections[0]
-        overall_confidence = best["confidence"]
+        overall_confidence = (
+            detections[0]["confidence"]
+            if detections
+            else min(0.9, 0.45 + 0.05 * len(detected_techniques))
+        )
 
         tools_found = [d["tool"] for d in detections]
+        description_bits: list[str] = []
+        if tools_found:
+            description_bits.append(
+                f"Detected {len(detections)} obfuscation signature(s): {', '.join(tools_found)}"
+            )
+        if detected_techniques:
+            description_bits.append(
+                "generic techniques: " + ", ".join(detected_techniques[:10])
+            )
+        description = ". ".join(description_bits) + "."
 
         return TransformResult(
             success=True,
             output=code,
             confidence=overall_confidence,
-            description=(
-                f"Detected {len(detections)} obfuscation signature(s): "
-                f"{', '.join(tools_found)}."
-            ),
+            description=description,
             details={
                 "detection_count": len(detections),
                 "detections": detections,
+                "detected_techniques": detected_techniques,
+                "identified_tools": tools_found,
             },
         )

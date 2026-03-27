@@ -42,9 +42,17 @@ _HEX_ESCAPE_STR = re.compile(r"(?:\\x[0-9a-fA-F]{2}){4,}")
 _BYTE_ARRAY = re.compile(
     r"\[\s*(?:0x[0-9a-fA-F]{1,2}\s*,\s*){3,}0x[0-9a-fA-F]{1,2}\s*\]"
 )
+# [65, 66, ...] decimal byte arrays
+_DECIMAL_BYTE_ARRAY = re.compile(
+    r"\[\s*(?:\d{1,3}\s*,\s*){3,}\d{1,3}\s*\]"
+)
 # Strings assigned near XOR ops (grab anything in quotes near ^)
 _NEAR_XOR_STRING = re.compile(
     r"""['"]((?:[^'"\n\\]|\\.){{8,}})['"]""",
+)
+_EXPLICIT_XOR_KEY = re.compile(
+    r"(?:\^|-bxor\b)\s*(0x[0-9a-fA-F]{1,2}|\d{1,3})",
+    re.IGNORECASE,
 )
 
 # Pattern to match a full hex-escape string literal including quotes
@@ -84,12 +92,32 @@ def _extract_bytes_from_array(text: str) -> bytes:
     return bytes(int(v, 16) for v in values)
 
 
+def _extract_bytes_from_decimal_array(text: str) -> bytes:
+    """Extract bytes from [65, 66, ...] format."""
+    values = [int(value) for value in re.findall(r"\d{1,3}", text)]
+    values = [value for value in values if 0 <= value <= 255]
+    return bytes(values)
+
+
 def _extract_bytes_from_string(text: str) -> bytes:
     """Convert a regular string to bytes for XOR brute-forcing."""
     try:
         return text.encode("latin-1")
     except Exception:
         return text.encode("utf-8", errors="ignore")
+
+
+def _parse_numeric_key(token: str) -> int | None:
+    try:
+        if token.lower().startswith("0x"):
+            value = int(token, 16)
+        else:
+            value = int(token, 10)
+    except Exception:
+        return None
+    if 0 <= value <= 255:
+        return value
+    return None
 
 
 def _printable_score(data: bytes) -> float:
@@ -158,6 +186,43 @@ def _brute_force_xor(
                 "method": "single_byte_bruteforce",
             })
     candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates
+
+
+def _decode_with_explicit_keys(
+    data: bytes,
+    code: str,
+    start: int,
+    end: int,
+    window: int = 240,
+) -> list[dict[str, Any]]:
+    """Use nearby ``^ 0xNN`` or ``-bxor`` literals as high-confidence keys."""
+    snippet_start = max(0, start - window)
+    snippet_end = min(len(code), end + window)
+    snippet = code[snippet_start:snippet_end]
+    candidates: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for match in _EXPLICIT_XOR_KEY.finditer(snippet):
+        key = _parse_numeric_key(match.group(1))
+        if key is None or key == 0 or key in seen:
+            continue
+        seen.add(key)
+        result = _xor_single_byte(data, key)
+        score = _printable_score(result)
+        if score < 0.60:
+            continue
+        try:
+            text = result.decode("utf-8", errors="replace")
+        except Exception:
+            text = result.decode("latin-1")
+        candidates.append({
+            "key": key,
+            "key_hex": f"0x{key:02x}",
+            "key_bytes": bytes([key]),
+            "decoded": text,
+            "score": round(score, 4),
+            "method": "explicit_key_context",
+        })
     return candidates
 
 
@@ -448,7 +513,7 @@ def _inline_replace(
             # Fallback: replace just the hex escapes, wrapping in quotes
             replacements.append((start, end, decoded_literal))
 
-        elif label == "byte_array":
+        elif label in {"byte_array", "decimal_byte_array"}:
             replacements.append((start, end, decoded_literal))
 
         elif label == "string_literal":
@@ -564,6 +629,11 @@ class XorRecovery(BaseTransform):
             if len(data) >= 4:
                 blobs.append(("byte_array", data, m.start(), m.end()))
 
+        for m in _DECIMAL_BYTE_ARRAY.finditer(code):
+            data = _extract_bytes_from_decimal_array(m.group(0))
+            if len(data) >= 4:
+                blobs.append(("decimal_byte_array", data, m.start(), m.end()))
+
         # Also look for strings stored in state by the string extractor
         extracted_strings = state.get("extracted_strings", [])
         for s in extracted_strings:
@@ -582,6 +652,14 @@ class XorRecovery(BaseTransform):
 
         for idx, (label, data, start, end) in enumerate(blobs):
             blob_candidates: list[dict[str, Any]] = []
+
+            explicit_key_candidates = _decode_with_explicit_keys(
+                data,
+                code,
+                start,
+                end,
+            )
+            blob_candidates.extend(explicit_key_candidates)
 
             # ---- Step 1: single-byte brute force (fast) ----
             single_candidates = _brute_force_xor(data)
@@ -671,5 +749,13 @@ class XorRecovery(BaseTransform):
                 "blob_count": len(all_results),
                 "methods_used": methods_used,
                 "results": all_results,
+                "recovered": [
+                    {"decoded": item.get("decoded", ""), "key_hex": item.get("key_hex", "")}
+                    for item in all_results
+                ],
+                "decoded_strings": [
+                    {"encoded": item.get("source", "xor_blob"), "decoded": item.get("decoded", "")}
+                    for item in all_results
+                ],
             },
         )

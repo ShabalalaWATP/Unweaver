@@ -46,6 +46,7 @@ from app.services.analysis.action_queue import ActionQueue, QueuedAction
 from app.services.analysis.findings_generator import FindingsGenerator
 from app.services.analysis.state_manager import StateManager
 from app.services.transforms.base import BaseTransform, TransformResult
+from app.services.transforms.source_preprocessor import normalize_source_anomalies
 
 logger = logging.getLogger(__name__)
 
@@ -1092,6 +1093,106 @@ class AnalysisResult:
     was_stopped: bool = False
 
 
+def _residual_obfuscation_markers(
+    code: str,
+    language: Optional[str],
+    state: Optional[AnalysisState] = None,
+) -> Dict[str, Any]:
+    """Estimate whether obvious decode/runtime wrappers still remain."""
+    if not code or not code.strip():
+        return {"score": 0.0, "reasons": [], "has_residual": False}
+
+    sample = code[:20_000]
+    lang = (language or "").lower().strip()
+    score = 0.0
+    reasons: List[str] = []
+    critical_residual = False
+
+    def _flag(
+        pattern: str,
+        weight: float,
+        reason: str,
+        flags: int = re.IGNORECASE,
+    ) -> None:
+        nonlocal score, critical_residual
+        if re.search(pattern, sample, flags):
+            score += weight
+            if weight >= 0.9:
+                critical_residual = True
+            if reason not in reasons:
+                reasons.append(reason)
+
+    _flag(r"[A-Za-z0-9+/]{48,}={0,2}", 0.4, "Encoded/base64-like blobs remain")
+    _flag(
+        r"""(?:"[^"\n]*"|'[^'\n]*')\s*\+\s*(?:"[^"\n]*"|'[^'\n]*')""",
+        0.7,
+        "Literal string concatenation remains",
+        flags=0,
+    )
+
+    if lang in {"javascript", "js", "jsx", "typescript", "ts", "tsx"}:
+        _flag(
+            r"""\b\w+\s*\(\s*['"]0x[0-9a-fA-F]+['"]\s*\)""",
+            1.4,
+            "JavaScript wrapper-function lookups remain",
+            flags=0,
+        )
+        _flag(r"\[\s*(?:0x[0-9a-fA-F]+|\d+)\s*\]", 0.7, "Array-indexed lookups remain")
+        _flag(r"\batob\s*\(", 0.9, "Base64 decode wrappers remain")
+        _flag(
+            r"\b(?:eval|Function|setTimeout|setInterval)\s*\(",
+            1.1,
+            "Dynamic JavaScript execution wrappers remain",
+        )
+        _flag(r"\bString\.fromCharCode\s*\(", 0.9, "Character-code builders remain")
+    elif lang in {"python", "py"}:
+        _flag(r"\bexec\s*\(", 1.2, "Python exec wrappers remain")
+        _flag(r"\bcompile\s*\(", 0.7, "Python compile wrappers remain")
+        _flag(r"(?:base64\.)?b64decode\s*\(", 1.0, "Python base64 decode wrappers remain")
+        _flag(r"\bzlib\.decompress\s*\(", 0.9, "Compressed Python payload wrappers remain")
+        _flag(r"\bmarshal\.loads\s*\(", 1.2, "Serialized Python code objects remain")
+        _flag(r"\bcodecs\.decode\s*\(", 0.6, "Python codec decode wrappers remain")
+    elif lang in {"powershell", "ps1", "ps"}:
+        _flag(r"\b(?:Invoke-Expression|IEX)\b", 1.2, "PowerShell execution wrappers remain")
+        _flag(
+            r"(?:\[System\.Convert\]::|\[Convert\]::|Convert\.)FromBase64String\s*\(",
+            1.0,
+            "PowerShell base64 decode wrappers remain",
+        )
+        _flag(
+            r"\[System\.Text\.Encoding\]::(?:Unicode|UTF8)\.GetString\s*\(",
+            0.9,
+            "PowerShell GetString wrappers remain",
+        )
+        _flag(r"`[A-Za-z]", 0.5, "PowerShell backtick obfuscation remains")
+        _flag(r"\bNew-Object\b", 0.4, "PowerShell object-construction wrappers remain")
+
+    if state is not None:
+        techniques = {
+            str(item).lower().replace(" ", "_")
+            for item in getattr(state, "detected_techniques", [])
+        }
+        lingering = techniques.intersection(
+            {
+                "array_indexing",
+                "base64_encoding",
+                "hex_encoding",
+                "char_code_construction",
+                "string_encryption",
+                "powershell_encoded_command",
+                "python_serialization",
+            }
+        )
+        score += min(len(lingering), 3) * 0.2
+
+    score = round(min(score, 9.9), 2)
+    return {
+        "score": score,
+        "reasons": reasons[:6],
+        "has_residual": score >= 1.0 or critical_residual,
+    }
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Stop decision
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1164,6 +1265,28 @@ class StopDecision:
         iteration = state_manager.current_iteration
         confidence = state_manager.overall_confidence
         stall = state_manager.stall_counter
+        pending_high_confidence = action_queue.peek()
+        residual = _residual_obfuscation_markers(
+            state_manager.current_code,
+            state_manager.state.language,
+            state_manager.state,
+        )
+
+        def _pending_can_reduce_residual() -> bool:
+            pending = action_queue.peek()
+            if pending is None:
+                return False
+            if residual["has_residual"]:
+                return (
+                    pending.confidence >= 0.55
+                    or pending.action_name.startswith("llm_")
+                )
+            return (
+                pending.confidence >= 0.7
+                and not action_queue.has_been_tried(pending.action_name)
+            )
+
+        residual_reason = ", ".join(residual["reasons"][:2]) or "residual decode wrappers remain"
 
         # 1. Budget exhausted.
         if iteration >= self.max_iterations:
@@ -1192,11 +1315,14 @@ class StopDecision:
         # 4. Stall detection.
         if stall >= self.stall_limit:
             # If there are still high-confidence items, try one more round.
-            peeked = action_queue.peek()
-            if peeked and peeked.confidence >= 0.7:
+            if _pending_can_reduce_residual():
                 return StopVerdict(
                     StopAction.CONTINUE,
-                    "Stalled, but high-confidence action available.",
+                    (
+                        "Stalled, but another action may still recover code."
+                        if not residual["has_residual"]
+                        else f"Stalled, but {residual_reason}."
+                    ),
                 )
             return StopVerdict(
                 StopAction.STOP,
@@ -1205,6 +1331,18 @@ class StopDecision:
 
         # 5. Queue empty.
         if action_queue.is_empty:
+            if (
+                residual["has_residual"]
+                and last_transform_success
+                and improvement_score > 0.0
+            ):
+                return StopVerdict(
+                    StopAction.CONTINUE,
+                    (
+                        "Queue exhausted after a successful transform, but "
+                        f"{residual_reason}; allowing one more planning cycle."
+                    ),
+                )
             return StopVerdict(
                 StopAction.STOP,
                 "Action queue exhausted; no more transforms to try.",
@@ -1212,6 +1350,14 @@ class StopDecision:
 
         # 6. Sufficiently deobfuscated — check both confidence and readability.
         if confidence >= self.sufficiency_threshold:
+            if residual["has_residual"] and _pending_can_reduce_residual():
+                return StopVerdict(
+                    StopAction.CONTINUE,
+                    (
+                        f"High confidence, but {residual_reason}; "
+                        "continuing with remaining transforms."
+                    ),
+                )
             return StopVerdict(
                 StopAction.STOP,
                 f"Code sufficiently deobfuscated (confidence {confidence:.2f}).",
@@ -1224,6 +1370,15 @@ class StopDecision:
             and readability_history[-1] >= 0.75
             and confidence >= 0.6
         ):
+            if residual["has_residual"] and _pending_can_reduce_residual():
+                return StopVerdict(
+                    StopAction.CONTINUE,
+                    (
+                        "Readable output, but another transform is still pending."
+                        if not residual["has_residual"]
+                        else f"Readable output, but {residual_reason}."
+                    ),
+                )
             # Readability is high and confidence is decent — code is clean.
             return StopVerdict(
                 StopAction.STOP,
@@ -1237,6 +1392,15 @@ class StopDecision:
             if all(abs(recent[i] - recent[i - 1]) < 0.02 for i in range(1, len(recent))):
                 # Readability has plateaued — further transforms are unlikely to help.
                 if confidence >= 0.5 and iteration >= 5:
+                    if residual["has_residual"] and _pending_can_reduce_residual():
+                        return StopVerdict(
+                            StopAction.CONTINUE,
+                            (
+                                "Readability plateaued, but another transform is still pending."
+                                if not residual["has_residual"]
+                                else f"Readability plateaued, but {residual_reason}."
+                            ),
+                        )
                     return StopVerdict(
                         StopAction.STOP,
                         f"Readability plateaued at {recent[-1]:.2f}; "
@@ -1418,6 +1582,12 @@ class Verifier:
         if iocs:
             scores.append((0.10, min(len(iocs) * 0.1, 0.5)))
 
+        # 4b. Sink identification. Recognising actual execution sinks or
+        # reflective dispatch points materially increases analyst confidence.
+        sink_score = self._sink_identification_score(details)
+        if sink_score > 0.0:
+            scores.append((0.14, sink_score))
+
         # 5. Transform confidence as a signal.
         scores.append((0.15, result.confidence * 0.5))
 
@@ -1461,6 +1631,24 @@ class Verifier:
             improvement = min(improvement, syntax_score)
 
         return max(-1.0, min(1.0, improvement))
+
+    @staticmethod
+    def _sink_identification_score(details: Dict[str, Any]) -> float:
+        sinks = details.get("identified_sinks") or []
+        if not isinstance(sinks, list) or not sinks:
+            return 0.0
+        severity_weight = {"high": 0.18, "medium": 0.11, "low": 0.06}
+        score = 0.0
+        families: set[str] = set()
+        for sink in sinks[:12]:
+            if not isinstance(sink, dict):
+                continue
+            score += severity_weight.get(str(sink.get("severity", "")).lower(), 0.05)
+            family = str(sink.get("family", "")).strip()
+            if family:
+                families.add(family)
+        score += min(0.18, len(families) * 0.04)
+        return min(0.7, score)
 
     @classmethod
     def _syntax_delta(cls, language: str, before: str, after: str) -> float:
@@ -1507,6 +1695,7 @@ class Verifier:
 
     @classmethod
     def _is_syntax_healthy(cls, language: str, code: str) -> bool:
+        code, _ = normalize_source_anomalies(code)
         lang = (language or "").lower()
         if lang in {"python", "py"}:
             try:
@@ -1524,6 +1713,7 @@ class Verifier:
 
     @staticmethod
     def _balanced_delimiters(code: str) -> bool:
+        code, _ = normalize_source_anomalies(code)
         pairs = {"(": ")", "{": "}", "[": "]"}
         closing = {value: key for key, value in pairs.items()}
         stack: List[str] = []
@@ -1681,18 +1871,23 @@ class Planner:
     # Ordered plan templates by analysis phase.
     _PHASE_INITIAL: List[str] = [
         "profile_workspace",
+        "preprocess_source",
         "detect_language",
         "fingerprint_obfuscation",
         "extract_strings",
         "analyze_entropy",
     ]
     _PHASE_DECODE: List[str] = [
+        "analyze_dotnet_assembly",
         "decode_base64",
         "decode_hex",
         "decode_base32_base85",
         "normalize_unicode",
         "try_xor_recovery",
         "decrypt_crypto",
+        "decode_js_encoder",
+        "unpack_js_packer",
+        "deobfuscate_js_bundle",
         "powershell_decode",
         "python_decode",
         "decode_python_serialization",
@@ -1721,8 +1916,11 @@ class Planner:
         fingerprint run, exposing potentially new patterns.
         """
         _CODE_MODIFYING = {
+            "preprocess_source",
             "deobfuscate_workspace_files",
+            "analyze_dotnet_assembly",
             "decode_base64", "decode_hex", "try_xor_recovery",
+            "decode_js_encoder", "unpack_js_packer", "deobfuscate_js_bundle",
             "powershell_decode", "python_decode", "constant_fold",
             "recover_literals",
             "simplify_junk_code", "identify_string_resolver",
@@ -1740,6 +1938,223 @@ class Planner:
         # Re-scan if code-modifying transforms have succeeded more times
         # than we've fingerprinted (roughly: new modifications since last scan).
         return modifying_successes >= fingerprint_count
+
+    @staticmethod
+    def _looks_like_javascript(language: str, code: str) -> bool:
+        lang = (language or "").lower().strip()
+        if lang in {"javascript", "js", "jsx", "typescript", "ts", "tsx"}:
+            return True
+        if lang == "workspace":
+            return bool(
+                re.search(
+                    r"languages:\s.*(?:javascript|typescript)\s*=",
+                    code[:800],
+                    re.IGNORECASE,
+                )
+            )
+        if lang:
+            return False
+        return bool(
+            re.search(
+                r"\b(?:var|let|const|function|document\.|window\.|require\s*\(|=>)\b",
+                code[:6000],
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _detect_javascript_hard_mode(
+        code: str,
+        language: str,
+        techniques: Set[str],
+        residual_score: float,
+        llm_classification: Optional[Dict[str, Any]],
+        *,
+        js_string_array_hint: bool,
+        js_packer_hint: bool,
+        js_encoder_hint: bool,
+        entropy_profile: str = "",
+        workspace_mode: bool = False,
+    ) -> Dict[str, Any]:
+        if not Planner._looks_like_javascript(language, code):
+            return {"enabled": False, "score": 0.0, "signals": [], "profile": "off"}
+
+        from app.services.transforms.source_preprocessor import detect_minified_source
+
+        sample = code[:20_000]
+        minified_profile = detect_minified_source(code, "javascript")
+        classification_terms: List[str] = []
+        if isinstance(llm_classification, dict):
+            classification_terms.extend(
+                str(item)
+                for item in llm_classification.get("tools_identified", [])[:8]
+            )
+            for key in ("obfuscation_type", "recommended_strategy"):
+                value = str(llm_classification.get(key, "")).strip()
+                if value:
+                    classification_terms.append(value)
+        classification_text = " ".join(classification_terms).lower()
+
+        signals: List[str] = []
+        score = 0.0
+
+        def _add(condition: bool, weight: float, signal: str) -> None:
+            nonlocal score
+            if condition and signal not in signals:
+                signals.append(signal)
+                score += weight
+
+        _add(
+            js_string_array_hint
+            or (
+                "array_indexing" in techniques
+                and "variable_renaming" in techniques
+            ),
+            1.1,
+            "string_array_wrappers",
+        )
+        _add(
+            js_encoder_hint
+            or bool(
+                {
+                    "jsfuck_encoding",
+                    "jjencode_encoding",
+                    "aaencode_encoding",
+                    "javascript_runtime_encoder",
+                }.intersection(techniques)
+            ),
+            1.3,
+            "runtime_encoder_chains",
+        )
+        _add(
+            js_packer_hint or "dean_edwards_packer" in techniques,
+            0.9,
+            "packer_wrappers",
+        )
+        _add(
+            "control_flow_flattening" in techniques
+            or bool(
+                re.search(
+                    r"while\s*\(\s*(?:true|1|!0)\s*\)\s*\{?\s*switch",
+                    sample,
+                    re.IGNORECASE,
+                )
+            ),
+            1.0,
+            "control_flow_flattening",
+        )
+        _add(
+            bool(
+                re.search(
+                    r"\bdebugger\b|disableConsoleOutput|console\[['\"](?:log|warn|info|error)['\"]\]\s*=\s*function",
+                    sample,
+                    re.IGNORECASE,
+                )
+            ),
+            0.8,
+            "anti_debugger_guards",
+        )
+        _add(
+            bool(
+                re.search(
+                    r"\b(?:eval|Function|setTimeout|setInterval)\s*\(",
+                    sample,
+                    re.IGNORECASE,
+                )
+            ),
+            0.7,
+            "dynamic_execution_wrappers",
+        )
+        _add(
+            bool(
+                re.search(
+                    r"\bselfDefending\b|toString\s*\(\s*\)\s*\[\s*['\"]constructor['\"]\s*\]",
+                    sample,
+                    re.IGNORECASE,
+                )
+            ),
+            0.9,
+            "self_defending_wrappers",
+        )
+        _add(
+            bool(
+                re.search(
+                    r"\b(?:domainLock|location\.(?:href|host|hostname)|document\.domain|window\.location)\b",
+                    sample,
+                    re.IGNORECASE,
+                )
+            ),
+            0.7,
+            "domain_lock_checks",
+        )
+        _add(
+            bool(
+                re.search(
+                    r"\b(?:CryptoJS|RC4|rc4|fromCharCode|charCodeAt|decodeURIComponent|decrypt)\b",
+                    sample,
+                    re.IGNORECASE,
+                )
+                or re.search(
+                    r"\.split\(\s*['\"]{0,1}\s*['\"]{0,1}\s*\)\.reverse\(\)\.join",
+                    sample,
+                    re.IGNORECASE,
+                )
+            ),
+            0.8,
+            "custom_string_decryptors",
+        )
+        _add(
+            float(minified_profile.get("score", 0.0)) >= 0.55,
+            0.6,
+            "heavy_minification",
+        )
+        _add(residual_score >= 2.6, 0.9, "residual_runtime_wrappers")
+        _add(
+            entropy_profile in ("encrypted", "heavily_obfuscated"),
+            0.5,
+            "high_entropy_payload",
+        )
+        _add(
+            "javascript-obfuscator" in classification_text
+            or "obfuscator.io" in classification_text,
+            1.0,
+            "javascript_obfuscator_profile",
+        )
+        _add(
+            any(term in classification_text for term in ("jsfuck", "jjencode", "aaencode")),
+            0.9,
+            "runtime_encoder_profile",
+        )
+        _add(
+            workspace_mode
+            and bool(
+                re.search(
+                    r"languages:\s.*(?:javascript|typescript)\s*=",
+                    code[:800],
+                    re.IGNORECASE,
+                )
+            ),
+            0.2,
+            "workspace_js_bundle",
+        )
+
+        enabled = (
+            score >= 2.4
+            or (
+                "runtime_encoder_chains" in signals
+                and "control_flow_flattening" in signals
+            )
+            or (
+                "string_array_wrappers" in signals
+                and "custom_string_decryptors" in signals
+            )
+        )
+        return {
+            "enabled": enabled,
+            "score": round(score, 2),
+            "signals": signals,
+            "profile": "aggressive" if score >= 4.0 else "assisted" if enabled else "off",
+        }
 
     @staticmethod
     def _planner_code_excerpt(code: str, max_chars: int = 4000) -> str:
@@ -2123,12 +2538,18 @@ class Planner:
             excerpt = self._planner_code_excerpt(code, max_chars=3000)
             techniques = list(state_manager.state.detected_techniques)
             language = state_manager.state.language or "unknown"
+            state_context = LLMTransform.build_state_context(
+                state_manager.state.model_dump(),
+                code=code,
+                compact=True,
+            )
 
             prompt = (
                 "You are an expert malware analyst. Classify the obfuscation "
                 "used in this code sample and recommend a deobfuscation strategy.\n\n"
                 f"Language: {language}\n"
                 f"Regex-detected techniques: {techniques}\n\n"
+                f"State context:\n{state_context}\n\n"
                 f"Code excerpt:\n```\n{excerpt}\n```\n\n"
                 "Respond with ONLY a JSON object:\n"
                 "{\n"
@@ -2272,6 +2693,9 @@ class Planner:
 
         recommendations: List[PlannedAction] = []
 
+        def _not_tried(action_name: str) -> bool:
+            return not action_queue.has_been_tried(action_name)
+
         # ── LLM Classification boost ─────────────────────────────────
         # If the LLM classified the obfuscation type on iteration 1,
         # boost its recommended transforms on iterations 1-3.
@@ -2288,10 +2712,14 @@ class Planner:
 
         # ── Phase 1: Initial reconnaissance ──────────────────────────
         if iteration <= 1:
+            from app.services.transforms.source_preprocessor import source_needs_preprocessing
+
             for i, action in enumerate(self._PHASE_INITIAL):
-                if workspace_mode and action == "detect_language":
+                if workspace_mode and action in {"detect_language", "preprocess_source"}:
                     continue
                 if not workspace_mode and action == "profile_workspace":
+                    continue
+                if action == "preprocess_source" and not source_needs_preprocessing(code, language):
                     continue
                 if action in self._available_actions and not action_queue.has_been_tried(action):
                     recommendations.append(PlannedAction(
@@ -2335,22 +2763,154 @@ class Planner:
 
         # ── Phase 2: Decoding — driven by detected techniques ────────
         techniques = set(t.lower().replace(" ", "_") for t in state.detected_techniques)
+        if "base64_blob" in techniques:
+            techniques.add("base64_encoding")
+        if "hex_stream" in techniques or "escaped_hex" in techniques:
+            techniques.add("hex_encoding")
+        if "python_serialization" in techniques:
+            techniques.add("marshal_bytecode")
+        if "powershell_encoded_command" in techniques:
+            techniques.add("base64_encoding")
 
-        if "base64_encoding" in techniques and not action_queue.success_count("decode_base64"):
+        base64_hint = bool(re.search(
+            r"(?:atob\s*\(|(?:base64\.)?b64decode\s*\(|(?:\[(?:System\.)?Convert\]::|Convert\.)FromBase64String\s*\(|-(?:EncodedCommand|enc)\b)",
+            code[:12000],
+            re.IGNORECASE,
+        ))
+        hex_hint = bool(re.search(
+            r"(?:\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|0x[0-9a-fA-F]{2}\s*,|(?:[0-9a-fA-F]{2}){16,})",
+            code[:12000],
+        ))
+        python_serial_hint = bool(re.search(
+            r"(?:pickle|marshal)\.loads\s*\(|zlib\.decompress\s*\(",
+            code[:12000],
+            re.IGNORECASE,
+        ))
+        dotnet_binary_hint = False
+        try:
+            from app.services.transforms.binary_analysis import (
+                binary_text_to_bytes,
+                looks_like_dotnet_assembly_bytes,
+            )
+
+            dotnet_binary_hint = looks_like_dotnet_assembly_bytes(binary_text_to_bytes(code))
+        except Exception:
+            dotnet_binary_hint = False
+        xor_hint = (
+            bool(re.search(r"(?:\^|-bxor\b)", code[:12000], re.IGNORECASE))
+            and bool(re.search(
+                r"(?:\\x[0-9a-fA-F]{2}|\[\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})(?:\s*,\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})){3,}\s*\])",
+                code[:12000],
+                re.IGNORECASE,
+            ))
+        )
+        js_string_array_hint = (
+            language in ("javascript", "js", "jsx", "typescript", "ts", "tsx")
+            and bool(re.search(
+                r"(?:\b_0x[0-9a-fA-F]{3,}\b|"
+                r"(?:var|let|const)\s+\w+\s*=\s*\[[^\]]+\]\s*;?.{0,240}"
+                r"(?:\.push\s*\(\s*\w+\.shift\s*\(|return\s+\w+\s*\[\s*(?:0x[0-9a-fA-F]+|\d+)\s*\]))",
+                code[:12000],
+                re.IGNORECASE | re.DOTALL,
+            ))
+        )
+        js_packer_hint = (
+            language in ("javascript", "js", "jsx", "typescript", "ts", "tsx", "")
+            and bool(re.search(
+                r"eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[dr]\s*\)",
+                code[:12000],
+                re.IGNORECASE,
+            ))
+        )
+        js_encoder_hint = (
+            language in ("javascript", "js", "jsx", "typescript", "ts", "tsx", "")
+            and (
+                bool(re.search(r"""(?:\[\s*['"]\w+['"]\s*\]\s*){1,4}\[\s*['"]constructor['"]\s*\]\s*\(""", code[:12000]))
+                or bool(re.search(r"""(?:\$=~\[\];|\$=\{___:|ﾟДﾟ|ﾟωﾟ)""", code[:12000]))
+            )
+        )
+        js_bundle_hint = (
+            language in ("javascript", "js", "jsx", "typescript", "ts", "tsx", "")
+            and bool(re.search(
+                r"(?:__webpack_require__|webpackJsonp|parcelRequire|\bmodule\.exports\b|\bexports\.default\b|\(function\s*\(\s*modules\s*\)|\b\d+\s*:\s*function\s*\()",
+                code[:25000],
+                re.IGNORECASE,
+            ))
+        )
+        js_minified_bundle_hint = (
+            language in ("javascript", "js", "jsx", "typescript", "ts", "tsx", "")
+            and (
+                "minified_code_beautification" in techniques
+                or bool(re.search(r"^[^\n]{220,}$", code[:8000], re.MULTILINE))
+            )
+        )
+        literal_eval_hint = (
+            language in ("javascript", "js", "jsx", "typescript", "ts", "tsx")
+            and bool(re.search(
+                r"""\beval\s*\(\s*(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*\)""",
+                code[:12000],
+                re.DOTALL,
+            ))
+        )
+        residual = _residual_obfuscation_markers(code, language, state)
+        residual_score = float(residual["score"])
+        residual_reasons = residual["reasons"]
+        js_hard_mode = self._detect_javascript_hard_mode(
+            code,
+            language,
+            techniques,
+            residual_score,
+            llm_classification,
+            js_string_array_hint=js_string_array_hint,
+            js_packer_hint=js_packer_hint,
+            js_encoder_hint=js_encoder_hint,
+            entropy_profile=entropy_profile,
+            workspace_mode=workspace_mode,
+        )
+        state.iteration_state["js_hard_mode"] = js_hard_mode
+        js_hard_enabled = bool(js_hard_mode.get("enabled"))
+        js_hard_score = float(js_hard_mode.get("score", 0.0))
+        js_hard_signals = {
+            str(item)
+            for item in js_hard_mode.get("signals", [])
+            if str(item).strip()
+        }
+
+        if (
+            "analyze_dotnet_assembly" in self._available_actions
+            and ((language or "").lower().strip() == "dotnet" or dotnet_binary_hint)
+            and _not_tried("analyze_dotnet_assembly")
+        ):
+            recommendations.append(PlannedAction(
+                action_name="analyze_dotnet_assembly",
+                confidence=0.92,
+                reason=".NET PE/CLR assembly detected.",
+                priority=9.8,
+            ))
+        if (
+            ("base64_encoding" in techniques or base64_hint)
+            and _not_tried("decode_base64")
+        ):
             recommendations.append(PlannedAction(
                 action_name="decode_base64",
                 confidence=0.9,
                 reason="Base64 encoding detected.",
                 priority=10.0,
             ))
-        if "hex_encoding" in techniques and not action_queue.success_count("decode_hex"):
+        if (
+            ("hex_encoding" in techniques or hex_hint)
+            and _not_tried("decode_hex")
+        ):
             recommendations.append(PlannedAction(
                 action_name="decode_hex",
                 confidence=0.85,
                 reason="Hex encoding detected.",
                 priority=11.0,
             ))
-        if "xor_encryption" in techniques and not action_queue.success_count("try_xor_recovery"):
+        if (
+            ("xor_encryption" in techniques or xor_hint)
+            and _not_tried("try_xor_recovery")
+        ):
             recommendations.append(PlannedAction(
                 action_name="try_xor_recovery",
                 confidence=0.6,
@@ -2374,67 +2934,173 @@ class Planner:
 
         # String decryption — schedule if custom decrypt functions suspected.
         if ("decrypt_strings" in self._available_actions
-                and not action_queue.success_count("decrypt_strings")):
+                and _not_tried("decrypt_strings")):
             _decrypt_hint = bool(
                 re.search(
-                    r'function\s+\w{1,6}\s*\(\s*\w+\s*\)\s*\{.*?(?:split|reverse|fromCharCode|charCodeAt|charAt)\b',
+                    r'function\s+\w{1,12}\s*\(\s*\w+\s*(?:,\s*\w+\s*)*\)\s*\{.*?(?:split|reverse|fromCharCode|charCodeAt|charAt|atob|b64decode|\^)\b',
                     code[:10000],
                     re.DOTALL,
                 )
             ) or "string_encryption" in techniques
-            if _decrypt_hint:
+            if _decrypt_hint or (
+                js_hard_enabled
+                and bool(
+                    {
+                        "custom_string_decryptors",
+                        "residual_runtime_wrappers",
+                    }.intersection(js_hard_signals)
+                )
+            ):
                 recommendations.append(PlannedAction(
                     action_name="decrypt_strings",
-                    confidence=0.75,
-                    reason="Custom string decrypt function detected.",
-                    priority=11.5,
+                    confidence=0.82 if js_hard_enabled else 0.75,
+                    reason=(
+                        "JavaScript hard mode: custom string decryptor helpers remain."
+                        if js_hard_enabled else
+                        "Custom string decrypt function detected."
+                    ),
+                    priority=11.0 if js_hard_enabled else 11.5,
                 ))
 
         # Language-specific decoders.
         if language in ("powershell", "ps1", "ps"):
-            if not action_queue.success_count("powershell_decode"):
+            if _not_tried("powershell_decode"):
                 recommendations.append(PlannedAction(
                     action_name="powershell_decode",
                     confidence=0.85,
                     reason="PowerShell code detected.",
-                    priority=10.5,
+                    priority=9.3,
                 ))
         if language in ("python", "py"):
-            if not action_queue.success_count("python_decode"):
+            if _not_tried("python_decode"):
                 recommendations.append(PlannedAction(
                     action_name="python_decode",
                     confidence=0.8,
                     reason="Python code detected.",
-                    priority=10.5,
+                    priority=9.35,
                 ))
-        if "array_indexing" in techniques or "char_code_construction" in techniques:
-            if not action_queue.success_count("identify_string_resolver"):
+        if (
+            "decode_python_serialization" in self._available_actions
+            and (python_serial_hint or "marshal_bytecode" in techniques)
+            and _not_tried("decode_python_serialization")
+        ):
+            recommendations.append(PlannedAction(
+                action_name="decode_python_serialization",
+                confidence=0.82,
+                reason="Python serialization or compressed bytecode chain detected.",
+                priority=10.8,
+            ))
+        if (
+            "array_indexing" in techniques
+            or "char_code_construction" in techniques
+            or js_string_array_hint
+        ):
+            if _not_tried("identify_string_resolver"):
                 recommendations.append(PlannedAction(
                     action_name="identify_string_resolver",
-                    confidence=0.75,
-                    reason="Array/char-code string obfuscation detected.",
-                    priority=11.0,
+                    confidence=0.86 if (js_string_array_hint or js_hard_enabled) else 0.75,
+                    reason=(
+                        "JavaScript hard mode: string-array resolver helpers detected."
+                        if js_hard_enabled and js_string_array_hint
+                        else "JavaScript string-array obfuscation pattern detected."
+                        if js_string_array_hint
+                        else "Array/char-code string obfuscation detected."
+                    ),
+                    priority=8.9 if (js_hard_enabled and js_string_array_hint) else 9.6 if js_string_array_hint else 10.9,
                 ))
+        if (
+            "decode_js_encoder" in self._available_actions
+            and (
+                js_encoder_hint
+                or bool(
+                    {
+                        "jsfuck_encoding",
+                        "jjencode_encoding",
+                        "aaencode_encoding",
+                        "javascript_runtime_encoder",
+                    }.intersection(techniques)
+                )
+            )
+            and _not_tried("decode_js_encoder")
+        ):
+            recommendations.append(PlannedAction(
+                action_name="decode_js_encoder",
+                confidence=0.88,
+                reason="JavaScript runtime encoder pattern detected.",
+                priority=10.6,
+            ))
+        if (
+            "unpack_js_packer" in self._available_actions
+            and ("dean_edwards_packer" in techniques or js_packer_hint)
+            and _not_tried("unpack_js_packer")
+        ):
+            recommendations.append(PlannedAction(
+                action_name="unpack_js_packer",
+                confidence=0.9,
+                reason="Dean Edwards Packer wrapper detected.",
+                priority=10.7,
+            ))
+        if (
+            "deobfuscate_js_bundle" in self._available_actions
+            and (js_bundle_hint or (js_minified_bundle_hint and (js_hard_enabled or iteration >= 2)))
+            and _not_tried("deobfuscate_js_bundle")
+        ):
+            recommendations.append(PlannedAction(
+                action_name="deobfuscate_js_bundle",
+                confidence=0.87 if js_bundle_hint else 0.8,
+                reason=(
+                    "Bundled JavaScript runtime detected; use specialist bundle deobfuscation."
+                    if js_bundle_hint else
+                    "Large minified JavaScript remains after preprocessing; try specialist bundle deobfuscation."
+                ),
+                priority=10.55 if js_bundle_hint else 11.1,
+            ))
 
         if (
             workspace_mode
             and "deobfuscate_workspace_files" in self._available_actions
             and iteration >= 2
-            and not action_queue.success_count("deobfuscate_workspace_files")
         ):
             workspace_context = state.workspace_context if hasattr(state, "workspace_context") else {}
             prioritized_files = workspace_context.get("prioritized_files", [])
             suspicious_files = workspace_context.get("suspicious_files", [])
             entry_points = workspace_context.get("entry_points", [])
-            if prioritized_files or suspicious_files or entry_points:
+            remaining_frontier = workspace_context.get("remaining_frontier_paths", [])
+            workspace_attempts = action_queue.total_attempts("deobfuscate_workspace_files")
+            should_run_workspace_pass = (
+                workspace_attempts == 0
+                or (remaining_frontier and workspace_attempts < 3)
+            )
+            if should_run_workspace_pass and (prioritized_files or suspicious_files or entry_points):
                 recommendations.append(PlannedAction(
                     action_name="deobfuscate_workspace_files",
-                    confidence=0.84,
+                    confidence=0.84 if workspace_attempts == 0 else 0.8,
                     reason=(
                         "Run deterministic per-file deobfuscation against prioritized "
                         "workspace hotspots instead of only whole-bundle passes."
+                        if workspace_attempts == 0 else
+                        "Continue workspace hotspot expansion against remaining high-priority files."
                     ),
-                    priority=12.2,
+                    priority=12.2 if workspace_attempts == 0 else 13.1 + workspace_attempts,
+                ))
+
+        if (
+            "preprocess_source" in self._available_actions
+            and not workspace_mode
+            and action_queue.success_count("preprocess_source") < 2
+        ):
+            from app.services.transforms.source_preprocessor import source_needs_preprocessing
+
+            if source_needs_preprocessing(code, language):
+                recommendations.append(PlannedAction(
+                    action_name="preprocess_source",
+                    confidence=0.87 if js_hard_enabled else 0.83,
+                    reason=(
+                        "JavaScript hard mode: minified or parser-hostile code still needs layout recovery."
+                        if js_hard_enabled else
+                        "Parser-hostile anomalies or minified code detected in the current working sample."
+                    ),
+                    priority=11.8 if js_hard_enabled else 12.4,
                 ))
 
         # ── Phase 3: Simplification ──────────────────────────────────
@@ -2461,6 +3127,20 @@ class Planner:
                     reason="Dynamic execution patterns detected.",
                     priority=14.0,
                 ))
+            elif (
+                literal_eval_hint
+                and action_queue.success_count("detect_eval_exec_reflection") == 1
+                and not action_queue.is_capped("detect_eval_exec_reflection")
+            ):
+                recommendations.append(PlannedAction(
+                    action_name="detect_eval_exec_reflection",
+                    confidence=0.78,
+                    reason=(
+                        "Re-run dynamic execution analysis now that the eval "
+                        "payload is a literal string."
+                    ),
+                    priority=4.8,
+                ))
 
         # Control flow unflattening — if CFF detected.
         if ("unflatten_control_flow" in self._available_actions
@@ -2476,27 +3156,48 @@ class Planner:
             if _cff_hint:
                 recommendations.append(PlannedAction(
                     action_name="unflatten_control_flow",
-                    confidence=0.70,
-                    reason="Control flow flattening detected.",
-                    priority=14.5,
+                    confidence=0.78 if js_hard_enabled else 0.70,
+                    reason=(
+                        "JavaScript hard mode: switch-dispatch control flow flattening detected."
+                        if js_hard_enabled else
+                        "Control flow flattening detected."
+                    ),
+                    priority=13.6 if js_hard_enabled else 14.5,
                 ))
 
+        early_deterministic_progress = sum(
+            action_queue.success_count(action)
+            for action in (
+                self._PHASE_DECODE
+                + self._PHASE_SIMPLIFY
+                + ["deobfuscate_workspace_files", "preprocess_source"]
+            )
+        )
+
         # ── Phase 4: Final passes ────────────────────────────────────
-        if iteration >= 3:
+        if iteration >= 3 or (
+            js_hard_enabled
+            and iteration >= 2
+            and early_deterministic_progress >= 1
+        ):
             # Deterministic renaming before LLM renaming.
             if ("apply_renames" in self._available_actions
-                    and not action_queue.success_count("apply_renames")):
+                    and _not_tried("apply_renames")):
                 recommendations.append(PlannedAction(
                     action_name="apply_renames",
-                    confidence=0.75,
-                    reason="Apply deterministic variable renaming.",
-                    priority=19.0,
+                    confidence=0.8 if js_hard_enabled else 0.75,
+                    reason=(
+                        "Apply JSNice-style deterministic renaming after structural recovery."
+                        if js_hard_enabled else
+                        "Apply deterministic variable renaming."
+                    ),
+                    priority=18.7 if js_hard_enabled else 19.0,
                 ))
 
             for i, action in enumerate(self._PHASE_FINAL):
                 if action == "apply_renames":
                     continue  # already handled above
-                if not action_queue.success_count(action):
+                if _not_tried(action):
                     recommendations.append(PlannedAction(
                         action_name=action,
                         confidence=0.7 if action != "generate_findings" else 0.95,
@@ -2597,14 +3298,38 @@ class Planner:
         # contains encoding signatures, even if the transform already ran.
         if iteration >= 2:
             _DECODE_RESCAN = {
+                "analyze_dotnet_assembly": r"MZ.{58,400}PE\x00\x00",
                 "decode_base64": r"[A-Za-z0-9+/\-_=]{40,}",
                 "decode_hex": r"(?:\\x[0-9a-f]{2}){4,}",
                 "decode_base32_base85": r"(?:[A-Z2-7]{16,}|<~[!-u]{4,}~>)",
-                "try_xor_recovery": None,  # no quick regex test
+                "try_xor_recovery": (
+                    r"(?s)(?:\^|-bxor\b).{0,160}"
+                    r"(?:\\x[0-9a-f]{2}|\[\s*(?:0x[0-9a-f]{1,2}|\d{1,3})"
+                    r"(?:\s*,\s*(?:0x[0-9a-f]{1,2}|\d{1,3})){3,}\s*\])"
+                ),
+                "decode_js_encoder": (
+                    r"""(?:(?:\[\s*['"]\w+['"]\s*\]\s*){1,4}\[\s*['"]constructor['"]\s*\]\s*\(|\$=~\[\];|\$=\{___:|ﾟДﾟ|ﾟωﾟ)"""
+                ),
+                "unpack_js_packer": (
+                    r"eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[dr]\s*\)"
+                ),
                 "decrypt_crypto": r"(?:AES|RC4|CryptoJS|Cipher|decrypt)",
-                "powershell_decode": r"-(?:EncodedCommand|enc)\s+[A-Za-z0-9+/=]{20,}",
-                "python_decode": r"(?:chr\s*\(\s*\d+\s*\)\s*\+?\s*){3,}",
-                "decode_python_serialization": r"(?:pickle|marshal)\.loads",
+                "powershell_decode": (
+                    r"(?:-(?:EncodedCommand|enc)\s+[A-Za-z0-9+/=]{20,}|"
+                    r"(?:\[System\.Convert\]::|\[Convert\]::|Convert\.)FromBase64String\s*\(|"
+                    r"\[System\.Text\.Encoding\]::(?:Unicode|UTF8)\.GetString\s*\(|"
+                    r"`[A-Za-z]|-(?:replace|creplace)\b)"
+                ),
+                "python_decode": (
+                    r"(?:\bexec\s*\(|\bcompile\s*\(|(?:base64\.)?b64decode\s*\(|"
+                    r"\bzlib\.decompress\s*\(|\bmarshal\.loads\s*\(|\bcodecs\.decode\s*\()"
+                ),
+                "decode_python_serialization": r"(?:pickle|marshal)\.loads|\bzlib\.decompress\s*\(",
+                "identify_string_resolver": (
+                    r"""(?:\b\w+\s*\(\s*['"]0x[0-9a-f]+['"]\s*\)|"""
+                    r"\.push\s*\(\s*\w+\.shift\s*\(|"
+                    r"return\s+\w+\s*\[\s*(?:0x[0-9a-f]+|\d+|\w+)\s*\])"
+                ),
             }
             for action, pattern in _DECODE_RESCAN.items():
                 if action not in self._available_actions:
@@ -2627,53 +3352,308 @@ class Planner:
                     priority=9.0 + prev_successes,  # gradually lower priority
                 ))
 
+        workspace_context = state.workspace_context if hasattr(state, "workspace_context") else {}
+        prioritized_files = workspace_context.get("prioritized_files", [])
+        suspicious_files = workspace_context.get("suspicious_files", [])
+        entry_points = workspace_context.get("entry_points", [])
+        remaining_frontier = workspace_context.get("remaining_frontier_paths", [])
+        indexed_from_archive = bool(workspace_context.get("indexed_from_archive"))
+
+        deterministic_progress = early_deterministic_progress
+        preprocess_successes = action_queue.success_count("preprocess_source")
+        decode_successes = sum(
+            action_queue.success_count(action)
+            for action in self._PHASE_DECODE
+        )
+        targeted_deterministic_pending = any(
+            rec.action_name in (
+                set(self._PHASE_DECODE)
+                | set(self._PHASE_SIMPLIFY)
+                | {"deobfuscate_workspace_files", "preprocess_source"}
+            )
+            for rec in recommendations
+        )
+        recent_failures = sum(
+            1 for record in state.transform_history[-4:]
+            if not record.success
+        )
+        evidence_score = (
+            min(len(techniques), 3)
+            + min(len(state.suspicious_apis), 3)
+            + min(len(state.recovered_literals), 3)
+            + min(len(state.imports), 2)
+            + min(len(state.functions), 2)
+            + min(len(state.strings), 2)
+            + min(len(prioritized_files), 2)
+            + min(len(suspicious_files), 2)
+            + min(len(entry_points), 1)
+            + min(len(remaining_frontier), 2)
+        )
+        hard_js_evidence = (
+            evidence_score
+            + min(int(round(js_hard_score)), 4)
+            + min(len(js_hard_signals), 2)
+        )
+        beautified_minified_js = (
+            self._looks_like_javascript(language, code)
+            and preprocess_successes >= 1
+            and "minified_code_beautification" in techniques
+        )
+        layered_signal_score = sum(
+            1
+            for flag in (
+                len(techniques) >= 2,
+                entropy_profile in ("encrypted", "heavily_obfuscated"),
+                base64_hint,
+                hex_hint,
+                xor_hint,
+                python_serial_hint,
+                js_string_array_hint,
+                js_encoder_hint,
+                js_packer_hint,
+                bool(suspicious_files or prioritized_files),
+            )
+            if flag
+        )
+        llm_stall = state_manager.stall_counter >= 2 or recent_failures >= 2
+
         # ── LLM-powered actions (when provider is available) ─────────
-        has_llm = "llm_deobfuscate" in self._available_actions
+        has_llm = bool(
+            {
+                "llm_deobfuscate",
+                "llm_multilayer_unwrap",
+                "llm_rename",
+                "llm_summarize",
+            }.intersection(self._available_actions)
+        )
         if has_llm:
-            # LLM deep deobfuscation — schedule after initial recon and
-            # deterministic decoding have had a chance to run (iteration >= 2).
-            if iteration >= 2 and not action_queue.success_count("llm_deobfuscate"):
+            llm_deobfuscate_ready = (
+                llm_stall
+                or (
+                    iteration >= 3
+                    and deterministic_progress >= 1
+                    and not targeted_deterministic_pending
+                )
+                or (
+                    iteration >= 4
+                    and evidence_score >= 5
+                )
+                or (
+                    residual_score >= 2.8
+                    and iteration >= 2
+                    and deterministic_progress >= 1
+                )
+                or (
+                    beautified_minified_js
+                    and iteration >= 2
+                    and (
+                        residual_score >= 1.8
+                        or evidence_score >= 4
+                        or recent_failures >= 1
+                    )
+                )
+                or (
+                    js_hard_enabled
+                    and iteration >= 2
+                    and (
+                        deterministic_progress >= 1
+                        or residual_score >= 3.0
+                        or js_hard_score >= 4.0
+                    )
+                    and hard_js_evidence >= 4
+                )
+                or (
+                    workspace_mode
+                    and indexed_from_archive
+                    and iteration >= 3
+                    and (
+                        remaining_frontier
+                        or action_queue.success_count("deobfuscate_workspace_files") >= 1
+                    )
+                    and (
+                        deterministic_progress >= 1
+                        or decode_successes >= 1
+                        or llm_stall
+                    )
+                )
+            )
+            if (
+                "llm_deobfuscate" in self._available_actions
+                and llm_deobfuscate_ready
+                and not action_queue.has_been_tried("llm_deobfuscate")
+            ):
+                llm_reason = "LLM-assisted deep deobfuscation after deterministic passes."
+                if llm_stall:
+                    llm_reason = "LLM-assisted recovery after deterministic passes stalled."
+                elif beautified_minified_js:
+                    llm_reason = (
+                        "AI follow-up after minified JavaScript beautification "
+                        "to recover semantics and naming."
+                    )
+                elif js_hard_enabled:
+                    llm_reason = (
+                        "JavaScript hard mode: escalate AI early for "
+                        + ", ".join(sorted(js_hard_signals)[:3])
+                        + "."
+                    )
+                elif residual_score >= 2.8 and residual_reasons:
+                    llm_reason = (
+                        "LLM-assisted recovery for residual obfuscation markers: "
+                        + ", ".join(residual_reasons[:2])
+                        + "."
+                    )
+                elif workspace_mode:
+                    llm_reason = (
+                        "LLM-assisted workspace deobfuscation across prioritized files."
+                        if not indexed_from_archive else
+                        "LLM-assisted workspace deobfuscation across prioritized files with full-archive hotspot context."
+                    )
                 recommendations.append(PlannedAction(
                     action_name="llm_deobfuscate",
-                    confidence=0.85 if workspace_mode else 0.8,
-                    reason=(
-                        "LLM-assisted bundle-aware deobfuscation across prioritized files."
-                        if workspace_mode else "LLM-assisted deep deobfuscation."
-                    ),
-                    priority=12.6 if workspace_mode else 13.0,
+                    confidence=0.88 if js_hard_enabled else 0.85 if workspace_mode else 0.8,
+                    reason=llm_reason,
+                    priority=12.2 if js_hard_enabled else 12.6 if workspace_mode else 13.0,
                 ))
 
-            # LLM multi-layer unwrapper — if we detected multiple encoding
-            # techniques or deterministic decoders made limited progress.
-            multi_technique = len(techniques) >= 2
-            limited_progress = (
-                iteration >= 3
-                and not action_queue.success_count("llm_multilayer_unwrap")
+            multilayer_ready = (
+                (
+                    layered_signal_score >= 3
+                    and iteration >= 3
+                    and (decode_successes >= 1 or not targeted_deterministic_pending)
+                )
+                or (
+                    llm_stall
+                    and layered_signal_score >= 2
+                )
+                or (
+                    residual_score >= 3.4
+                    and iteration >= 2
+                    and deterministic_progress >= 1
+                )
+                or (
+                    beautified_minified_js
+                    and iteration >= 2
+                    and residual_score >= 2.2
+                )
+                or (
+                    js_hard_enabled
+                    and iteration >= 2
+                    and (
+                        js_hard_score >= 3.4
+                        or len(js_hard_signals) >= 3
+                        or (
+                            "runtime_encoder_chains" in js_hard_signals
+                            and decode_successes >= 1
+                        )
+                        or (
+                            "string_array_wrappers" in js_hard_signals
+                            and residual_score >= 2.6
+                        )
+                    )
+                )
+                or (
+                    workspace_mode
+                    and indexed_from_archive
+                    and iteration >= 3
+                    and (
+                        layered_signal_score >= 2
+                        or remaining_frontier
+                    )
+                    and (
+                        decode_successes >= 1
+                        or action_queue.success_count("deobfuscate_workspace_files") >= 1
+                        or llm_stall
+                    )
+                )
             )
-            if multi_technique or limited_progress:
-                if not action_queue.success_count("llm_multilayer_unwrap"):
-                    recommendations.append(PlannedAction(
-                        action_name="llm_multilayer_unwrap",
-                        confidence=0.8 if workspace_mode else 0.75,
-                        reason=(
-                            "Workspace bundle may hide layered obfuscation across file boundaries."
-                            if workspace_mode else
-                            "Multiple encoding layers detected; LLM multi-layer unwrap."
-                        ),
-                        priority=13.2 if workspace_mode else 13.5,
-                    ))
+            if (
+                "llm_multilayer_unwrap" in self._available_actions
+                and multilayer_ready
+                and not action_queue.has_been_tried("llm_multilayer_unwrap")
+            ):
+                multilayer_reason = (
+                    "Multiple layered signals remain after deterministic decoding."
+                    if not residual_reasons
+                    else "Residual wrappers remain after deterministic decoding: "
+                    + ", ".join(residual_reasons[:2])
+                    + "."
+                )
+                if js_hard_enabled:
+                    multilayer_reason = (
+                        "JavaScript hard mode: layered wrappers remain after deterministic decoding."
+                        if not residual_reasons
+                        else "JavaScript hard mode: residual wrappers remain after deterministic decoding: "
+                        + ", ".join(residual_reasons[:2])
+                        + "."
+                    )
+                if workspace_mode:
+                    multilayer_reason = (
+                        "Workspace bundle may hide layered obfuscation across file boundaries."
+                        if not indexed_from_archive else
+                        "Workspace bundle may hide layered obfuscation across file boundaries; full-archive hotspot context is available."
+                    )
+                recommendations.append(PlannedAction(
+                    action_name="llm_multilayer_unwrap",
+                    confidence=0.84 if js_hard_enabled else 0.8 if workspace_mode else 0.75,
+                    reason=multilayer_reason,
+                    priority=12.8 if js_hard_enabled else 13.2 if workspace_mode else 13.5,
+                ))
 
-            # LLM renaming — schedule after deterministic renaming has run.
-            if iteration >= 4 and not action_queue.success_count("llm_rename"):
+            rename_ready = (
+                (
+                    iteration >= 5
+                    and evidence_score >= 4
+                    and (
+                        action_queue.success_count("apply_renames") >= 1
+                        or action_queue.success_count("llm_deobfuscate") >= 1
+                        or deterministic_progress >= 2
+                    )
+                )
+                or (
+                    js_hard_enabled
+                    and iteration >= 3
+                    and hard_js_evidence >= 4
+                    and (
+                        action_queue.success_count("apply_renames") >= 1
+                        or action_queue.success_count("llm_deobfuscate") >= 1
+                        or deterministic_progress >= 1
+                    )
+                )
+            )
+            if (
+                "llm_rename" in self._available_actions
+                and rename_ready
+                and not action_queue.has_been_tried("llm_rename")
+            ):
                 recommendations.append(PlannedAction(
                     action_name="llm_rename",
-                    confidence=0.7,
-                    reason="LLM-assisted semantic identifier renaming.",
-                    priority=19.5,
+                    confidence=0.78 if js_hard_enabled else 0.7,
+                    reason=(
+                        "LLM-assisted JSNice-style semantic renaming after structural recovery."
+                        if js_hard_enabled else
+                        "LLM-assisted semantic identifier renaming after structural recovery."
+                    ),
+                    priority=19.1 if js_hard_enabled else 19.5,
                 ))
 
-            # LLM summariser — schedule in the final phase alongside findings.
-            if iteration >= 3 and not action_queue.success_count("llm_summarize"):
+            summarizer_ready = (
+                iteration >= 4
+                and evidence_score >= 3
+                and (
+                    action_queue.success_count("extract_iocs") >= 1
+                    or action_queue.success_count("generate_findings") >= 1
+                    or llm_stall
+                    or (
+                        deterministic_progress >= 2
+                        and not targeted_deterministic_pending
+                    )
+                )
+            )
+            if (
+                "llm_summarize" in self._available_actions
+                and summarizer_ready
+                and not action_queue.has_been_tried("llm_summarize")
+            ):
                 recommendations.append(PlannedAction(
                     action_name="llm_summarize",
                     confidence=0.85,
@@ -2756,9 +3736,17 @@ class ActionSelector:
         try:
             from app.services.transforms.llm_base import LLMTransform
 
-            code_excerpt = state_manager.current_code[:2000]
+            code_excerpt = Planner._planner_code_excerpt(
+                state_manager.current_code,
+                max_chars=2200,
+            )
             confidence = state_manager.overall_confidence
             iteration = state_manager.current_iteration
+            state_context = LLMTransform.build_state_context(
+                state_manager.state.model_dump(),
+                code=state_manager.current_code,
+                compact=True,
+            )
 
             history_lines = []
             for record in state_manager.state.transform_history[-8:]:
@@ -2779,6 +3767,7 @@ class ActionSelector:
                 "You are a deobfuscation pipeline controller. Given the current "
                 "state, choose which transform to run next.\n\n"
                 f"Iteration: {iteration}, Overall confidence: {confidence:.2f}\n\n"
+                f"State summary:\n{state_context}\n\n"
                 f"Recent transform history:\n{history_str}\n\n"
                 f"Candidate actions (ranked by heuristic priority):\n{candidate_str}\n\n"
                 f"Code excerpt ({len(state_manager.current_code)} chars total):\n"
@@ -2912,9 +3901,11 @@ class PreflightValidator:
     # Map of actions to the languages they apply to.
     # If an action isn't listed here, it's considered language-agnostic.
     _LANGUAGE_AFFINITY: Dict[str, Set[str]] = {
+        "analyze_dotnet_assembly": {"dotnet"},
         "powershell_decode": {"powershell", "ps1", "ps"},
         "python_decode": {"python", "py"},
-        "identify_string_resolver": {"javascript", "js", "typescript", "ts"},
+        "deobfuscate_js_bundle": {"javascript", "js", "jsx", "typescript", "ts", "tsx"},
+        "identify_string_resolver": {"javascript", "js", "jsx", "typescript", "ts", "tsx"},
     }
 
     # Actions that shouldn't run back-to-back (no point re-running immediately).
@@ -3146,10 +4137,13 @@ class StateReconciler:
         # succeed should NOT count as stalls even if readability doesn't
         # improve — they're peeling layers and the next decode will benefit.
         _DECODE_ACTIONS = {
+            "analyze_dotnet_assembly",
             "decode_base64", "decode_hex", "decode_base32_base85",
             "try_xor_recovery", "decrypt_crypto",
+            "decode_js_encoder", "unpack_js_packer", "deobfuscate_js_bundle",
             "powershell_decode", "python_decode", "decrypt_strings",
-            "normalize_unicode", "llm_multilayer_unwrap",
+            "normalize_unicode", "identify_string_resolver",
+            "llm_multilayer_unwrap",
             "decode_python_serialization",
         }
         if improvement > 0.01:
@@ -3177,7 +4171,7 @@ class StateReconciler:
 
         # Language detection.
         if action_name == "detect_language" and result.success:
-            detected = details.get("detected_language")
+            detected = details.get("detected_language") or details.get("detected")
             if detected:
                 sm.set_language(detected)
 
@@ -3228,6 +4222,23 @@ class StateReconciler:
 
         # Decoded strings (from base64, hex, etc.).
         decoded = details.get("decoded_strings", [])
+        if not decoded:
+            fallback_items = details.get("items", [])
+            if isinstance(fallback_items, list):
+                decoded = []
+                for item in fallback_items:
+                    if not isinstance(item, dict):
+                        continue
+                    if "decoded" in item:
+                        decoded.append({
+                            "encoded": item.get("encoded", item.get("format", "")),
+                            "decoded": item.get("decoded", ""),
+                        })
+                    elif "plaintext" in item:
+                        decoded.append({
+                            "encoded": item.get("method", "decrypted_payload"),
+                            "decoded": item.get("plaintext", ""),
+                        })
         if decoded:
             entries = []
             for d in decoded:
@@ -3269,8 +4280,17 @@ class StateReconciler:
 
         # Suspicious patterns from eval/exec detector.
         patterns = details.get("patterns", {})
-        if patterns:
-            sm.add_suspicious_apis(list(patterns.keys()))
+        if patterns and (
+            action_name == "detect_eval_exec_reflection"
+            or isinstance(patterns, dict)
+        ):
+            if isinstance(patterns, dict):
+                pattern_names = list(patterns.keys())
+            elif isinstance(patterns, list):
+                pattern_names = [str(item)[:160] for item in patterns[:30]]
+            else:
+                pattern_names = [str(patterns)[:160]]
+            sm.add_suspicious_apis(pattern_names)
             if "eval_exec" not in [
                 t.lower() for t in sm.state.detected_techniques
             ]:
@@ -3432,6 +4452,7 @@ def _build_action_space(llm_client: Optional[Any] = None) -> Dict[str, BaseTrans
     # Mapping of action name -> (module_path, class_name).
     _EXTERNAL_MAP: Dict[str, Tuple[str, str]] = {
         "profile_workspace": ("app.services.transforms.workspace_profiler", "WorkspaceProfiler"),
+        "preprocess_source": ("app.services.transforms.source_preprocessor", "SourcePreprocessor"),
         "deobfuscate_workspace_files": (
             "app.services.transforms.workspace_file_deobfuscator",
             "WorkspaceFileDeobfuscator",
@@ -3439,6 +4460,7 @@ def _build_action_space(llm_client: Optional[Any] = None) -> Dict[str, BaseTrans
         "detect_language": ("app.services.transforms.language_detector", "LanguageDetector"),
         "fingerprint_obfuscation": ("app.services.transforms.obfuscation_fingerprinter", "ObfuscationFingerprinter"),
         "extract_strings": ("app.services.transforms.string_extraction", "StringExtractor"),
+        "analyze_dotnet_assembly": ("app.services.transforms.dotnet_assembly_analyzer", "DotNetAssemblyAnalyzer"),
         "decode_base64": ("app.services.transforms.base64_decoder", "Base64Decoder"),
         "decode_hex": ("app.services.transforms.hex_decoder", "HexDecoder"),
         "try_xor_recovery": ("app.services.transforms.xor_recovery", "XorRecovery"),
@@ -3446,6 +4468,9 @@ def _build_action_space(llm_client: Optional[Any] = None) -> Dict[str, BaseTrans
         "recover_literals": ("app.services.transforms.literal_propagator", "LiteralPropagator"),
         "simplify_junk_code": ("app.services.transforms.junk_code", "JunkCodeRemover"),
         "detect_eval_exec_reflection": ("app.services.transforms.eval_detection", "EvalExecDetector"),
+        "decode_js_encoder": ("app.services.transforms.javascript_encoder_decoder", "JavaScriptEncoderDecoder"),
+        "unpack_js_packer": ("app.services.transforms.js_packer_unpacker", "JavaScriptPackerUnpacker"),
+        "deobfuscate_js_bundle": ("app.services.transforms.javascript_bundle_deobfuscator", "JavaScriptBundleDeobfuscator"),
         "identify_string_resolver": ("app.services.transforms.js_resolvers", "JavaScriptArrayResolver"),
         "suggest_renames": ("app.services.transforms.rename_suggester", "RenameSuggester"),
         "extract_iocs": ("app.services.transforms.ioc_extractor", "IOCExtractor"),
@@ -3542,6 +4567,7 @@ class Orchestrator:
         settings: Optional[Any] = None,
         db_session: Optional[Any] = None,
         llm_client: Optional[Any] = None,
+        analysis_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.sample_id = sample_id
         self.original_code = original_code
@@ -3549,6 +4575,7 @@ class Orchestrator:
         self.settings = settings
         self.db_session = db_session
         self.llm_client = llm_client
+        self.analysis_metadata = analysis_metadata or {}
 
         # Sub-components initialised in run().
         self._state_manager: Optional[StateManager] = None
@@ -3611,6 +4638,22 @@ class Orchestrator:
             language=self.language,
             db_session=self.db_session,
         )
+        if self.analysis_metadata:
+            metadata = {
+                str(key): value
+                for key, value in self.analysis_metadata.items()
+                if value not in (None, "", [], {})
+            }
+            if metadata:
+                self._state_manager.state.iteration_state["sample_metadata"] = metadata
+
+        initial_workspace_context = extract_workspace_context(self._state_manager.current_code)
+        if initial_workspace_context:
+            if self.analysis_metadata.get("content_kind") == "archive_bundle":
+                initial_workspace_context["source_mode"] = "archive_bundle"
+                if self.analysis_metadata.get("stored_file_path"):
+                    initial_workspace_context["archive_source_available"] = True
+            self._state_manager.merge_workspace_context(initial_workspace_context)
         self._action_queue = ActionQueue(
             auto_approve_threshold=auto_approve_threshold,
         )
@@ -3635,10 +4678,52 @@ class Orchestrator:
         # Collected IOCs across all iterations.
         all_iocs: List[IOC] = []
 
+        preprocess_transform = self.action_space.get("preprocess_source")
+        if preprocess_transform is not None and self._state_manager is not None and self._action_queue is not None:
+            try:
+                bootstrap_code = self._state_manager.current_code
+                bootstrap_lang = self.language or ""
+                if preprocess_transform.can_apply(bootstrap_code, bootstrap_lang, {}):
+                    bootstrap_result = preprocess_transform.apply(bootstrap_code, bootstrap_lang, {})
+                    if bootstrap_result.success and bootstrap_result.output != bootstrap_code:
+                        readability_before = self._state_manager.readability_history[-1]
+                        self._reconciler._apply_details(
+                            "preprocess_source",
+                            bootstrap_result,
+                            self._state_manager,
+                            all_iocs,
+                        )
+                        self._state_manager.current_code = bootstrap_result.output
+                        readability_after = self._state_manager.update_readability(bootstrap_result.output)
+                        self._state_manager.record_transform(
+                            TransformRecord(
+                                iteration=0,
+                                action="preprocess_source",
+                                reason="Bootstrap preprocessing before iterative analysis.",
+                                inputs={"code_length": len(bootstrap_code)},
+                                outputs={
+                                    "code_length": len(bootstrap_result.output),
+                                    "description": bootstrap_result.description,
+                                },
+                                confidence_before=0.0,
+                                confidence_after=0.0,
+                                readability_before=readability_before,
+                                readability_after=readability_after,
+                                success=True,
+                                retry_revert=False,
+                            ),
+                            new_code=bootstrap_result.output,
+                        )
+                        self._action_queue.mark_succeeded("preprocess_source")
+                    else:
+                        self._action_queue.mark_skipped("preprocess_source")
+            except Exception:
+                logger.exception("Bootstrap preprocessing failed (non-critical)")
+
         logger.info(
             "Starting orchestration for sample %s (%d chars, language=%s)",
             self.sample_id,
-            len(self.original_code),
+            len(self._state_manager.current_code),
             self.language or "auto-detect",
         )
 
@@ -3927,7 +5012,10 @@ class Orchestrator:
 
                 # Update orchestrator-level language if detect succeeded.
                 if action_name == "detect_language" and result.success:
-                    detected = result.details.get("detected_language")
+                    detected = (
+                        result.details.get("detected_language")
+                        or result.details.get("detected")
+                    )
                     if detected:
                         self.language = detected
 
@@ -4021,7 +5109,22 @@ class Orchestrator:
                 # After a successful transform with meaningful
                 # improvement, re-plan to discover newly exposed
                 # patterns without waiting for the next full cycle.
-                if result.success and improvement > 0.05:
+                residual_after = _residual_obfuscation_markers(
+                    self._state_manager.current_code,
+                    self._state_manager.state.language,
+                    self._state_manager.state,
+                )
+                should_feedback_replan = (
+                    result.success
+                    and (
+                        improvement > 0.05
+                        or (
+                            improvement > 0.01
+                            and residual_after["has_residual"]
+                        )
+                    )
+                )
+                if should_feedback_replan:
                     try:
                         logger.info(
                             "Feedback: significant improvement (%.3f), "
@@ -4166,7 +5269,18 @@ class Orchestrator:
 
         # Blend current confidence with the transform's confidence and
         # the improvement score.
-        delta = improvement * 0.3 + result.confidence * 0.1
+        sink_bonus = 0.0
+        identified_sinks = (result.details or {}).get("identified_sinks", [])
+        if isinstance(identified_sinks, list) and identified_sinks:
+            high = sum(
+                1
+                for item in identified_sinks[:12]
+                if isinstance(item, dict)
+                and str(item.get("severity", "")).lower() == "high"
+            )
+            sink_bonus = min(0.08, 0.025 + high * 0.015)
+
+        delta = improvement * 0.3 + result.confidence * 0.1 + sink_bonus
         new = current + delta
         # Clamp to [0, 1].
         return max(0.0, min(1.0, new))

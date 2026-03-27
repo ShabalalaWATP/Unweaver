@@ -11,10 +11,14 @@ import ast
 import json
 import re
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from app.core.config import settings
 from app.services.ingest.workspace_bundle import (
     ParsedWorkspaceFile,
+    load_workspace_archive_from_path,
+    overlay_workspace_files,
     parse_workspace_bundle,
     rebuild_workspace_bundle,
     validate_workspace_bundle_candidate,
@@ -23,7 +27,9 @@ from app.services.transforms.base import BaseTransform, TransformResult
 from app.services.transforms.base64_decoder import Base64Decoder
 from app.services.transforms.constant_folder import ConstantFolder
 from app.services.transforms.hex_decoder import HexDecoder
+from app.services.transforms.javascript_bundle_deobfuscator import JavaScriptBundleDeobfuscator
 from app.services.transforms.js_resolvers import JavaScriptArrayResolver
+from app.services.transforms.js_tooling import validate_javascript_source
 from app.services.transforms.junk_code import JunkCodeRemover
 from app.services.transforms.literal_propagator import (
     LiteralPropagator,
@@ -31,6 +37,7 @@ from app.services.transforms.literal_propagator import (
 )
 from app.services.transforms.powershell_decoder import PowerShellDecoder
 from app.services.transforms.python_decoder import PythonDecoder
+from app.services.transforms.source_preprocessor import normalize_source_anomalies, SourcePreprocessor
 from app.services.transforms.string_decryptor import StringDecryptor
 from app.services.transforms.unicode_normalizer import UnicodeNormalizer
 from app.services.transforms.workspace_profiler import (
@@ -38,7 +45,7 @@ from app.services.transforms.workspace_profiler import (
     _extract_import_metadata,
 )
 
-_SUPPORTED_LANGUAGES = {"javascript", "typescript", "python", "powershell"}
+_SUPPORTED_LANGUAGES = {"javascript", "typescript", "jsx", "tsx", "python", "powershell"}
 _LIST_DETAIL_KEYS = (
     "strings",
     "decoded_strings",
@@ -118,30 +125,40 @@ def _balanced_delimiters(code: str) -> bool:
 
 def _is_syntax_healthy(language: str, code: str) -> bool:
     lang = (language or "").lower()
+    cleaned, _ = normalize_source_anomalies(code)
+    if lang in {"javascript", "js", "jsx", "typescript", "ts", "tsx"}:
+        validation = validate_javascript_source(cleaned, language=lang)
+        if validation.get("ok") is True:
+            return True
+        if validation.get("error") in {"node_unavailable", "worker_missing", "tooling_unavailable"}:
+            return _balanced_delimiters(cleaned)
+        return False
     if lang in {"python", "py"}:
         try:
-            ast.parse(code)
+            ast.parse(cleaned)
             return True
         except SyntaxError:
             return False
     if lang == "json":
         try:
-            json.loads(code)
+            json.loads(cleaned)
             return True
         except (json.JSONDecodeError, TypeError):
             return False
-    return _balanced_delimiters(code)
+    return _balanced_delimiters(cleaned)
 
 
 class WorkspaceFileDeobfuscator(BaseTransform):
     name = "WorkspaceFileDeobfuscator"
     description = "Run deterministic deobfuscation against prioritized workspace files."
 
-    _MAX_TARGET_FILES = 8
-    _MAX_TRANSFORMS_PER_FILE = 8
+    _MAX_TARGET_FILES = getattr(settings, "MAX_WORKSPACE_TARGET_FILES", 28)
+    _MAX_BUNDLE_ADDITIONS = getattr(settings, "MAX_WORKSPACE_BUNDLE_ADDITIONS", 24)
+    _MAX_TRANSFORMS_PER_FILE = 10
 
     def __init__(self) -> None:
         self._common_transforms: Tuple[BaseTransform, ...] = (
+            SourcePreprocessor(),
             UnicodeNormalizer(),
             Base64Decoder(),
             HexDecoder(),
@@ -151,6 +168,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             JunkCodeRemover(),
         )
         self._js_transforms: Tuple[BaseTransform, ...] = (
+            JavaScriptBundleDeobfuscator(),
             JavaScriptArrayResolver(),
         )
         self._python_transforms: Tuple[BaseTransform, ...] = (
@@ -164,9 +182,44 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         files = parse_workspace_bundle(code)
         return any(file.language in _SUPPORTED_LANGUAGES for file in files)
 
+    def _load_archive_files(self, state: dict) -> List[ParsedWorkspaceFile]:
+        iteration_state = state.get("iteration_state", {})
+        if not isinstance(iteration_state, dict):
+            return []
+        sample_metadata = iteration_state.get("sample_metadata", {})
+        if not isinstance(sample_metadata, dict):
+            return []
+        if sample_metadata.get("content_kind") != "archive_bundle":
+            return []
+
+        archive_path = str(sample_metadata.get("stored_file_path", "")).strip()
+        if not archive_path:
+            return []
+
+        try:
+            scan = load_workspace_archive_from_path(
+                archive_path,
+                archive_name=str(sample_metadata.get("filename") or Path(archive_path).name),
+                max_member_bytes=getattr(settings, "MAX_ARCHIVE_MEMBER_SIZE", 2 * 1024 * 1024),
+                max_scan_files=getattr(settings, "MAX_ARCHIVE_SCAN_FILES", 0) or None,
+            )
+        except Exception:
+            return []
+
+        return [
+            ParsedWorkspaceFile(
+                path=item.path,
+                language=item.language,
+                priority=item.priority_tags,
+                size_bytes=item.size_bytes,
+                text=item.text,
+            )
+            for item in scan.files
+        ]
+
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
-        files = parse_workspace_bundle(code)
-        if not files:
+        bundled_files = parse_workspace_bundle(code)
+        if not bundled_files:
             return TransformResult(
                 success=False,
                 output=code,
@@ -175,7 +228,13 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                 details={},
             )
 
-        target_paths = self._select_target_paths(files, state)
+        archive_files = self._load_archive_files(state)
+        source_files = overlay_workspace_files(code, archive_files) if archive_files else bundled_files
+        target_paths = self._select_target_paths(
+            source_files=source_files,
+            bundled_files=bundled_files,
+            state=state,
+        )
         if not target_paths:
             return TransformResult(
                 success=False,
@@ -185,20 +244,22 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                 details={"skipped": True},
             )
 
-        file_lookup = {file.path: file for file in files}
-        path_set = set(file_lookup)
-        python_modules = _build_python_module_index(files)
+        bundled_lookup = {file.path: file for file in bundled_files}
+        source_lookup = {file.path: file for file in source_files}
+        path_set = set(source_lookup)
+        python_modules = _build_python_module_index(source_files)
         symbol_literals = self._build_workspace_literal_index(
-            files=files,
+            files=source_files,
             path_set=path_set,
             python_modules=python_modules,
         )
         rewritten_files: List[ParsedWorkspaceFile] = []
         changed_files: List[str] = []
+        added_files: List[str] = []
         file_transform_summary: List[Dict[str, Any]] = []
         aggregate_details = self._initial_aggregate_details()
 
-        for file in files:
+        for file in bundled_files:
             if file.path not in target_paths:
                 rewritten_files.append(file)
                 continue
@@ -225,7 +286,37 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             if transformed_file.text != file.text:
                 changed_files.append(file.path)
 
-        if not changed_files:
+        for path in target_paths:
+            if path in bundled_lookup:
+                continue
+            file = source_lookup.get(path)
+            if file is None:
+                continue
+
+            imported_literals = self._imported_literals_for_file(
+                file=file,
+                path_set=path_set,
+                python_modules=python_modules,
+                symbol_literals=symbol_literals,
+            )
+            transformed_file, summary, details = self._process_file(
+                file=file,
+                global_state=state,
+                imported_literals=imported_literals,
+            )
+            rewritten_files.append(transformed_file)
+            file_transform_summary.append(summary)
+            self._merge_transform_details(aggregate_details, details, file.path)
+            symbol_literals[file.path] = extract_literal_bindings(
+                transformed_file.text,
+                transformed_file.language,
+                imported_literals=imported_literals,
+            )
+            added_files.append(file.path)
+            if transformed_file.text != file.text:
+                changed_files.append(file.path)
+
+        if not changed_files and not added_files:
             return TransformResult(
                 success=False,
                 output=code,
@@ -239,6 +330,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                         state=state,
                         target_paths=target_paths,
                         changed_files=[],
+                        added_files=[],
                         file_transform_summary=file_transform_summary,
                         symbol_literals=symbol_literals,
                     ),
@@ -246,7 +338,11 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             )
 
         rebuilt = rebuild_workspace_bundle(code, rewritten_files)
-        validation = validate_workspace_bundle_candidate(code, rebuilt)
+        validation = validate_workspace_bundle_candidate(
+            code,
+            rebuilt,
+            allow_added_files=True,
+        )
         if not validation["accepted"]:
             return TransformResult(
                 success=False,
@@ -257,6 +353,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                     "workspace_validation": validation,
                     "targeted_files": target_paths,
                     "deobfuscated_files": changed_files,
+                    "added_files_to_bundle": added_files,
                 },
             )
 
@@ -264,30 +361,48 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             state=state,
             target_paths=target_paths,
             changed_files=changed_files,
+            added_files=added_files,
             file_transform_summary=file_transform_summary,
             symbol_literals=symbol_literals,
         )
         aggregate_details["workspace_validation"] = validation
         aggregate_details["targeted_files"] = target_paths
         aggregate_details["deobfuscated_files"] = changed_files
+        aggregate_details["added_files_to_bundle"] = added_files
         aggregate_details["file_transform_summary"] = file_transform_summary
-        aggregate_details["evidence_references"] = changed_files[:]
+        aggregate_details["evidence_references"] = (changed_files + added_files)[:]
         aggregate_details["detected_techniques"] = list(dict.fromkeys(
             list(aggregate_details.get("detected_techniques", []))
             + [
                 "workspace_targeted_deobfuscation",
                 "per_file_workspace_pipeline",
+                "workspace_bundle_expansion" if added_files else "",
             ]
         ))
+        aggregate_details["detected_techniques"] = [
+            str(item) for item in aggregate_details["detected_techniques"]
+            if str(item).strip()
+        ]
 
         transform_count = sum(
             len(item.get("applied_transforms", []))
             for item in file_transform_summary
         )
-        confidence = min(0.92, 0.72 + len(changed_files) * 0.04 + transform_count * 0.01)
+        confidence = min(
+            0.94,
+            0.72
+            + len(changed_files) * 0.03
+            + len(added_files) * 0.015
+            + transform_count * 0.01,
+        )
         description = (
             f"Targeted {len(target_paths)} workspace file(s); "
-            f"safely rewrote {len(changed_files)} file(s) across {transform_count} deterministic pass(es)."
+            f"safely rewrote {len(changed_files)} file(s)"
+            + (
+                f" and added {len(added_files)} high-priority file(s) to the active bundle"
+                if added_files else ""
+            )
+            + f" across {transform_count} deterministic pass(es)."
         )
         return TransformResult(
             success=True,
@@ -299,11 +414,14 @@ class WorkspaceFileDeobfuscator(BaseTransform):
 
     def _select_target_paths(
         self,
-        files: Sequence[ParsedWorkspaceFile],
+        *,
+        source_files: Sequence[ParsedWorkspaceFile],
+        bundled_files: Sequence[ParsedWorkspaceFile],
         state: dict,
     ) -> List[str]:
         context = state.get("workspace_context", {})
         ranked_paths: List[str] = []
+        bundled_path_set = {file.path for file in bundled_files}
 
         prioritized = context.get("prioritized_files", [])
         for item in prioritized:
@@ -314,7 +432,16 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             if path:
                 ranked_paths.append(path)
 
-        for key in ("suspicious_files", "entry_points", "prioritized_paths"):
+        for key in (
+            "suspicious_files",
+            "entry_points",
+            "prioritized_paths",
+            "analysis_frontier",
+            "remaining_frontier_paths",
+            "bundle_expansion_paths",
+            "llm_focus_paths",
+            "unbundled_hotspots",
+        ):
             for path in context.get(key, []):
                 value = str(path).strip()
                 if value:
@@ -346,20 +473,26 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                     ranked_paths.append(target)
 
         if not ranked_paths:
-            for file in files:
+            for file in source_files:
                 if "suspicious" in file.priority or "entrypoint" in file.priority:
                     ranked_paths.append(file.path)
             if not ranked_paths:
-                ranked_paths.extend(file.path for file in files[: self._MAX_TARGET_FILES])
+                ranked_paths.extend(file.path for file in source_files[: self._MAX_TARGET_FILES])
 
         supported_paths = {
-            file.path for file in files
+            file.path for file in source_files
             if file.language in _SUPPORTED_LANGUAGES
         }
-        selected = []
+        selected: List[str] = []
+        added_paths = 0
         for path in ranked_paths:
-            if path in supported_paths and path not in selected:
-                selected.append(path)
+            if path not in supported_paths or path in selected:
+                continue
+            if path not in bundled_path_set and added_paths >= self._MAX_BUNDLE_ADDITIONS:
+                continue
+            selected.append(path)
+            if path not in bundled_path_set:
+                added_paths += 1
             if len(selected) >= self._MAX_TARGET_FILES:
                 break
         return selected
@@ -506,7 +639,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
 
     def _pipeline_for_language(self, language: str) -> Sequence[BaseTransform]:
         lang = (language or "").lower()
-        if lang in {"javascript", "typescript"}:
+        if lang in {"javascript", "typescript", "jsx", "tsx"}:
             return (
                 self._common_transforms[0],
                 *self._js_transforms,
@@ -592,15 +725,29 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         state: dict,
         target_paths: List[str],
         changed_files: List[str],
+        added_files: List[str],
         file_transform_summary: List[Dict[str, Any]],
         symbol_literals: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
         context = dict(state.get("workspace_context", {}))
         context["targeted_files"] = target_paths
         context["deobfuscated_files"] = changed_files
+        context["added_files_to_bundle"] = added_files
         context["file_transform_summary"] = file_transform_summary[:12]
         context["targeted_file_count"] = len(target_paths)
         context["deobfuscated_file_count"] = len(changed_files)
+        context["bundle_file_count"] = (
+            int(context.get("bundled_file_count") or 0) + len(added_files)
+            if context.get("bundled_file_count") is not None
+            else None
+        )
+        remaining_frontier = [
+            str(path).strip()
+            for path in context.get("analysis_frontier", [])
+            if str(path).strip() and str(path).strip() not in set(target_paths)
+        ]
+        if remaining_frontier:
+            context["remaining_frontier_paths"] = remaining_frontier[:32]
         context["symbol_literal_files"] = [
             {
                 "path": path,

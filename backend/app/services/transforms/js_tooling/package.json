@@ -1,0 +1,9 @@
+{
+  "name": "unweaver-js-tooling",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@babel/parser": "^7.29.2",
+    "webcrack": "^2.15.1"
+  }
+}

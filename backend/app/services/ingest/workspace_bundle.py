@@ -15,8 +15,10 @@ import tarfile
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 WORKSPACE_BUNDLE_HEADER = "UNWEAVER_WORKSPACE_BUNDLE v1"
 
@@ -170,6 +172,16 @@ class WorkspaceBundleResult:
 
 
 @dataclass(frozen=True)
+class WorkspaceArchiveScanResult:
+    """Immutable view of the eligible files extracted from an archive."""
+
+    archive_name: str
+    files: tuple[WorkspaceFile, ...]
+    skipped_files: int
+    total_members: int
+
+
+@dataclass(frozen=True)
 class ParsedWorkspaceFile:
     """A file block parsed back out of a workspace bundle."""
 
@@ -180,33 +192,36 @@ class ParsedWorkspaceFile:
     text: str
 
 
-def is_archive_upload(filename: str, content_bytes: bytes) -> bool:
-    """Return True when the payload looks like a supported archive."""
-    lower = filename.lower()
-    if lower.endswith(_ARCHIVE_EXTENSIONS):
-        return True
-    if zipfile.is_zipfile(io.BytesIO(content_bytes)):
-        return True
-    try:
-        with tarfile.open(fileobj=io.BytesIO(content_bytes), mode="r:*"):
-            return True
-    except tarfile.TarError:
-        return False
+def _workspace_file_rank_key(item: WorkspaceFile) -> Tuple[float, int, str]:
+    return (-item.score, item.size_bytes, item.path)
 
 
-def build_workspace_bundle(
+def _as_parsed_workspace_file(item: WorkspaceFile | ParsedWorkspaceFile) -> ParsedWorkspaceFile:
+    if isinstance(item, ParsedWorkspaceFile):
+        return item
+    return ParsedWorkspaceFile(
+        path=item.path,
+        language=item.language,
+        priority=item.priority_tags,
+        size_bytes=item.size_bytes,
+        text=item.text,
+    )
+
+
+def scan_workspace_archive(
     *,
     filename: str,
     content_bytes: bytes,
-    max_bundle_chars: int,
     max_member_bytes: int,
-    max_files: int,
-) -> WorkspaceBundleResult:
-    """Extract, prioritise, and serialise a codebase archive."""
+    max_scan_files: Optional[int] = None,
+) -> WorkspaceArchiveScanResult:
+    """Extract and score every eligible text file in an archive."""
     candidates: List[WorkspaceFile] = []
     skipped = 0
+    total_members = 0
 
     for raw_path, payload, declared_size in _iter_archive_members(filename, content_bytes):
+        total_members += 1
         normalised = _normalise_member_path(raw_path)
         if not normalised or _should_skip_path(normalised):
             skipped += 1
@@ -223,25 +238,149 @@ def build_workspace_bundle(
             skipped += 1
             continue
         score, tags = _score_file(normalised, text)
-        candidates.append(
-            WorkspaceFile(
-                path=normalised,
-                language=language,
-                text=text,
-                size_bytes=len(payload),
-                score=score,
-                priority_tags=tuple(tags),
-            )
+        candidate = WorkspaceFile(
+            path=normalised,
+            language=language,
+            text=text,
+            size_bytes=len(payload),
+            score=score,
+            priority_tags=tuple(tags),
+        )
+        if max_scan_files is None or max_scan_files <= 0 or len(candidates) < max_scan_files:
+            candidates.append(candidate)
+            continue
+
+        skipped += 1
+        worst_index = max(
+            range(len(candidates)),
+            key=lambda index: _workspace_file_rank_key(candidates[index]),
+        )
+        if _workspace_file_rank_key(candidate) < _workspace_file_rank_key(candidates[worst_index]):
+            candidates[worst_index] = candidate
+
+    candidates.sort(key=_workspace_file_rank_key)
+    return WorkspaceArchiveScanResult(
+        archive_name=filename,
+        files=tuple(candidates),
+        skipped_files=skipped,
+        total_members=total_members,
+    )
+
+
+def load_workspace_archive_from_path(
+    archive_path: str,
+    *,
+    archive_name: Optional[str] = None,
+    max_member_bytes: int,
+    max_scan_files: Optional[int] = None,
+) -> WorkspaceArchiveScanResult:
+    """Load and cache an archive scan from a stored upload path."""
+    path = Path(archive_path)
+    stat = path.stat()
+    return _load_workspace_archive_cached(
+        str(path.resolve()),
+        archive_name or path.name,
+        max_member_bytes,
+        int(max_scan_files or 0),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+    )
+
+
+@lru_cache(maxsize=6)
+def _load_workspace_archive_cached(
+    archive_path: str,
+    archive_name: str,
+    max_member_bytes: int,
+    max_scan_files: int,
+    mtime_ns: int,
+    size_bytes: int,
+) -> WorkspaceArchiveScanResult:
+    del mtime_ns, size_bytes
+    content_bytes = Path(archive_path).read_bytes()
+    return scan_workspace_archive(
+        filename=archive_name,
+        content_bytes=content_bytes,
+        max_member_bytes=max_member_bytes,
+        max_scan_files=max_scan_files or None,
+    )
+
+
+def normalise_workspace_path(path: str) -> Optional[str]:
+    """Return a normalized workspace path when safe to reference."""
+    return _normalise_member_path(path)
+
+
+def overlay_workspace_files(
+    bundle_text: Optional[str],
+    archive_files: Sequence[WorkspaceFile | ParsedWorkspaceFile],
+) -> List[ParsedWorkspaceFile]:
+    """Overlay the current bundle over archive-backed files by path."""
+    merged = parse_workspace_bundle(bundle_text or "")
+    seen_paths = {item.path for item in merged}
+
+    for item in archive_files:
+        parsed = _as_parsed_workspace_file(item)
+        if parsed.path in seen_paths:
+            continue
+        merged.append(parsed)
+        seen_paths.add(parsed.path)
+
+    return merged
+
+
+def load_workspace_archive_file_from_path(
+    archive_path: str,
+    *,
+    member_path: str,
+    archive_name: Optional[str] = None,
+    max_member_bytes: int,
+) -> Optional[ParsedWorkspaceFile]:
+    """Load one eligible text file from a stored archive by exact path."""
+    target_path = normalise_workspace_path(member_path)
+    if not target_path:
+        return None
+
+    path = Path(archive_path)
+    try:
+        content_bytes = path.read_bytes()
+    except OSError:
+        return None
+
+    for raw_path, payload, declared_size in _iter_archive_members(archive_name or path.name, content_bytes):
+        normalised = _normalise_member_path(raw_path)
+        if normalised != target_path or not normalised:
+            continue
+        if _should_skip_path(normalised):
+            return None
+        if declared_size > max_member_bytes or len(payload) > max_member_bytes:
+            return None
+        language = _language_from_path(normalised)
+        if language is None:
+            return None
+        text = _decode_text(payload)
+        if text is None:
+            return None
+        _score, tags = _score_file(normalised, text)
+        return ParsedWorkspaceFile(
+            path=normalised,
+            language=language,
+            priority=tuple(tags),
+            size_bytes=len(payload),
+            text=text,
         )
 
-    if not candidates:
-        raise WorkspaceBundleError(
-            "Archive did not contain any supported text source files after filtering."
-        )
+    return None
 
-    candidates.sort(key=lambda item: (-item.score, item.size_bytes, item.path))
+
+def _select_workspace_bundle_files(
+    candidates: List[WorkspaceFile],
+    *,
+    max_bundle_chars: int,
+    max_files: int,
+) -> Tuple[List[WorkspaceFile], int]:
     selected: List[WorkspaceFile] = []
-    omitted = skipped
+    omitted = 0
     used_chars = 0
 
     for candidate in candidates:
@@ -268,55 +407,233 @@ def build_workspace_bundle(
         selected.append(candidate)
         used_chars += block_len
 
-    if not selected:
-        raise WorkspaceBundleError(
-            "Archive files exceeded the bundle budget before any candidate could be included."
-        )
+    return selected, omitted
 
-    languages = Counter(item.language for item in selected)
-    entry_points = [item.path for item in selected if "entrypoint" in item.priority_tags]
-    suspicious_files = [item.path for item in selected if "suspicious" in item.priority_tags]
-    manifest_files = [item.path for item in selected if "manifest" in item.priority_tags]
-    root_dirs = sorted({item.path.split("/", 1)[0] for item in selected if "/" in item.path})[:8]
+
+def _split_languages(files: List[ParsedWorkspaceFile] | List[WorkspaceFile]) -> Dict[str, int]:
+    return dict(Counter(item.language for item in files))
+
+
+def _detect_package_roots(paths: List[str]) -> List[str]:
+    roots: List[str] = []
+    seen: set[str] = set()
+
+    for path in paths:
+        pure = PurePosixPath(path)
+        parts = pure.parts
+        if pure.name.lower() in _MANIFEST_FILES:
+            candidate = pure.parent.as_posix()
+            candidate = "." if candidate == "." else candidate
+        elif len(parts) >= 2 and parts[0].lower() in {"apps", "packages", "services", "libs", "modules"}:
+            candidate = "/".join(parts[:2])
+        else:
+            continue
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            roots.append(candidate)
+        if len(roots) >= 12:
+            break
+
+    return roots
+
+
+def _build_workspace_metadata(
+    *,
+    archive_name: str,
+    files: List[ParsedWorkspaceFile] | List[WorkspaceFile],
+    omitted_files: int,
+    total_candidate_files: Optional[int] = None,
+    skipped_files: Optional[int] = None,
+    total_members: Optional[int] = None,
+    omitted_preview: Optional[List[str]] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    entry_points = [
+        item.path for item in files
+        if "entrypoint" in (item.priority if isinstance(item, ParsedWorkspaceFile) else item.priority_tags)
+    ]
+    suspicious_files = [
+        item.path for item in files
+        if "suspicious" in (item.priority if isinstance(item, ParsedWorkspaceFile) else item.priority_tags)
+    ]
+    manifest_files = [
+        item.path for item in files
+        if "manifest" in (item.priority if isinstance(item, ParsedWorkspaceFile) else item.priority_tags)
+    ]
+    root_dirs = sorted({item.path.split("/", 1)[0] for item in files if "/" in item.path})[:12]
+    package_roots = _detect_package_roots([item.path for item in files])
+
+    metadata: Dict[str, Any] = {
+        "archive_name": archive_name,
+        "included_files": len(files),
+        "omitted_files": max(0, omitted_files),
+        "languages": _split_languages(files),
+        "entry_points": entry_points[:16],
+        "suspicious_files": suspicious_files[:16],
+        "manifest_files": manifest_files[:16],
+        "root_dirs": root_dirs,
+        "package_roots": package_roots[:12],
+        "selected_paths": [item.path for item in files[:48]],
+    }
+    if total_candidate_files is not None:
+        metadata["total_candidate_files"] = max(int(total_candidate_files), len(files))
+    if skipped_files is not None:
+        metadata["skipped_files"] = max(0, int(skipped_files))
+    if total_members is not None:
+        metadata["total_members"] = max(0, int(total_members))
+    if omitted_preview:
+        metadata["omitted_preview"] = omitted_preview[:12]
+    if extra_metadata:
+        for key, value in extra_metadata.items():
+            if value in (None, "", [], {}):
+                continue
+            metadata[key] = value
+    return metadata
+
+
+def _render_workspace_bundle(
+    *,
+    archive_name: str,
+    files: List[ParsedWorkspaceFile],
+    metadata: Dict[str, Any],
+) -> str:
+    languages = metadata.get("languages", {})
+    entry_points = metadata.get("entry_points", [])
+    suspicious_files = metadata.get("suspicious_files", [])
+    manifest_files = metadata.get("manifest_files", [])
+    root_dirs = metadata.get("root_dirs", [])
+    package_roots = metadata.get("package_roots", [])
+    selected_paths = metadata.get("selected_paths", [])
+    omitted_preview = metadata.get("omitted_preview", [])
+    total_candidate_files = metadata.get("total_candidate_files")
+    skipped_files = metadata.get("skipped_files")
+    total_members = metadata.get("total_members")
+
+    if isinstance(languages, dict):
+        rendered_languages = ", ".join(
+            f"{name}={count}" for name, count in sorted(languages.items(), key=lambda item: (-int(item[1]), str(item[0])))
+        )
+    else:
+        rendered_languages = ", ".join(
+            f"{name}={count}" for name, count in Counter(languages).most_common()
+        )
 
     header_lines = [
         WORKSPACE_BUNDLE_HEADER,
-        f"archive_name: {filename}",
-        f"included_files: {len(selected)}",
-        f"omitted_files: {max(0, omitted)}",
-        "languages: " + ", ".join(
-            f"{name}={count}" for name, count in languages.most_common()
-        ),
+        f"archive_name: {archive_name}",
+        f"included_files: {len(files)}",
+        f"omitted_files: {int(metadata.get('omitted_files', 0) or 0)}",
+        "languages: " + (rendered_languages or "none"),
         "entry_points: " + (" | ".join(entry_points[:8]) if entry_points else "none"),
         "suspicious_files: "
         + (" | ".join(suspicious_files[:8]) if suspicious_files else "none"),
         "manifest_files: "
         + (" | ".join(manifest_files[:6]) if manifest_files else "none"),
-        "root_dirs: " + (" | ".join(root_dirs) if root_dirs else "none"),
+        "root_dirs: " + (" | ".join(root_dirs[:12]) if root_dirs else "none"),
+    ]
+    if package_roots:
+        header_lines.append("package_roots: " + " | ".join(package_roots[:10]))
+    if isinstance(total_candidate_files, int):
+        header_lines.append(f"total_candidate_files: {total_candidate_files}")
+    if isinstance(total_members, int):
+        header_lines.append(f"total_members: {total_members}")
+    if isinstance(skipped_files, int):
+        header_lines.append(f"skipped_files: {skipped_files}")
+    if selected_paths:
+        header_lines.append("selected_preview: " + " | ".join(selected_paths[:10]))
+    if omitted_preview:
+        header_lines.append("omitted_preview: " + " | ".join(omitted_preview[:10]))
+    header_lines.extend([
         "bundle_note: files are ordered by likely execution or obfuscation relevance; "
         "preserve <<<FILE ...>>> markers if rewriting only part of the bundle.",
         "",
-    ]
+    ])
 
-    body = "\n\n".join(_format_file_block(item) for item in selected)
-    bundle_text = "\n".join(header_lines) + body
+    body = "\n\n".join(_format_parsed_file_block(item) for item in files)
+    return "\n".join(header_lines) + body
+
+
+def is_archive_upload(filename: str, content_bytes: bytes) -> bool:
+    """Return True when the payload looks like a supported archive."""
+    lower = filename.lower()
+    if lower.endswith(_ARCHIVE_EXTENSIONS):
+        return True
+    if zipfile.is_zipfile(io.BytesIO(content_bytes)):
+        return True
+    try:
+        with tarfile.open(fileobj=io.BytesIO(content_bytes), mode="r:*"):
+            return True
+    except tarfile.TarError:
+        return False
+
+
+def build_workspace_bundle(
+    *,
+    filename: str,
+    content_bytes: bytes,
+    max_bundle_chars: int,
+    max_member_bytes: int,
+    max_files: int,
+) -> WorkspaceBundleResult:
+    """Extract, prioritise, and serialise a codebase archive."""
+    scan = scan_workspace_archive(
+        filename=filename,
+        content_bytes=content_bytes,
+        max_member_bytes=max_member_bytes,
+    )
+    candidates = list(scan.files)
+
+    if not candidates:
+        raise WorkspaceBundleError(
+            "Archive did not contain any supported text source files after filtering."
+        )
+
+    selected, omitted_candidates = _select_workspace_bundle_files(
+        candidates,
+        max_bundle_chars=max_bundle_chars,
+        max_files=max_files,
+    )
+    omitted = scan.skipped_files + omitted_candidates
+
+    if not selected:
+        raise WorkspaceBundleError(
+            "Archive files exceeded the bundle budget before any candidate could be included."
+        )
+
+    omitted_preview = [
+        item.path
+        for item in candidates
+        if item.path not in {selected_item.path for selected_item in selected}
+    ][:12]
+    metadata = _build_workspace_metadata(
+        archive_name=scan.archive_name,
+        files=selected,
+        omitted_files=max(0, omitted),
+        total_candidate_files=len(candidates),
+        skipped_files=scan.skipped_files,
+        total_members=scan.total_members,
+        omitted_preview=omitted_preview,
+    )
+    bundle_text = _render_workspace_bundle(
+        archive_name=scan.archive_name,
+        files=[
+            ParsedWorkspaceFile(
+                path=item.path,
+                language=item.language,
+                priority=item.priority_tags,
+                size_bytes=item.size_bytes,
+                text=item.text,
+            )
+            for item in selected
+        ],
+        metadata=metadata,
+    )
     summary = (
-        f"Bundled {len(selected)} file(s) from {filename} "
+        f"Bundled {len(selected)} file(s) from {scan.archive_name} "
         f"({max(0, omitted)} omitted after filtering/limits)."
     )
-    metadata: Dict[str, Any] = {
-        "archive_name": filename,
-        "included_files": len(selected),
-        "omitted_files": max(0, omitted),
-        "languages": dict(languages),
-        "entry_points": entry_points[:12],
-        "suspicious_files": suspicious_files[:12],
-        "manifest_files": manifest_files[:12],
-        "root_dirs": root_dirs,
-        "selected_paths": [item.path for item in selected[:32]],
-    }
     return WorkspaceBundleResult(
-        display_name=filename,
+        display_name=scan.archive_name,
         language="workspace",
         bundle_text=bundle_text,
         summary=summary,
@@ -336,16 +653,25 @@ def extract_workspace_context(bundle_text: str, *, max_paths: int = 8) -> Option
     suspicious_files = _split_manifest_value(metadata.get("suspicious_files", ""))
     manifest_files = _split_manifest_value(metadata.get("manifest_files", ""))
     root_dirs = _split_manifest_value(metadata.get("root_dirs", ""))
+    package_roots = _split_manifest_value(metadata.get("package_roots", ""))
+    selected_preview = _split_manifest_value(metadata.get("selected_preview", ""))
+    omitted_preview = _split_manifest_value(metadata.get("omitted_preview", ""))
 
     return {
         "archive_name": metadata.get("archive_name", ""),
         "included_files": _parse_int(metadata.get("included_files")),
         "omitted_files": _parse_int(metadata.get("omitted_files")),
+        "total_candidate_files": _parse_int(metadata.get("total_candidate_files")),
+        "total_members": _parse_int(metadata.get("total_members")),
+        "skipped_files": _parse_int(metadata.get("skipped_files")),
         "languages": metadata.get("languages", ""),
         "entry_points": entry_points,
         "suspicious_files": suspicious_files,
         "manifest_files": manifest_files,
         "root_dirs": root_dirs,
+        "package_roots": package_roots,
+        "selected_preview": selected_preview,
+        "omitted_preview": omitted_preview,
         "prioritized_paths": prioritized_paths,
         "bundle_note": metadata.get("bundle_note", ""),
     }
@@ -364,6 +690,9 @@ def workspace_context_prompt(bundle_text: str) -> Optional[str]:
     omitted = context.get("omitted_files")
     if isinstance(omitted, int):
         parts.append(f"Omitted files: {omitted}")
+    total_candidates = context.get("total_candidate_files")
+    if isinstance(total_candidates, int):
+        parts.append(f"Eligible files indexed: {total_candidates}")
     if context.get("languages"):
         parts.append(f"Languages: {context['languages']}")
     if context.get("entry_points"):
@@ -380,10 +709,20 @@ def workspace_context_prompt(bundle_text: str) -> Optional[str]:
             "Manifest files: "
             + " | ".join(str(item) for item in context["manifest_files"][:4])
         )
+    if context.get("package_roots"):
+        parts.append(
+            "Package roots: "
+            + " | ".join(str(item) for item in context["package_roots"][:6])
+        )
     if context.get("prioritized_paths"):
         parts.append(
             "Bundled order: "
             + " | ".join(str(item) for item in context["prioritized_paths"][:6])
+        )
+    if context.get("omitted_preview"):
+        parts.append(
+            "Deferred files: "
+            + " | ".join(str(item) for item in context["omitted_preview"][:6])
         )
     note = context.get("bundle_note")
     if note:
@@ -460,19 +799,26 @@ def workspace_bundle_signature(bundle_text: str) -> Optional[Dict[str, Any]]:
 
 
 def pick_workspace_bundle_text(*bundle_candidates: Optional[str]) -> Optional[str]:
-    """Return the first structurally valid workspace bundle candidate."""
+    """Return the richest structurally valid workspace bundle candidate."""
+    best_candidate: Optional[str] = None
+    best_file_count = -1
     for candidate in bundle_candidates:
         if not candidate:
             continue
         signature = workspace_bundle_signature(candidate)
         if signature and signature["valid"]:
-            return candidate
-    return None
+            file_count = int(signature.get("file_count") or 0)
+            if file_count > best_file_count:
+                best_candidate = candidate
+                best_file_count = file_count
+    return best_candidate
 
 
 def validate_workspace_bundle_candidate(
     original_bundle: str,
     candidate_bundle: str,
+    *,
+    allow_added_files: bool = True,
 ) -> Dict[str, Any]:
     """Ensure a rewritten workspace bundle preserves structure and file set."""
     original_signature = workspace_bundle_signature(original_bundle)
@@ -514,11 +860,17 @@ def validate_workspace_bundle_candidate(
     missing_paths = [path for path in original_paths if path not in candidate_path_set]
     extra_paths = [path for path in candidate_paths if path not in original_path_set]
 
-    if candidate_signature["file_count"] != original_signature["file_count"]:
+    if (
+        candidate_signature["file_count"] != original_signature["file_count"]
+        and not (
+            allow_added_files
+            and candidate_signature["file_count"] >= original_signature["file_count"]
+        )
+    ):
         issues.append("workspace_file_count_changed")
     if missing_paths:
         issues.append("workspace_file_blocks_missing")
-    if extra_paths:
+    if extra_paths and not allow_added_files:
         issues.append("workspace_file_blocks_added")
 
     original_context = original_signature.get("context") or {}
@@ -546,26 +898,68 @@ def rebuild_workspace_bundle(
     if not bundle_text.startswith(WORKSPACE_BUNDLE_HEADER):
         raise WorkspaceBundleError("Text is not a workspace bundle.")
 
-    first_file_idx = bundle_text.find("<<<FILE ")
-    header = bundle_text[:first_file_idx].rstrip() if first_file_idx != -1 else bundle_text.rstrip()
-    body = "\n\n".join(_format_parsed_file_block(item) for item in files)
-    if not body:
-        return header + "\n"
-    return header + "\n\n" + body
+    original_context = extract_workspace_context(bundle_text) or {}
+    original_included = int(original_context.get("included_files") or 0)
+    original_total = int(
+        original_context.get("total_candidate_files")
+        or (original_included + int(original_context.get("omitted_files") or 0))
+        or len(files)
+    )
+    omitted_files = max(original_total - len(files), 0)
+
+    metadata = _build_workspace_metadata(
+        archive_name=str(original_context.get("archive_name") or "workspace.zip"),
+        files=files,
+        omitted_files=omitted_files,
+        total_candidate_files=original_total,
+        skipped_files=original_context.get("skipped_files"),
+        total_members=original_context.get("total_members"),
+        omitted_preview=list(original_context.get("omitted_preview", [])),
+        extra_metadata={
+            "selected_paths": [item.path for item in files[:48]],
+            "package_roots": list(original_context.get("package_roots", [])),
+        },
+    )
+    return _render_workspace_bundle(
+        archive_name=str(metadata.get("archive_name") or "workspace.zip"),
+        files=files,
+        metadata=metadata,
+    )
 
 
-def build_workspace_archive(bundle_text: str) -> bytes:
+def build_workspace_archive(bundle_text: str, *, base_archive_path: Optional[str] = None) -> bytes:
     """Reconstruct a workspace bundle into a downloadable zip archive."""
     signature = workspace_bundle_signature(bundle_text)
     if not signature or not signature["valid"]:
         raise WorkspaceBundleError("Text is not a valid workspace bundle.")
 
     files = parse_workspace_bundle(bundle_text)
+    bundle_files = {item.path: item.text for item in files}
+    original_members: List[Tuple[str, bytes]] = []
+
+    if base_archive_path:
+        try:
+            payload = Path(base_archive_path).read_bytes()
+            seen_paths: set[str] = set()
+            for raw_path, member_payload, _declared_size in _iter_archive_members(base_archive_path, payload):
+                normalised = _normalise_member_path(raw_path)
+                if not normalised or normalised in seen_paths:
+                    continue
+                original_members.append((normalised, member_payload))
+                seen_paths.add(normalised)
+        except Exception:
+            original_members = []
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for item in files:
-            archive.writestr(item.path, item.text)
+        for normalised, member_payload in original_members:
+            if normalised in bundle_files:
+                archive.writestr(normalised, bundle_files.pop(normalised))
+            else:
+                archive.writestr(normalised, member_payload)
+
+        for path, text in bundle_files.items():
+            archive.writestr(path, text)
     return buffer.getvalue()
 
 
@@ -680,9 +1074,6 @@ def _should_skip_path(path: str) -> bool:
     pure = PurePosixPath(path)
     if any(part in _IGNORED_DIRS for part in pure.parts[:-1]):
         return True
-    basename = pure.name.lower()
-    if basename.endswith(".min.js") or basename.endswith(".bundle.js"):
-        return True
     return False
 
 
@@ -734,6 +1125,12 @@ def _score_file(path: str, text: str) -> Tuple[float, List[str]]:
     if basename in _MANIFEST_FILES:
         score += 3.5
         tags.append("manifest")
+    if basename.endswith(".bundle.js"):
+        score += 2.5
+        tags.append("bundle")
+    elif basename.endswith(".min.js"):
+        score += 2.0
+        tags.append("minified")
     if len(parts) <= 2:
         score += 1.0
     if any(part in {"src", "app", "apps", "bin", "cli", "cmd", "packages", "server"} for part in parts):

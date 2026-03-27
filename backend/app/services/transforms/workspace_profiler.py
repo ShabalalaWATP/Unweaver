@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from app.core.config import settings
 from app.services.ingest.workspace_bundle import (
     ParsedWorkspaceFile,
     extract_workspace_context,
+    load_workspace_archive_from_path,
+    overlay_workspace_files,
     parse_workspace_bundle,
     workspace_files_preview,
 )
@@ -157,6 +160,42 @@ _OBFUSCATION_SIGNAL_PATTERNS: Sequence[Tuple[re.Pattern[str], str]] = (
     (re.compile(r'\bmarshal\.loads\b', re.IGNORECASE), "python_marshal"),
 )
 _JS_TS_EXTENSIONS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+
+
+def _parsed_from_archive_source(state: dict) -> List[ParsedWorkspaceFile]:
+    iteration_state = state.get("iteration_state", {})
+    if not isinstance(iteration_state, dict):
+        return []
+    sample_metadata = iteration_state.get("sample_metadata", {})
+    if not isinstance(sample_metadata, dict):
+        return []
+    if sample_metadata.get("content_kind") != "archive_bundle":
+        return []
+
+    archive_path = str(sample_metadata.get("stored_file_path", "")).strip()
+    if not archive_path:
+        return []
+
+    try:
+            scan = load_workspace_archive_from_path(
+                archive_path,
+                archive_name=str(sample_metadata.get("filename") or Path(archive_path).name),
+                max_member_bytes=getattr(settings, "MAX_ARCHIVE_MEMBER_SIZE", 2 * 1024 * 1024),
+                max_scan_files=getattr(settings, "MAX_ARCHIVE_SCAN_FILES", 0) or None,
+            )
+    except Exception:
+        return []
+
+    return [
+        ParsedWorkspaceFile(
+            path=item.path,
+            language=item.language,
+            priority=item.priority_tags,
+            size_bytes=item.size_bytes,
+            text=item.text,
+        )
+        for item in scan.files
+    ]
 
 
 def _clean_import_target(raw: str) -> str:
@@ -697,8 +736,10 @@ class WorkspaceProfiler(BaseTransform):
 
     def apply(self, code: str, language: str, state: dict) -> TransformResult:
         context = extract_workspace_context(code)
-        files = parse_workspace_bundle(code)
-        if not context or not files:
+        bundled_files = parse_workspace_bundle(code)
+        archive_files = _parsed_from_archive_source(state)
+        files = overlay_workspace_files(code, archive_files) if archive_files else bundled_files
+        if not context or not bundled_files:
             return TransformResult(
                 success=False,
                 output=code,
@@ -708,6 +749,7 @@ class WorkspaceProfiler(BaseTransform):
             )
 
         path_set = {file.path for file in files}
+        bundled_path_set = {file.path for file in bundled_files}
         python_modules = _build_python_module_index(files)
         imports: List[str] = []
         import_edges: List[Dict[str, Any]] = []
@@ -726,7 +768,7 @@ class WorkspaceProfiler(BaseTransform):
         cross_file_call_edges: List[Dict[str, Any]] = []
         counted_local_dependencies: set[Tuple[str, str]] = set()
 
-        for file in files[:48]:
+        for file in files:
             evidence_references.append(file.path)
             file_imports, file_import_edges, binding_map = _extract_import_metadata(
                 file=file,
@@ -799,18 +841,23 @@ class WorkspaceProfiler(BaseTransform):
                 for file in files
             ),
             key=lambda item: (-float(item["score"]), item["path"]),
-        )[:16]
+        )[:32]
 
         dependency_hotspots = [
             item["path"]
-            for item in prioritized_files[:8]
+            for item in prioritized_files[:12]
             if item["inbound_edges"] or item["outbound_edges"] or item["reasons"] != ["bundled_order"]
         ]
         symbol_hotspots = [
             item["path"]
-            for item in prioritized_files[:8]
+            for item in prioritized_files[:12]
             if item["cross_file_call_in"] or item["cross_file_call_out"] or item["exported_symbol_count"]
         ]
+        expansion_candidates = [
+            item["path"]
+            for item in prioritized_files
+            if item["path"] not in bundled_path_set
+        ][:24]
         unique_local_edges: List[Dict[str, Any]] = []
         unique_external_edges: List[Dict[str, Any]] = []
         seen_local_edges: set[Tuple[str, str]] = set()
@@ -857,11 +904,13 @@ class WorkspaceProfiler(BaseTransform):
             detected_techniques.append("workspace_hotspots_ranked")
 
         summary_parts = [
-            f"Workspace bundle with {len(files)} file(s)",
+            f"Workspace codebase with {len(files)} indexed file(s)",
             f"{len(entry_points)} likely entrypoint(s)",
             f"{len(suspicious_files)} suspicious file(s)",
             f"{len(local_edges)} local dependency edge(s)",
         ]
+        if archive_files:
+            summary_parts.append(f"{len(bundled_files)} file(s) currently bundled")
         if cross_file_call_edges:
             summary_parts.append(f"{len(cross_file_call_edges)} cross-file call edge(s)")
         if manifest_files:
@@ -878,12 +927,25 @@ class WorkspaceProfiler(BaseTransform):
         workspace_context = {
             **context,
             "files_preview": workspace_files_preview(code, max_files=16),
+            "indexed_file_count": len(files),
+            "bundled_file_count": len(bundled_files),
+            "indexed_from_archive": bool(archive_files),
             "imports_count": len(imports),
             "functions_count": len(functions),
             "languages_by_file": dict(languages_counter),
             "prioritized_files": prioritized_files,
+            "analysis_frontier": [item["path"] for item in prioritized_files[:32]],
             "dependency_hotspots": dependency_hotspots,
             "symbol_hotspots": symbol_hotspots,
+            "bundle_expansion_paths": expansion_candidates,
+            "remaining_frontier_paths": expansion_candidates[:],
+            "llm_focus_paths": _dedupe_preserve_order(
+                dependency_hotspots[:6]
+                + symbol_hotspots[:6]
+                + expansion_candidates[:6]
+                + entry_points[:4]
+                + suspicious_files[:4]
+            )[:10],
             "local_dependency_edges": local_edges,
             "external_dependency_edges": external_edges,
             "cross_file_call_edges": cross_file_call_edges[:96],
@@ -901,11 +963,16 @@ class WorkspaceProfiler(BaseTransform):
             "local_dependency_count": len(local_edges),
             "external_dependency_count": len(external_edges),
             "cross_file_call_count": len(cross_file_call_edges),
+            "package_roots": context.get("package_roots", []),
+            "unbundled_hotspots": expansion_candidates[:12],
             "graph_summary": {
+                "indexed_files": len(files),
+                "bundled_files": len(bundled_files),
                 "local_edges": len(local_edges),
                 "external_edges": len(external_edges),
                 "cross_file_calls": len(cross_file_call_edges),
                 "execution_paths": len(execution_paths),
+                "bundle_expansion_candidates": len(expansion_candidates),
                 "hotspots": _dedupe_preserve_order(dependency_hotspots + symbol_hotspots)[:8],
             },
         }
@@ -923,7 +990,7 @@ class WorkspaceProfiler(BaseTransform):
                 "functions": functions[:80],
                 "suspicious_apis": sorted(set(suspicious_apis))[:30],
                 "detected_techniques": detected_techniques,
-                "evidence_references": evidence_references[:48],
+                "evidence_references": evidence_references[:96],
                 "summary": summary,
             },
         )

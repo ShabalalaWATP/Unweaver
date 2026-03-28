@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import zipfile
 from unittest.mock import patch
@@ -7,6 +8,25 @@ from unittest.mock import patch
 from app.services.transforms.llm_deobfuscator import LLMDeobfuscator
 from app.services.transforms.llm_multilayer import LLMMultiLayerUnwrapper
 from app.services.transforms.llm_renamer import LLMRenamer
+
+
+class FakeLLMClient:
+    def __init__(self, replies):
+        self._replies = list(replies)
+        self.calls = []
+        self.context_window = 131_072
+
+    async def chat(self, messages, temperature=0.3, max_tokens=None):
+        self.calls.append(
+            {
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        )
+        if not self._replies:
+            raise AssertionError("No fake LLM replies left")
+        return self._replies.pop(0)
 
 
 class TestLLMRenamer:
@@ -149,6 +169,82 @@ class TestLLMRenamer:
 
 
 class TestLLMDeobfuscator:
+    def test_apply_async_reranks_multiple_candidates_with_critic(self):
+        client = FakeLLMClient(
+            [
+                json.dumps(
+                    {
+                        "cleaned_code": (
+                            "def execute_payload():\n"
+                            '    print("hi")\n\n'
+                            "execute_payload()\n"
+                        ),
+                        "confidence": 0.92,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "cleaned_code": (
+                            "# Decoded entrypoint\n\n"
+                            "def runPayload():\n"
+                            '    print("hi")\n\n'
+                            "runPayload()\n"
+                        ),
+                        "confidence": 0.68,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "choice": 2,
+                        "reason": "Candidate 2 keeps the same entrypoint behavior and produces clearer intent.",
+                        "candidate_scores": [
+                            {
+                                "candidate": 1,
+                                "behavior_preservation": 0.8,
+                                "evidence_retention": 0.9,
+                                "readability": 0.45,
+                                "overall": 0.32,
+                            },
+                            {
+                                "candidate": 2,
+                                "behavior_preservation": 0.9,
+                                "evidence_retention": 0.9,
+                                "readability": 0.95,
+                                "overall": 0.95,
+                            },
+                        ],
+                    }
+                ),
+            ]
+        )
+        transform = LLMDeobfuscator(client)
+
+        result = asyncio.run(
+            transform.apply_async(
+                "def _0x1():\n    print('hi')\n\n_0x1()\n",
+                "python",
+                {},
+            )
+        )
+
+        assert result.success is True
+        assert "runPayload" in result.output
+        assert result.details["selection"]["critic_used"] is True
+        assert result.details["selection"]["selected_candidate"] == 2
+        assert len(result.details["candidates"]) == 2
+        assert len(client.calls) == 3
+
+    def test_validate_candidate_code_rejects_semantic_python_regression(self):
+        validation = LLMDeobfuscator.validate_candidate_code(
+            "def run():\n    return 1\n\nif __name__ == '__main__':\n    run()\n",
+            "def run():\n    return 1\n\nif __name__ == '__main__':\n    pass\n",
+            "python",
+        )
+
+        assert validation["accepted"] is False
+        assert "entrypoint_call_surface_removed" in validation["issues"]
+        assert validation["semantic"]["available"] is True
+
     def test_does_not_hard_fail_when_js_tooling_is_unavailable(self):
         with patch(
             "app.services.transforms.llm_base.validate_javascript_source",
@@ -268,7 +364,8 @@ class TestLLMDeobfuscator:
                     "function executePayload() {\n"
                     '  const payloadUrl = "http://evil.test/payload";\n'
                     "  return eval(payloadUrl);\n"
-                    "}"
+                    "}\n\n"
+                    "executePayload();"
                 ),
                 "decoded_artifacts": ["http://evil.test/payload"],
                 "confidence": 0.86,

@@ -11,8 +11,8 @@ import ast
 import json
 import re
 from copy import deepcopy
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from app.core.config import settings
 from app.services.ingest.workspace_bundle import (
@@ -38,15 +38,17 @@ from app.services.transforms.literal_propagator import (
 )
 from app.services.transforms.powershell_decoder import PowerShellDecoder
 from app.services.transforms.python_decoder import PythonDecoder
+from app.services.transforms.semantic_verifier import semantic_validation_summary
 from app.services.transforms.source_preprocessor import normalize_source_anomalies, SourcePreprocessor
 from app.services.transforms.string_decryptor import StringDecryptor
 from app.services.transforms.unicode_normalizer import UnicodeNormalizer
 from app.services.transforms.workspace_profiler import (
+    WORKSPACE_DEOBFUSCATION_LANGUAGES,
     _build_python_module_index,
     _extract_import_metadata,
 )
 
-_SUPPORTED_LANGUAGES = {"javascript", "typescript", "jsx", "tsx", "python", "powershell"}
+_SUPPORTED_LANGUAGES = set(WORKSPACE_DEOBFUSCATION_LANGUAGES)
 _LIST_DETAIL_KEYS = (
     "strings",
     "decoded_strings",
@@ -59,6 +61,60 @@ _LIST_DETAIL_KEYS = (
     "suspicious_apis",
     "evidence_references",
 )
+_PACKAGE_ROOT_SEGMENTS = {"apps", "packages", "services", "libs", "modules"}
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for item in items:
+        value = str(item).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _workspace_package_root_for_path(path: str, package_roots: Sequence[str]) -> str:
+    value = str(path).strip()
+    if not value:
+        return ""
+
+    normalized_roots = sorted(
+        (
+            str(root).strip()
+            for root in package_roots
+            if str(root).strip()
+        ),
+        key=len,
+        reverse=True,
+    )
+    for root in normalized_roots:
+        if value == root or value.startswith(f"{root}/"):
+            return root
+
+    pure = PurePosixPath(value)
+    parts = pure.parts
+    if len(parts) >= 2 and parts[0].lower() in _PACKAGE_ROOT_SEGMENTS:
+        return "/".join(parts[:2])
+    if parts:
+        return parts[0]
+    return value
+
+
+def _supported_workspace_paths(files: Sequence[ParsedWorkspaceFile]) -> List[str]:
+    return [
+        file.path
+        for file in files
+        if file.language in _SUPPORTED_LANGUAGES
+    ]
+
+
+def _safe_ratio(numerator: int, denominator: int) -> Optional[float]:
+    if denominator <= 0:
+        return None
+    return round(float(numerator) / float(denominator), 4)
 
 
 def _balanced_delimiters(code: str) -> bool:
@@ -147,6 +203,47 @@ def _is_syntax_healthy(language: str, code: str) -> bool:
         except (json.JSONDecodeError, TypeError):
             return False
     return _balanced_delimiters(cleaned)
+
+
+def _structural_signature(language: str, code: str) -> Dict[str, int]:
+    lang = (language or "").lower()
+    cleaned, _ = normalize_source_anomalies(code)
+    lines = cleaned.splitlines()
+    metrics = {
+        "lines": len(lines),
+        "imports": 0,
+        "functions": 0,
+        "classes": 0,
+    }
+
+    if lang in {"javascript", "js", "jsx", "typescript", "ts", "tsx"}:
+        metrics["imports"] = len(re.findall(r"\bimport\b|\brequire\s*\(", cleaned))
+        metrics["functions"] = len(re.findall(r"\bfunction\b|=>", cleaned))
+        metrics["classes"] = len(re.findall(r"\bclass\b", cleaned))
+        return metrics
+
+    if lang in {"python", "py"}:
+        metrics["imports"] = len(
+            re.findall(r"^\s*(?:from|import)\s+", cleaned, flags=re.MULTILINE)
+        )
+        metrics["functions"] = len(
+            re.findall(r"^\s*(?:async\s+def|def)\s+[A-Za-z_]\w*\s*\(", cleaned, flags=re.MULTILINE)
+        )
+        metrics["classes"] = len(
+            re.findall(r"^\s*class\s+[A-Za-z_]\w*", cleaned, flags=re.MULTILINE)
+        )
+        return metrics
+
+    if lang == "powershell":
+        metrics["imports"] = len(
+            re.findall(r"\bImport-Module\b|^\s*\.\s+\S+", cleaned, flags=re.IGNORECASE | re.MULTILINE)
+        )
+        metrics["functions"] = len(
+            re.findall(r"\bfunction\s+[A-Za-z_][\w-]*", cleaned, flags=re.IGNORECASE)
+        )
+        return metrics
+
+    return metrics
 
 
 def _coerce_workspace_file_addition(
@@ -248,7 +345,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                 archive_path,
                 archive_name=str(sample_metadata.get("filename") or Path(archive_path).name),
                 max_member_bytes=getattr(settings, "MAX_ARCHIVE_MEMBER_SIZE", 2 * 1024 * 1024),
-                max_scan_files=getattr(settings, "MAX_ARCHIVE_SCAN_FILES", 0) or None,
+                max_scan_files=None,
             )
         except Exception:
             return []
@@ -386,23 +483,28 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             rewritten_files.extend(synthetic_additions.values())
 
         if not changed_files and not added_files:
+            workspace_context = self._updated_workspace_context(
+                state=state,
+                source_files=source_files,
+                target_paths=target_paths,
+                changed_files=[],
+                added_files=[],
+                file_transform_summary=file_transform_summary,
+                symbol_literals=symbol_literals,
+            )
             return TransformResult(
-                success=False,
+                success=True,
                 output=code,
                 confidence=0.0,
-                description="Targeted workspace pass did not produce any safe file-level rewrites.",
+                description=(
+                    f"Processed {len(target_paths)} workspace file(s); "
+                    "no additional safe file-level rewrites were produced in this batch."
+                ),
                 details={
-                    "skipped": True,
+                    "coverage_advanced": bool(target_paths),
                     "targeted_files": target_paths,
                     "file_transform_summary": file_transform_summary,
-                    "workspace_context": self._updated_workspace_context(
-                        state=state,
-                        target_paths=target_paths,
-                        changed_files=[],
-                        added_files=[],
-                        file_transform_summary=file_transform_summary,
-                        symbol_literals=symbol_literals,
-                    ),
+                    "workspace_context": workspace_context,
                 },
             )
 
@@ -428,6 +530,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
 
         aggregate_details["workspace_context"] = self._updated_workspace_context(
             state=state,
+            source_files=source_files,
             target_paths=target_paths,
             changed_files=changed_files,
             added_files=added_files,
@@ -489,8 +592,19 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         state: dict,
     ) -> List[str]:
         context = state.get("workspace_context", {})
-        ranked_paths: List[str] = []
         bundled_path_set = {file.path for file in bundled_files}
+        supported_paths = _supported_workspace_paths(source_files)
+        supported_path_set = set(supported_paths)
+        if not supported_path_set:
+            return []
+
+        processed_paths = {
+            str(path).strip()
+            for path in context.get("processed_supported_files", [])
+            if str(path).strip() in supported_path_set
+        }
+        ranked_paths: List[str] = []
+        priority_rank: Dict[str, int] = {}
 
         prioritized = context.get("prioritized_files", [])
         for item in prioritized:
@@ -499,6 +613,8 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             else:
                 path = str(item).strip()
             if path:
+                if path not in priority_rank:
+                    priority_rank[path] = len(priority_rank)
                 ranked_paths.append(path)
 
         for key in (
@@ -514,18 +630,24 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             for path in context.get(key, []):
                 value = str(path).strip()
                 if value:
+                    if value not in priority_rank:
+                        priority_rank[value] = len(priority_rank)
                     ranked_paths.append(value)
 
         for key in ("dependency_hotspots", "symbol_hotspots"):
             for path in context.get(key, []):
                 value = str(path).strip()
                 if value:
+                    if value not in priority_rank:
+                        priority_rank[value] = len(priority_rank)
                     ranked_paths.append(value)
 
         for execution_path in context.get("execution_paths", []):
             for segment in str(execution_path).split(" -> "):
                 value = segment.split("::", 1)[0].strip()
                 if value:
+                    if value not in priority_rank:
+                        priority_rank[value] = len(priority_rank)
                     ranked_paths.append(value)
 
         graph_edges = context.get("cross_file_call_edges", [])
@@ -537,25 +659,91 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             target = str(edge.get("target", "")).strip()
             if source in current_seeds or target in current_seeds:
                 if source:
+                    if source not in priority_rank:
+                        priority_rank[source] = len(priority_rank)
                     ranked_paths.append(source)
                 if target:
+                    if target not in priority_rank:
+                        priority_rank[target] = len(priority_rank)
                     ranked_paths.append(target)
 
         if not ranked_paths:
             for file in source_files:
                 if "suspicious" in file.priority or "entrypoint" in file.priority:
+                    if file.path not in priority_rank:
+                        priority_rank[file.path] = len(priority_rank)
                     ranked_paths.append(file.path)
             if not ranked_paths:
-                ranked_paths.extend(file.path for file in source_files[: self._MAX_TARGET_FILES])
+                for file in source_files:
+                    if file.path not in priority_rank:
+                        priority_rank[file.path] = len(priority_rank)
+                    ranked_paths.append(file.path)
 
-        supported_paths = {
-            file.path for file in source_files
-            if file.language in _SUPPORTED_LANGUAGES
-        }
+        ranked_paths = _dedupe_preserve_order(ranked_paths)
+        ranked_unprocessed = [
+            path
+            for path in ranked_paths
+            if path in supported_path_set and path not in processed_paths
+        ]
+
+        package_roots = [
+            str(root).strip()
+            for root in (context.get("package_roots", []) or context.get("root_dirs", []))
+            if str(root).strip()
+        ]
+        ordered_package_roots = _dedupe_preserve_order(
+            [
+                _workspace_package_root_for_path(path, package_roots)
+                for path in ranked_unprocessed
+            ]
+            + package_roots
+            + [
+                _workspace_package_root_for_path(path, package_roots)
+                for path in supported_paths
+                if path not in processed_paths
+            ]
+        )
+        remaining_by_package: Dict[str, List[str]] = {}
+        for path in supported_paths:
+            if path in processed_paths:
+                continue
+            package_root = _workspace_package_root_for_path(path, ordered_package_roots or package_roots)
+            remaining_by_package.setdefault(package_root, []).append(path)
+
+        def _path_sort_key(path: str) -> Tuple[int, int, str, str]:
+            package_root = _workspace_package_root_for_path(path, ordered_package_roots or package_roots)
+            return (
+                0 if path in bundled_path_set else 1,
+                priority_rank.get(path, 100_000),
+                package_root,
+                path,
+            )
+
+        package_sweep: List[str] = []
+        for root in ordered_package_roots:
+            bucket = remaining_by_package.pop(root, [])
+            bucket.sort(key=_path_sort_key)
+            package_sweep.extend(bucket)
+        for root in sorted(remaining_by_package):
+            bucket = remaining_by_package[root]
+            bucket.sort(key=_path_sort_key)
+            package_sweep.extend(bucket)
+
+        candidate_paths = _dedupe_preserve_order(
+            ranked_unprocessed
+            + package_sweep
+        )
+        if not candidate_paths and processed_paths:
+            candidate_paths = [
+                path
+                for path in _dedupe_preserve_order(ranked_paths + supported_paths)
+                if path in supported_path_set
+            ]
+
         selected: List[str] = []
         added_paths = 0
-        for path in ranked_paths:
-            if path not in supported_paths or path in selected:
+        for path in candidate_paths:
+            if path not in supported_path_set or path in selected:
                 continue
             if path not in bundled_path_set and added_paths >= self._MAX_BUNDLE_ADDITIONS:
                 continue
@@ -588,6 +776,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             "changed": False,
             "applied_transforms": [],
             "rejected_transforms": [],
+            "rejection_reasons": [],
         }
         if imported_literals:
             summary["imported_literals"] = sorted(imported_literals)[:12]
@@ -601,13 +790,23 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             self._merge_transform_details(details, result.details or {}, file.path)
 
             candidate = result.output if result.success else current
-            if candidate != current and not self._candidate_is_safe(
-                language=file.language,
-                before=current,
-                after=candidate,
-            ):
-                summary["rejected_transforms"].append(transform.name)
-                continue
+            if candidate != current:
+                validation = self._candidate_validation_summary(
+                    language=file.language,
+                    before=current,
+                    after=candidate,
+                )
+                if not validation["safe"]:
+                    summary["rejected_transforms"].append(transform.name)
+                    summary["rejection_reasons"].append(
+                        {
+                            "transform": transform.name,
+                            "reasons": validation["reasons"],
+                            "size_ratio": validation["size_ratio"],
+                            "line_ratio": validation["line_ratio"],
+                        }
+                    )
+                    continue
 
             if result.success and (candidate != current or result.details):
                 summary["applied_transforms"].append(transform.name)
@@ -620,6 +819,11 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                     workspace_additions[addition.path] = addition
 
         summary["changed"] = current != file.text
+        summary["final_verification"] = self._candidate_validation_summary(
+            language=file.language,
+            before=file.text,
+            after=current,
+        )
         if summary["changed"]:
             details["evidence_references"].append(file.path)
 
@@ -792,12 +996,77 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             )
         return self._common_transforms
 
-    def _candidate_is_safe(self, *, language: str, before: str, after: str) -> bool:
+    def _candidate_validation_summary(
+        self,
+        *,
+        language: str,
+        before: str,
+        after: str,
+    ) -> Dict[str, Any]:
         before_ok = _is_syntax_healthy(language, before)
         after_ok = _is_syntax_healthy(language, after)
+        before_signature = _structural_signature(language, before)
+        after_signature = _structural_signature(language, after)
+        size_ratio = _safe_ratio(len(after.strip()), len(before.strip()) or 1)
+        line_ratio = _safe_ratio(after_signature["lines"], before_signature["lines"] or 1)
+        semantic = semantic_validation_summary(
+            language=language,
+            before=before,
+            after=after,
+            size_ratio=size_ratio,
+        )
+
+        reasons: List[str] = []
         if before_ok and not after_ok:
-            return False
-        return True
+            reasons.append("syntax_regression")
+        if (
+            before_signature["imports"] >= 1
+            and after_signature["imports"] == 0
+            and (size_ratio or 0.0) < 0.65
+        ):
+            reasons.append("import_surface_removed")
+        if (
+            before_signature["functions"] >= 2
+            and after_signature["functions"] == 0
+            and (size_ratio or 0.0) < 0.55
+        ):
+            reasons.append("function_surface_removed")
+        if (
+            before_signature["classes"] >= 1
+            and after_signature["classes"] == 0
+            and (size_ratio or 0.0) < 0.7
+        ):
+            reasons.append("class_surface_removed")
+        if (
+            before_signature["lines"] >= 12
+            and after_signature["lines"] <= max(2, int(before_signature["lines"] * 0.2))
+            and (size_ratio or 0.0) < 0.35
+        ):
+            reasons.append("destructive_shrink")
+        for reason in semantic.get("reasons", []):
+            if reason not in reasons:
+                reasons.append(str(reason))
+
+        return {
+            "safe": not reasons,
+            "reasons": reasons,
+            "syntax_before": before_ok,
+            "syntax_after": after_ok,
+            "size_ratio": size_ratio,
+            "line_ratio": line_ratio,
+            "before": before_signature,
+            "after": after_signature,
+            "semantic": semantic,
+        }
+
+    def _candidate_is_safe(self, *, language: str, before: str, after: str) -> bool:
+        return bool(
+            self._candidate_validation_summary(
+                language=language,
+                before=before,
+                after=after,
+            )["safe"]
+        )
 
     def _initial_aggregate_details(self) -> Dict[str, Any]:
         details: Dict[str, Any] = {key: [] for key in _LIST_DETAIL_KEYS}
@@ -857,6 +1126,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         self,
         *,
         state: dict,
+        source_files: Sequence[ParsedWorkspaceFile],
         target_paths: List[str],
         changed_files: List[str],
         added_files: List[str],
@@ -864,26 +1134,190 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         symbol_literals: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
         context = dict(state.get("workspace_context", {}))
-        context["targeted_files"] = target_paths
-        context["deobfuscated_files"] = changed_files
-        context["added_files_to_bundle"] = added_files
+        added_lookup = {
+            str(item.get("path", "")).strip(): str(item.get("language", "")).strip().lower()
+            for item in file_transform_summary
+            if isinstance(item, dict) and str(item.get("path", "")).strip()
+        }
+        supported_paths = _supported_workspace_paths(source_files)
+        supported_path_set = set(supported_paths)
+        supported_file_count = max(
+            int(context.get("supported_file_count") or 0),
+            len(supported_paths),
+        )
+        indexed_file_count = max(
+            int(context.get("indexed_file_count") or 0),
+            len(source_files),
+        )
+        previous_processed = [
+            str(path).strip()
+            for path in context.get("processed_supported_files", [])
+            if str(path).strip() in supported_path_set
+        ]
+        processed_supported = _dedupe_preserve_order(
+            previous_processed
+            + [
+                str(path).strip()
+                for path in target_paths
+                if str(path).strip() in supported_path_set
+            ]
+        )
+        processed_supported_set = set(processed_supported)
+        remaining_supported = [
+            path
+            for path in supported_paths
+            if path not in processed_supported_set
+        ]
+        previous_deobfuscated = [
+            str(path).strip()
+            for path in (
+                context.get("all_deobfuscated_files")
+                or context.get("deobfuscated_files")
+                or []
+            )
+            if str(path).strip()
+        ]
+        all_deobfuscated = _dedupe_preserve_order(previous_deobfuscated + changed_files)
+        previous_added_to_bundle = [
+            str(path).strip()
+            for path in (
+                context.get("all_added_files_to_bundle")
+                or context.get("added_files_to_bundle")
+                or []
+            )
+            if str(path).strip()
+        ]
+        all_added_to_bundle = _dedupe_preserve_order(previous_added_to_bundle + added_files)
+        package_roots = [
+            str(root).strip()
+            for root in (context.get("package_roots", []) or context.get("root_dirs", []))
+            if str(root).strip()
+        ]
+        processed_package_roots = _dedupe_preserve_order(
+            _workspace_package_root_for_path(path, package_roots)
+            for path in processed_supported
+        )
+        remaining_package_roots = _dedupe_preserve_order(
+            _workspace_package_root_for_path(path, package_roots)
+            for path in remaining_supported
+        )
+        context["processed_supported_files"] = processed_supported
+        context["targeted_files"] = processed_supported[:32]
+        context["latest_targeted_files"] = target_paths[:32]
+        context["deobfuscated_files"] = all_deobfuscated[:32]
+        context["all_deobfuscated_files"] = all_deobfuscated
+        context["added_files_to_bundle"] = all_added_to_bundle[:32]
+        context["all_added_files_to_bundle"] = all_added_to_bundle
         if added_files:
             context["bundle_expansion_paths"] = added_files[:32]
         context["file_transform_summary"] = file_transform_summary[:12]
-        context["targeted_file_count"] = len(target_paths)
-        context["deobfuscated_file_count"] = len(changed_files)
+        context["targeted_file_count"] = len(processed_supported)
+        context["latest_targeted_file_count"] = len(target_paths)
+        context["processed_supported_file_count"] = len(processed_supported)
+        context["remaining_supported_file_count"] = len(remaining_supported)
+        context["remaining_supported_paths_preview"] = remaining_supported[:24]
+        context["deobfuscated_file_count"] = len(all_deobfuscated)
+        context["latest_deobfuscated_file_count"] = len(changed_files)
+        current_bundle_file_count = int(
+            context.get("bundle_file_count")
+            or context.get("bundled_file_count")
+            or 0
+        )
         context["bundle_file_count"] = (
-            int(context.get("bundled_file_count") or 0) + len(added_files)
-            if context.get("bundled_file_count") is not None
+            current_bundle_file_count + len(added_files)
+            if context.get("bundle_file_count") is not None
+            or context.get("bundled_file_count") is not None
             else None
         )
+        context["bundled_file_count"] = context["bundle_file_count"]
+        added_supported_count = sum(
+            1
+            for path in added_files
+            if added_lookup.get(path) in _SUPPORTED_LANGUAGES
+        )
+        bundled_supported = int(context.get("bundled_supported_file_count") or 0) + added_supported_count
+        context["bundled_supported_file_count"] = bundled_supported
+        if supported_file_count:
+            context["supported_bundle_coverage_ratio"] = _safe_ratio(
+                bundled_supported,
+                supported_file_count,
+            )
+            context["targeted_supported_ratio"] = _safe_ratio(
+                len(processed_supported),
+                supported_file_count,
+            )
+        else:
+            context["supported_bundle_coverage_ratio"] = None
+            context["targeted_supported_ratio"] = None
+        if indexed_file_count and context.get("bundle_file_count") is not None:
+            context["bundle_coverage_ratio"] = _safe_ratio(
+                int(context["bundle_file_count"] or 0),
+                indexed_file_count,
+            )
+        else:
+            context["bundle_coverage_ratio"] = None
         remaining_frontier = [
             str(path).strip()
             for path in context.get("analysis_frontier", [])
-            if str(path).strip() and str(path).strip() not in set(target_paths)
+            if str(path).strip() and str(path).strip() not in processed_supported_set
         ]
-        if remaining_frontier:
-            context["remaining_frontier_paths"] = remaining_frontier[:32]
+        context["remaining_frontier_paths"] = remaining_frontier[:32]
+        analysis_frontier = [
+            str(path).strip()
+            for path in context.get("analysis_frontier", [])
+            if str(path).strip()
+        ]
+        if analysis_frontier:
+            targeted_frontier = [
+                path for path in analysis_frontier
+                if path in processed_supported_set
+            ]
+            context["analysis_frontier_targeted_count"] = len(targeted_frontier)
+            context["analysis_frontier_completion_ratio"] = _safe_ratio(
+                len(targeted_frontier),
+                len(analysis_frontier),
+            )
+        else:
+            context["analysis_frontier_targeted_count"] = 0
+            context["analysis_frontier_completion_ratio"] = None
+        if processed_supported:
+            context["recovered_target_ratio"] = _safe_ratio(
+                len(all_deobfuscated),
+                len(processed_supported),
+            )
+        else:
+            context["recovered_target_ratio"] = None
+        context["processed_package_roots"] = processed_package_roots[:16]
+        context["processed_package_count"] = len(processed_package_roots)
+        context["remaining_package_roots"] = remaining_package_roots[:16]
+        context["remaining_package_count"] = len(remaining_package_roots)
+        context["workspace_pass_index"] = int(context.get("workspace_pass_index") or 0) + 1
+        if supported_file_count:
+            context["workspace_pass_count_estimate"] = max(
+                int(context.get("workspace_pass_count_estimate") or 0),
+                max(1, (supported_file_count + self._MAX_TARGET_FILES - 1) // self._MAX_TARGET_FILES),
+            )
+        else:
+            context["workspace_pass_count_estimate"] = int(
+                context.get("workspace_pass_count_estimate") or 0
+            )
+        scope_note = str(context.get("coverage_scope_note") or "").strip()
+        progress_note = (
+            f"Processed {len(processed_supported)}/{supported_file_count} supported files "
+            f"across {int(context.get('workspace_pass_index') or 0)} workspace batch(es)."
+            if supported_file_count
+            else ""
+        )
+        if remaining_supported:
+            progress_note = f"{progress_note} {len(remaining_supported)} supported file(s) remain outside the active bundle sweep.".strip()
+        elif progress_note:
+            progress_note = f"{progress_note} Supported workspace coverage is fully swept.".strip()
+        if progress_note:
+            context["coverage_scope_note"] = (
+                f"{scope_note} {progress_note}".strip()
+                if scope_note and progress_note not in scope_note
+                else progress_note
+            )
         context["symbol_literal_files"] = [
             {
                 "path": path,

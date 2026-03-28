@@ -24,6 +24,9 @@ from app.services.ingest.workspace_bundle import (
 )
 from app.services.transforms.base import BaseTransform, TransformResult
 
+WORKSPACE_DEOBFUSCATION_LANGUAGES = frozenset(
+    {"javascript", "typescript", "jsx", "tsx", "python", "powershell"}
+)
 _IMPORT_PATTERNS: Dict[str, Sequence[re.Pattern[str]]] = {
     "javascript": (
         re.compile(r'import\s+.+?\s+from\s+["\']([^"\']+)["\']'),
@@ -160,6 +163,54 @@ _OBFUSCATION_SIGNAL_PATTERNS: Sequence[Tuple[re.Pattern[str], str]] = (
     (re.compile(r'\bmarshal\.loads\b', re.IGNORECASE), "python_marshal"),
 )
 _JS_TS_EXTENSIONS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+
+
+def _safe_ratio(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round(float(numerator) / float(denominator), 4)
+
+
+def _workspace_language_support(
+    *,
+    indexed_languages: Counter,
+    bundled_languages: Counter,
+) -> Dict[str, Any]:
+    supported = {
+        str(language): int(count)
+        for language, count in indexed_languages.items()
+        if str(language) in WORKSPACE_DEOBFUSCATION_LANGUAGES and int(count) > 0
+    }
+    unsupported = {
+        str(language): int(count)
+        for language, count in indexed_languages.items()
+        if str(language) not in WORKSPACE_DEOBFUSCATION_LANGUAGES and int(count) > 0
+    }
+    supported_file_count = sum(supported.values())
+    bundled_supported_file_count = sum(
+        int(count)
+        for language, count in bundled_languages.items()
+        if str(language) in WORKSPACE_DEOBFUSCATION_LANGUAGES and int(count) > 0
+    )
+    indexed_file_count = sum(int(count) for count in indexed_languages.values())
+    bundled_file_count = sum(int(count) for count in bundled_languages.values())
+    return {
+        "supported_languages": sorted(supported),
+        "unsupported_languages": sorted(unsupported),
+        "supported_file_count": supported_file_count,
+        "unsupported_file_count": sum(unsupported.values()),
+        "bundled_supported_file_count": bundled_supported_file_count,
+        "bundle_coverage_ratio": _safe_ratio(bundled_file_count, indexed_file_count),
+        "supported_bundle_coverage_ratio": _safe_ratio(
+            bundled_supported_file_count,
+            supported_file_count,
+        ),
+        "coverage_scope_note": (
+            "Coverage is scoped to supported JS/TS/Python/PowerShell files that were indexed "
+            "and swept for recovery across iterative workspace batches. Unsupported languages "
+            "remain visible in the scan but are excluded from adjusted recovery confidence."
+        ),
+    }
 
 
 def _parsed_from_archive_source(state: dict) -> List[ParsedWorkspaceFile]:
@@ -822,6 +873,11 @@ class WorkspaceProfiler(BaseTransform):
         manifest_files = list(context.get("manifest_files", []))
         suspicious_files = list(context.get("suspicious_files", []))
         languages_counter = Counter(file.language for file in files)
+        bundled_languages_counter = Counter(file.language for file in bundled_files)
+        language_support = _workspace_language_support(
+            indexed_languages=languages_counter,
+            bundled_languages=bundled_languages_counter,
+        )
 
         prioritized_files = sorted(
             (
@@ -924,6 +980,39 @@ class WorkspaceProfiler(BaseTransform):
             )
         summary = ". ".join(summary_parts) + "."
 
+        analysis_frontier = [item["path"] for item in prioritized_files[:32]]
+        supported_frontier_count = sum(
+            1
+            for item in prioritized_files[:32]
+            if str(item.get("language", "")).strip() in WORKSPACE_DEOBFUSCATION_LANGUAGES
+        )
+        supported_paths = [
+            file.path
+            for file in files
+            if file.language in WORKSPACE_DEOBFUSCATION_LANGUAGES
+        ]
+        package_roots = list(context.get("package_roots", []) or context.get("root_dirs", []))
+        remaining_supported_preview = _dedupe_preserve_order(
+            [
+                item["path"]
+                for item in prioritized_files
+                if str(item.get("language", "")).strip() in WORKSPACE_DEOBFUSCATION_LANGUAGES
+            ]
+            + supported_paths
+        )[:24]
+        workspace_pass_count_estimate = (
+            max(
+                1,
+                (
+                    len(supported_paths)
+                    + max(1, int(getattr(settings, "MAX_WORKSPACE_TARGET_FILES", 28)))
+                    - 1
+                )
+                // max(1, int(getattr(settings, "MAX_WORKSPACE_TARGET_FILES", 28))),
+            )
+            if supported_paths else 0
+        )
+
         workspace_context = {
             **context,
             "files_preview": workspace_files_preview(code, max_files=16),
@@ -933,8 +1022,10 @@ class WorkspaceProfiler(BaseTransform):
             "imports_count": len(imports),
             "functions_count": len(functions),
             "languages_by_file": dict(languages_counter),
+            **language_support,
             "prioritized_files": prioritized_files,
-            "analysis_frontier": [item["path"] for item in prioritized_files[:32]],
+            "analysis_frontier": analysis_frontier,
+            "supported_frontier_count": supported_frontier_count,
             "dependency_hotspots": dependency_hotspots,
             "symbol_hotspots": symbol_hotspots,
             "bundle_expansion_paths": expansion_candidates,
@@ -964,6 +1055,13 @@ class WorkspaceProfiler(BaseTransform):
             "external_dependency_count": len(external_edges),
             "cross_file_call_count": len(cross_file_call_edges),
             "package_roots": context.get("package_roots", []),
+            "processed_supported_file_count": 0,
+            "remaining_supported_file_count": len(supported_paths),
+            "remaining_supported_paths_preview": remaining_supported_preview,
+            "processed_package_count": 0,
+            "remaining_package_roots": package_roots[:12],
+            "workspace_pass_index": 0,
+            "workspace_pass_count_estimate": workspace_pass_count_estimate,
             "unbundled_hotspots": expansion_candidates[:12],
             "graph_summary": {
                 "indexed_files": len(files),

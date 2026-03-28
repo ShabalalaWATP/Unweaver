@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
+from app.core.config import settings
 from app.services.transforms.base import TransformResult
 from app.services.transforms.llm_base import LLMTransform
 
@@ -62,6 +63,48 @@ class LLMDeobfuscator(LLMTransform):
 
     def get_temperature(self) -> float:
         return 0.1  # Low creativity for faithful deobfuscation.
+
+    def generation_variants(
+        self,
+        code: str,
+        language: str,
+        state: dict,
+    ) -> List[Dict[str, Any]]:
+        candidate_count = int(getattr(settings, "LLM_DEOBFUSCATE_CANDIDATES", 2) or 2)
+        if not bool(getattr(settings, "LLM_GENERATOR_CRITIC_ENABLED", True)) or candidate_count <= 1:
+            return super().generation_variants(code, language, state)
+
+        variants: List[Dict[str, Any]] = [
+            {
+                "label": "conservative_rewrite",
+                "temperature": 0.05,
+                "guidance": (
+                    "Prefer the most conservative behavior-preserving cleanup. "
+                    "Only inline or remove wrapper logic when the evidence is strong; "
+                    "if uncertain, preserve the original structure and annotate ambiguity."
+                ),
+            },
+            {
+                "label": "semantic_readability",
+                "temperature": 0.18,
+                "guidance": (
+                    "Prefer maximum readability when justified by the code. "
+                    "Inline decode helpers, collapse wrapper scaffolding, and use "
+                    "descriptive names, but do not drop behavior, evidence, or exports."
+                ),
+            },
+        ]
+        return variants[:candidate_count]
+
+    def critic_enabled(self, code: str, language: str, state: dict) -> bool:
+        return bool(getattr(settings, "LLM_GENERATOR_CRITIC_ENABLED", True))
+
+    def critic_priority_instructions(self) -> str:
+        return (
+            "Favor the candidate that preserves payload behavior, exported surface, "
+            "and recovered indicators while still resolving wrapper logic and "
+            "improving names/comments where the evidence is clear."
+        )
 
     def build_messages(
         self, code: str, language: str, state: dict

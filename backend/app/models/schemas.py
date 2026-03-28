@@ -178,6 +178,14 @@ class SavedAnalysisSnapshot(BaseModel):
     string_count: int = 0
     recovered_text_length: int = 0
     confidence_score: Optional[float] = None
+    raw_confidence_score: Optional[float] = None
+    coverage_adjusted_confidence: Optional[float] = None
+    coverage_adjustment_factor: Optional[float] = None
+    confidence_scope_note: Optional[str] = None
+    stop_reason: Optional[str] = None
+    fatal_error: Optional[str] = None
+    result_kind: Optional[str] = None
+    best_effort: bool = False
     analysis_summary: str = ""
     workspace_context: Dict[str, Any] = Field(default_factory=dict)
     ai_summary: Optional[AISummaryReport] = None
@@ -292,6 +300,14 @@ class AnalysisState(BaseModel):
             "stall_counter": 0,
             "last_confidence": 0.0,
             "stopped": False,
+            "stop_reason": "",
+            "fatal_error": None,
+            "result_kind": "in_progress",
+            "best_effort": False,
+            "raw_confidence": 0.0,
+            "coverage_adjusted_confidence": None,
+            "coverage_adjustment_factor": None,
+            "confidence_scope_note": "",
         }
     )
 

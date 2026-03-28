@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
+from app.core.config import settings
 from app.services.transforms.base import TransformResult
 from app.services.transforms.llm_base import LLMTransform
 
@@ -68,6 +69,46 @@ class LLMMultiLayerUnwrapper(LLMTransform):
 
     def get_temperature(self) -> float:
         return 0.1
+
+    def generation_variants(
+        self,
+        code: str,
+        language: str,
+        state: dict,
+    ) -> List[Dict[str, Any]]:
+        candidate_count = int(getattr(settings, "LLM_MULTILAYER_CANDIDATES", 2) or 2)
+        if not bool(getattr(settings, "LLM_GENERATOR_CRITIC_ENABLED", True)) or candidate_count <= 1:
+            return super().generation_variants(code, language, state)
+
+        variants: List[Dict[str, Any]] = [
+            {
+                "label": "outer_layer_first",
+                "temperature": 0.05,
+                "guidance": (
+                    "Prefer a conservative outer-to-inner unwrap. Preserve each observed "
+                    "layer boundary and only claim a full unwrap when the final payload is clear."
+                ),
+            },
+            {
+                "label": "payload_first",
+                "temperature": 0.18,
+                "guidance": (
+                    "Prioritize recovering the deepest payload and hidden artifacts, even if "
+                    "some wrapper layers remain only partially explained. Keep partial results explicit."
+                ),
+            },
+        ]
+        return variants[:candidate_count]
+
+    def critic_enabled(self, code: str, language: str, state: dict) -> bool:
+        return bool(getattr(settings, "LLM_GENERATOR_CRITIC_ENABLED", True))
+
+    def critic_priority_instructions(self) -> str:
+        return (
+            "Favor the candidate that most faithfully identifies the true layer order, "
+            "retains hidden payload indicators, and only claims a full unwrap when the "
+            "result is structurally and semantically credible."
+        )
 
     def build_messages(
         self, code: str, language: str, state: dict

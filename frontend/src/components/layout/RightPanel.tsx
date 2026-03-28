@@ -273,16 +273,29 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
 
   const savedAnalysis = sample.saved_analysis;
   const confidence = analysisState?.confidence ?? null;
-  const overallConfidence = confidence
-    ? Math.round(confidence.overall * 100)
-    : typeof savedAnalysis?.confidence_score === 'number'
-      ? Math.round(savedAnalysis.confidence_score * 100)
-      : null;
+  const displayedConfidenceValue = analysisState?.iteration_state?.coverage_adjusted_confidence
+    ?? savedAnalysis?.coverage_adjusted_confidence
+    ?? confidence?.overall
+    ?? savedAnalysis?.confidence_score
+    ?? null;
+  const rawConfidenceValue = analysisState?.iteration_state?.raw_confidence
+    ?? confidence?.overall
+    ?? savedAnalysis?.raw_confidence_score
+    ?? savedAnalysis?.confidence_score
+    ?? null;
+  const overallConfidence = typeof displayedConfidenceValue === 'number'
+    ? Math.round(displayedConfidenceValue * 100)
+    : null;
   const readability = analysisState?.transform_history?.length
     ? analysisState.transform_history[analysisState.transform_history.length - 1].readability_after
     : 0;
   const techniques = analysisState?.detected_techniques ?? [];
   const suspiciousApis = analysisState?.suspicious_apis ?? [];
+  const resultKind = analysisState?.iteration_state?.result_kind ?? savedAnalysis?.result_kind ?? null;
+  const bestEffort = analysisState?.iteration_state?.best_effort
+    ?? savedAnalysis?.best_effort
+    ?? (resultKind ? resultKind !== 'completed_recovery' : false);
+  const stopReason = analysisState?.iteration_state?.stop_reason ?? savedAnalysis?.stop_reason ?? null;
   const parsedWorkspace = sample.language === 'workspace'
     ? parseWorkspaceBundle(sample.recovered_text ?? '') ?? parseWorkspaceBundle(sample.original_text)
     : null;
@@ -309,6 +322,12 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
     )
     : [];
   const workspaceExecutionPaths = workspaceContext?.execution_paths ?? [];
+  const workspaceFocusPaths = workspaceContext?.llm_focus_paths ?? [];
+  const unsupportedLanguages = workspaceContext?.unsupported_languages ?? [];
+  const confidenceScopeNote = analysisState?.iteration_state?.confidence_scope_note
+    ?? savedAnalysis?.confidence_scope_note
+    ?? workspaceContext?.coverage_scope_note
+    ?? null;
   const indexedFileCount = countOrNull(
     workspaceContext?.indexed_file_count,
     workspaceContext?.included_files,
@@ -324,6 +343,10 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
   const recoveredFileCount = countOrNull(
     workspaceContext?.deobfuscated_file_count,
     workspaceContext?.deobfuscated_files?.length,
+  );
+  const remainingSupportedCount = countOrNull(
+    workspaceContext?.remaining_supported_file_count,
+    undefined,
   );
   const deferredHotspotCount = countOrNull(
     workspaceContext?.remaining_frontier_paths?.length,
@@ -420,6 +443,12 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
             <ConfidenceGauge value={overallConfidence} />
             {confidence && (
               <div style={{ marginTop: '10px' }}>
+                {typeof rawConfidenceValue === 'number' && rawConfidenceValue !== displayedConfidenceValue && (
+                  <div style={s.statRow}>
+                    <span>Raw</span>
+                    <span style={s.statValue}>{Math.round(rawConfidenceValue * 100)}%</span>
+                  </div>
+                )}
                 <div style={s.statRow}>
                   <span>Naming</span>
                   <span style={s.statValue}>{Math.round(confidence.naming * 100)}%</span>
@@ -434,9 +463,15 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
                 </div>
               </div>
             )}
-            {sample.language === 'workspace' && workspaceContext && (
+            {resultKind && (
               <div style={s.helperText}>
-                Confidence reflects the bundled files and targeted hotspots that were analyzed, not every archived file.
+                {bestEffort ? 'Best-effort output.' : 'Completed recovery.'}
+                {stopReason ? ` ${stopReason}` : ''}
+              </div>
+            )}
+            {confidenceScopeNote && (
+              <div style={s.helperText}>
+                {confidenceScopeNote}
               </div>
             )}
           </div>
@@ -502,10 +537,40 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
                 <span style={s.statValue}>{targetedFileCount}</span>
               </div>
             )}
+            {remainingSupportedCount !== null && (
+              <div style={s.statRow}>
+                <span>Remaining supported</span>
+                <span style={s.statValue}>{remainingSupportedCount}</span>
+              </div>
+            )}
+            {typeof workspaceContext.supported_file_count === 'number' && (
+              <div style={s.statRow}>
+                <span>Supported files</span>
+                <span style={s.statValue}>{workspaceContext.supported_file_count}</span>
+              </div>
+            )}
+            {typeof workspaceContext.unsupported_file_count === 'number' && (
+              <div style={s.statRow}>
+                <span>Unsupported files</span>
+                <span style={s.statValue}>{workspaceContext.unsupported_file_count}</span>
+              </div>
+            )}
             {recoveredFileCount !== null && (
               <div style={s.statRow}>
                 <span>Recovered files</span>
                 <span style={s.statValue}>{recoveredFileCount}</span>
+              </div>
+            )}
+            {typeof workspaceContext.workspace_pass_index === 'number' && (
+              <div style={s.statRow}>
+                <span>Workspace batches</span>
+                <span style={s.statValue}>
+                  {workspaceContext.workspace_pass_index}
+                  {typeof workspaceContext.workspace_pass_count_estimate === 'number'
+                    && workspaceContext.workspace_pass_count_estimate > 0
+                    ? `/${workspaceContext.workspace_pass_count_estimate}`
+                    : ''}
+                </span>
               </div>
             )}
             {deferredHotspotCount !== null && (
@@ -538,6 +603,18 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
                 <span style={s.statValue}>{workspaceGraphSummary.execution_paths}</span>
               </div>
             )}
+            {typeof workspaceContext.targeted_supported_ratio === 'number' && (
+              <div style={s.statRow}>
+                <span>Supported coverage</span>
+                <span style={s.statValue}>{Math.round(workspaceContext.targeted_supported_ratio * 100)}%</span>
+              </div>
+            )}
+            {typeof workspaceContext.analysis_frontier_completion_ratio === 'number' && (
+              <div style={s.statRow}>
+                <span>Frontier covered</span>
+                <span style={s.statValue}>{Math.round(workspaceContext.analysis_frontier_completion_ratio * 100)}%</span>
+              </div>
+            )}
             {!!workspaceContext.entry_points?.length && (
               <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--text-secondary)' }}>
                 Entrypoints: {workspaceContext.entry_points.slice(0, 4).join(', ')}
@@ -556,6 +633,26 @@ export default function RightPanel({ sample, analysisState, onRefresh }: RightPa
             {!!workspaceExecutionPaths.length && (
               <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.55' }}>
                 Execution path: {workspaceExecutionPaths[0]}
+              </div>
+            )}
+            {!!workspaceFocusPaths.length && (
+              <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.55' }}>
+                Focus paths: {workspaceFocusPaths.slice(0, 3).join(', ')}
+              </div>
+            )}
+            {!!unsupportedLanguages.length && (
+              <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--warning)', lineHeight: '1.55' }}>
+                Unsupported: {unsupportedLanguages.slice(0, 4).join(', ')}
+              </div>
+            )}
+            {!!workspaceContext.remaining_frontier_paths?.length && (
+              <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--text-muted)', lineHeight: '1.55' }}>
+                Deferred hotspots: {workspaceContext.remaining_frontier_paths.slice(0, 4).join(', ')}
+              </div>
+            )}
+            {!!workspaceContext.remaining_supported_paths_preview?.length && (
+              <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--text-muted)', lineHeight: '1.55' }}>
+                Deferred supported paths: {workspaceContext.remaining_supported_paths_preview.slice(0, 4).join(', ')}
               </div>
             )}
             {!!workspaceContext.files_preview?.length && (

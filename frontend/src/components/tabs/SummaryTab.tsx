@@ -275,14 +275,22 @@ function getStatusBadge(status: string): { color: string; bg: string } {
   }
 }
 
+function formatPercent(value: number | null | undefined): string | null {
+  return typeof value === 'number' ? `${Math.round(value * 100)}%` : null;
+}
+
 function buildWorkspaceCoverage(context: WorkspaceContext | null | undefined) {
   if (!context) return [];
 
   const stats = [
     { label: 'Indexed Files', value: context.indexed_file_count ?? null },
     { label: 'Bundled Files', value: context.bundle_file_count ?? context.bundled_file_count ?? context.included_files ?? null },
+    { label: 'Supported Files', value: context.supported_file_count ?? null },
+    { label: 'Unsupported Files', value: context.unsupported_file_count ?? null },
     { label: 'Targeted Files', value: context.targeted_file_count ?? context.targeted_files?.length ?? null },
+    { label: 'Remaining Supported', value: context.remaining_supported_file_count ?? null },
     { label: 'Recovered Files', value: context.deobfuscated_file_count ?? context.deobfuscated_files?.length ?? null },
+    { label: 'Workspace Batches', value: context.workspace_pass_index ?? null },
     { label: 'Deferred Hotspots', value: context.remaining_frontier_paths?.length ?? null },
     { label: 'Omitted Files', value: context.omitted_files ?? null },
     { label: 'LLM Focus Files', value: context.llm_focus_paths?.length ?? null },
@@ -327,8 +335,18 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
     );
   }
 
+  const displayedOverall = analysisState?.iteration_state?.coverage_adjusted_confidence
+    ?? savedAnalysis?.coverage_adjusted_confidence
+    ?? analysisState?.confidence?.overall
+    ?? savedAnalysis?.confidence_score
+    ?? 0;
+  const rawOverall = analysisState?.iteration_state?.raw_confidence
+    ?? analysisState?.confidence?.overall
+    ?? savedAnalysis?.raw_confidence_score
+    ?? savedAnalysis?.confidence_score
+    ?? 0;
   const confidence = analysisState?.confidence ?? {
-    overall: savedAnalysis?.confidence_score ?? 0,
+    overall: rawOverall,
     naming: 0,
     structure: 0,
     strings: 0,
@@ -340,6 +358,15 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
   const workspaceContext = analysisState?.workspace_context ?? savedAnalysis?.workspace_context ?? null;
   const workspaceCoverage = buildWorkspaceCoverage(workspaceContext);
   const fatalError = typeof iterState?.fatal_error === 'string' ? iterState.fatal_error : null;
+  const stopReason = iterState?.stop_reason ?? savedAnalysis?.stop_reason ?? null;
+  const resultKind = iterState?.result_kind ?? savedAnalysis?.result_kind ?? null;
+  const bestEffort = iterState?.best_effort
+    ?? savedAnalysis?.best_effort
+    ?? (resultKind ? resultKind !== 'completed_recovery' : false);
+  const confidenceScopeNote = iterState?.confidence_scope_note
+    ?? savedAnalysis?.confidence_scope_note
+    ?? workspaceContext?.coverage_scope_note
+    ?? null;
   const statusBadge = getStatusBadge(sample.status);
 
   const successCount = transforms.filter((t) => t.success && !t.retry_revert).length;
@@ -383,6 +410,44 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
         </div>
       )}
 
+      {(resultKind || stopReason || confidenceScopeNote || displayedOverall !== rawOverall) && (
+        <div className="unweaver-card" style={{ ...s.card, borderLeft: '3px solid var(--accent)' }}>
+          <div style={s.cardTitle}>Recovered Output Status</div>
+          <div style={{ fontSize: '15px', fontWeight: 700, color: 'var(--text-primary)', marginBottom: '8px' }}>
+            {resultKind === 'completed_recovery'
+              ? 'Recovered output'
+              : resultKind === 'partial_recovery'
+                ? 'Partial recovery'
+                : resultKind === 'stopped_best_effort'
+                  ? 'Stopped best-effort state'
+                  : resultKind === 'failed_best_effort'
+                    ? 'Failure best-effort state'
+                    : bestEffort
+                      ? 'Best-effort recovered output'
+                      : 'Recovered output'}
+          </div>
+          <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: '1.65' }}>
+            {bestEffort
+              ? 'The recovered file or bundle below is the best final state captured from this run, not a guarantee that every semantic detail was fully reconstructed.'
+              : 'The recovered output below reflects the final deobfuscation result from the completed run.'}
+          </div>
+          <div style={{ ...s.techniqueList, marginTop: '10px' }}>
+            <span style={s.techniqueTag}>Displayed confidence {formatPercent(displayedOverall)}</span>
+            {displayedOverall !== rawOverall && (
+              <span style={{ ...s.techniqueTag, background: 'var(--bg-tertiary)', color: 'var(--text-secondary)', border: '1px solid var(--border)' }}>
+                Raw transform confidence {formatPercent(rawOverall)}
+              </span>
+            )}
+          </div>
+          {stopReason && (
+            <div style={s.savedNote}>Stop reason: {stopReason}</div>
+          )}
+          {confidenceScopeNote && (
+            <div style={s.savedNote}>{confidenceScopeNote}</div>
+          )}
+        </div>
+      )}
+
       {sample.language === 'workspace' && workspaceCoverage.length > 0 && (
         <div className="unweaver-card" style={s.card}>
           <div style={s.cardTitle}>Workspace Coverage</div>
@@ -397,6 +462,49 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
           <div style={s.coverageNote}>
             Confidence reflects the bundled files and targeted hotspots that were actually analyzed. It is not proof that every archived file was fully recovered.
           </div>
+          {typeof workspaceContext?.targeted_supported_ratio === 'number' && (
+            <div style={s.savedNote}>
+              Supported-file targeting: {formatPercent(workspaceContext.targeted_supported_ratio)}.
+              {typeof workspaceContext?.supported_bundle_coverage_ratio === 'number' && (
+                <> Bundled supported coverage: {formatPercent(workspaceContext.supported_bundle_coverage_ratio)}.</>
+              )}
+              {typeof workspaceContext?.analysis_frontier_completion_ratio === 'number' && (
+                <> Ranked frontier covered: {formatPercent(workspaceContext.analysis_frontier_completion_ratio)}.</>
+              )}
+              {typeof workspaceContext?.workspace_pass_index === 'number' && (
+                <>
+                  {' '}Workspace batches: {workspaceContext.workspace_pass_index}
+                  {typeof workspaceContext?.workspace_pass_count_estimate === 'number'
+                    && workspaceContext.workspace_pass_count_estimate > 0
+                    ? `/${workspaceContext.workspace_pass_count_estimate}`
+                    : ''}
+                  .
+                </>
+              )}
+            </div>
+          )}
+          {typeof workspaceContext?.remaining_supported_file_count === 'number' && (
+            <div style={s.savedNote}>
+              Remaining supported files outside the processed sweep: {workspaceContext.remaining_supported_file_count}.
+            </div>
+          )}
+          {!!workspaceContext?.unsupported_languages?.length && (
+            <div style={s.savedNote}>
+              Unsupported languages visible in the scan: {workspaceContext.unsupported_languages.slice(0, 6).join(', ')}
+            </div>
+          )}
+          {!!workspaceContext?.remaining_supported_paths_preview?.length && (
+            <div style={s.savedNote}>
+              Deferred supported paths: {workspaceContext.remaining_supported_paths_preview.slice(0, 4).join(', ')}
+              {workspaceContext.remaining_supported_paths_preview.length > 4 ? ' ...' : ''}
+            </div>
+          )}
+          {!!workspaceContext?.remaining_frontier_paths?.length && (
+            <div style={s.savedNote}>
+              Deferred hotspot paths: {workspaceContext.remaining_frontier_paths.slice(0, 4).join(', ')}
+              {workspaceContext.remaining_frontier_paths.length > 4 ? ' ...' : ''}
+            </div>
+          )}
         </div>
       )}
 
@@ -531,8 +639,8 @@ export default function SummaryTab({ sample, analysisState }: SummaryTabProps) {
           <div style={s.cardTitle}>Metrics</div>
         <div style={s.metricGrid}>
           <div style={s.metric}>
-            <div style={{ ...s.metricValue, color: getConfidenceColor(confidence.overall) }}>
-              {Math.round(confidence.overall * 100)}%
+            <div style={{ ...s.metricValue, color: getConfidenceColor(displayedOverall) }}>
+              {Math.round(displayedOverall * 100)}%
             </div>
             <div style={s.metricLabel}>Overall Confidence</div>
           </div>

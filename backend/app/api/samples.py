@@ -61,7 +61,10 @@ from app.services.transforms.binary_analysis import (
     detect_upload_content_kind,
 )
 from app.services.llm.client import LLMClient, _MAX_TOKENS_MAP
-from app.services.reports.saved_analysis import persist_saved_analysis_snapshot
+from app.services.reports.saved_analysis import (
+    extract_result_metadata_from_state,
+    persist_saved_analysis_snapshot,
+)
 from app.tasks.analysis_task import get_analysis_status
 
 logger = logging.getLogger(__name__)
@@ -712,6 +715,12 @@ def _build_workspace_context_section(latest_workspace_context: Dict[str, Any], o
         hotspots = latest_workspace_context.get("dependency_hotspots", []) or latest_workspace_context.get("symbol_hotspots", [])
         execution_paths = latest_workspace_context.get("execution_paths", [])
         graph_summary = latest_workspace_context.get("graph_summary", {})
+        supported_file_count = latest_workspace_context.get("supported_file_count")
+        targeted_file_count = latest_workspace_context.get("targeted_file_count")
+        targeted_supported_ratio = latest_workspace_context.get("targeted_supported_ratio")
+        supported_bundle_ratio = latest_workspace_context.get("supported_bundle_coverage_ratio")
+        unsupported_languages = latest_workspace_context.get("unsupported_languages", [])
+        coverage_scope_note = latest_workspace_context.get("coverage_scope_note")
         if hotspots:
             workspace_details.append(
                 "Workspace hotspots: " + " | ".join(str(item) for item in hotspots[:6])
@@ -724,6 +733,29 @@ def _build_workspace_context_section(latest_workspace_context: Dict[str, Any], o
             workspace_details.append(
                 f"Cross-file calls: {graph_summary['cross_file_calls']}"
             )
+        if isinstance(supported_file_count, int) and supported_file_count > 0:
+            coverage_parts: List[str] = []
+            if isinstance(targeted_file_count, int):
+                coverage_parts.append(
+                    f"Supported files targeted: {targeted_file_count}/{supported_file_count}"
+                )
+            if isinstance(targeted_supported_ratio, (int, float)):
+                coverage_parts.append(
+                    f"targeted coverage {round(float(targeted_supported_ratio) * 100)}%"
+                )
+            if isinstance(supported_bundle_ratio, (int, float)):
+                coverage_parts.append(
+                    f"bundled coverage {round(float(supported_bundle_ratio) * 100)}%"
+                )
+            if coverage_parts:
+                workspace_details.append("Workspace coverage: " + ", ".join(coverage_parts))
+        if isinstance(unsupported_languages, list) and unsupported_languages:
+            workspace_details.append(
+                "Unsupported languages visible in the scan: "
+                + " | ".join(str(item) for item in unsupported_languages[:6])
+            )
+        if isinstance(coverage_scope_note, str) and coverage_scope_note.strip():
+            workspace_details.append(coverage_scope_note.strip())
     if not workspace_summary and not workspace_details:
         return ""
     return (
@@ -830,6 +862,10 @@ def _build_fallback_ai_summary(
     suspicious_apis: List[str],
     recovered_text: str,
     confidence_score: float | None,
+    stop_reason: str | None = None,
+    best_effort: bool = False,
+    confidence_scope_note: str | None = None,
+    result_kind: str | None = None,
 ) -> AISummaryReport:
     techniques_text = ", ".join(detected_techniques) if detected_techniques else "no explicit technique fingerprint was preserved in state"
     transform_names = ", ".join(t.action for t in success_transforms[:8]) if success_transforms else "no successful transforms were recorded"
@@ -871,6 +907,15 @@ def _build_fallback_ai_summary(
         )
         if reverted_transforms or failed_transforms:
             confidence_assessment += " Reverted or failed transform attempts reduce certainty and suggest manual review is still warranted."
+    if best_effort:
+        kind_label = (result_kind or "partial_recovery").replace("_", " ")
+        confidence_assessment += (
+            f" The current output is a {kind_label} state rather than a guarantee of full semantic recovery."
+        )
+    if stop_reason:
+        confidence_assessment += f" Run stop reason: {stop_reason}."
+    if confidence_scope_note:
+        confidence_assessment += f" {confidence_scope_note}"
 
     sections = AISummarySections(
         deobfuscation_analysis=deobfuscation_analysis,
@@ -1521,6 +1566,7 @@ async def generate_summary(
     suspicious_apis: List[str] = []
     confidence_score: float | None = None
     latest_workspace_context: Dict[str, Any] = {}
+    result_metadata: Dict[str, Any] = {}
     if iter_state_row and iter_state_row.state_json:
         try:
             state_data = iter_state_row.state_json
@@ -1528,7 +1574,8 @@ async def generate_summary(
                 state_data = json.loads(state_data)
             detected_techniques = state_data.get("detected_techniques", [])
             suspicious_apis = state_data.get("suspicious_apis", [])
-            confidence_score = state_data.get("confidence", {}).get("overall")
+            result_metadata = extract_result_metadata_from_state(state_data)
+            confidence_score = result_metadata.get("confidence_score")
             latest_workspace_context = state_data.get("workspace_context", {})
         except Exception:
             pass
@@ -1556,6 +1603,10 @@ async def generate_summary(
         f"Detected obfuscation techniques: {detected_techniques}\n\n"
         f"Suspicious APIs: {suspicious_apis}\n"
         f"Recovered output confidence: {confidence_score}\n\n"
+        f"Recovered output kind: {result_metadata.get('result_kind')}\n"
+        f"Best-effort output: {result_metadata.get('best_effort')}\n"
+        f"Stop reason: {result_metadata.get('stop_reason')}\n"
+        f"Confidence scope note: {result_metadata.get('confidence_scope_note')}\n\n"
         f"Transform results: {len(success_transforms)} successful, "
         f"{len(reverted_transforms)} reverted, {len(failed_transforms)} failed\n"
         f"Successful transforms: {[t.action for t in success_transforms]}\n\n"
@@ -1582,6 +1633,10 @@ async def generate_summary(
             suspicious_apis=suspicious_apis,
             recovered_text=recovered_text,
             confidence_score=confidence_score,
+            stop_reason=result_metadata.get("stop_reason"),
+            best_effort=bool(result_metadata.get("best_effort")),
+            confidence_scope_note=result_metadata.get("confidence_scope_note"),
+            result_kind=result_metadata.get("result_kind"),
         )
         await persist_saved_analysis_snapshot(
             db,
@@ -1603,6 +1658,10 @@ async def generate_summary(
         suspicious_apis=suspicious_apis,
         recovered_text=recovered_text,
         confidence_score=confidence_score,
+        stop_reason=result_metadata.get("stop_reason"),
+        best_effort=bool(result_metadata.get("best_effort")),
+        confidence_scope_note=result_metadata.get("confidence_scope_note"),
+        result_kind=result_metadata.get("result_kind"),
     )
 
     client, _ = _build_llm_client(provider)
@@ -1740,12 +1799,14 @@ async def chat_about_sample(
     suspicious_apis: List[str] = []
     confidence_score: float | None = None
     latest_workspace_context: Dict[str, Any] = {}
+    result_metadata: Dict[str, Any] = {}
     if iter_state_row and iter_state_row.state_json:
         state_data = _parse_iteration_state_json(iter_state_row.state_json)
         if isinstance(state_data, dict):
             detected_techniques = state_data.get("detected_techniques", []) or []
             suspicious_apis = state_data.get("suspicious_apis", []) or []
-            confidence_score = state_data.get("confidence", {}).get("overall")
+            result_metadata = extract_result_metadata_from_state(state_data)
+            confidence_score = result_metadata.get("confidence_score")
             latest_workspace_context = state_data.get("workspace_context", {}) or {}
 
     client, context_window = _build_llm_client(provider)
@@ -1831,6 +1892,10 @@ async def chat_about_sample(
         f"Original length: {len(original_text)} chars\n"
         f"Recovered length: {len(recovered_text)} chars\n"
         f"Recovered confidence: {confidence_score}\n"
+        f"Recovered output kind: {result_metadata.get('result_kind')}\n"
+        f"Best-effort output: {result_metadata.get('best_effort')}\n"
+        f"Stop reason: {result_metadata.get('stop_reason')}\n"
+        f"Confidence scope note: {result_metadata.get('confidence_scope_note')}\n"
         f"Detected techniques: {detected_techniques or ['none recorded']}\n"
         f"Suspicious APIs: {suspicious_apis or ['none recorded']}\n"
         "Source tag guide: [original] = uploaded source, [recovered] = deobfuscated output, "

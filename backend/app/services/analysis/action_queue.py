@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Set
 
+from app.core.config import settings
+
 
 class ActionStatus(str, Enum):
     """Lifecycle of a queued action."""
@@ -92,6 +94,14 @@ class ActionQueue:
         # Hard cap on total enqueues for any single action name.
         self._max_global_attempts: int = 4
 
+    def _global_attempt_cap(self, action_name: str) -> int:
+        if action_name == "deobfuscate_workspace_files":
+            return max(
+                self._max_global_attempts,
+                int(getattr(settings, "MAX_WORKSPACE_ACTION_ATTEMPTS", 0) or 0),
+            )
+        return self._max_global_attempts
+
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
@@ -145,7 +155,7 @@ class ActionQueue:
 
     def is_capped(self, action_name: str) -> bool:
         """Return True if the action has hit its global attempt or failure cap."""
-        if self.total_attempts(action_name) >= self._max_global_attempts:
+        if self.total_attempts(action_name) >= self._global_attempt_cap(action_name):
             return True
         if self.failure_streak(action_name) >= 2:  # default max_attempts
             return True
@@ -172,7 +182,7 @@ class ActionQueue:
         * An identical PENDING entry already exists.
         """
         # Global attempt cap.
-        if self.total_attempts(action_name) >= self._max_global_attempts:
+        if self.total_attempts(action_name) >= self._global_attempt_cap(action_name):
             return False
 
         # Consecutive-failure cap. Historical failures should not permanently

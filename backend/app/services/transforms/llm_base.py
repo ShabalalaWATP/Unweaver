@@ -14,7 +14,7 @@ import logging
 import re
 from abc import abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
 from app.services.ingest.workspace_bundle import (
@@ -29,6 +29,7 @@ from app.services.llm.client import LLMClient
 from app.services.transforms.base import BaseTransform, TransformResult
 from app.services.transforms.js_tooling import validate_javascript_source
 from app.services.transforms.readability_scorer import compute_readability_score
+from app.services.transforms.semantic_verifier import semantic_validation_summary
 from app.services.transforms.source_preprocessor import normalize_source_anomalies
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ _TASK_MULTIPLIERS: Dict[str, float] = {
     "summarize": 0.3,
     "confidence": 0.05,
     "select": 0.05,
+    "critic": 0.12,
 }
 
 
@@ -104,6 +106,32 @@ class LLMTransform(BaseTransform):
     def _task_type(self) -> str:
         """Override to declare the task type for dynamic token budgeting."""
         return "deobfuscate"
+
+    def generation_variants(
+        self,
+        code: str,
+        language: str,
+        state: dict,
+    ) -> List[Dict[str, Any]]:
+        """Return bounded candidate-generation variants for this transform."""
+        return [
+            {
+                "label": "default",
+                "temperature": self.get_temperature(),
+                "guidance": "",
+            }
+        ]
+
+    def critic_enabled(self, code: str, language: str, state: dict) -> bool:
+        """Override to enable critic/rerank for multi-candidate generation."""
+        return False
+
+    def critic_priority_instructions(self) -> str:
+        """Override with transform-specific critic guidance."""
+        return (
+            "Prefer the candidate that best preserves behavior and recovered "
+            "evidence while materially improving readability."
+        )
 
     @staticmethod
     def compute_token_budget(
@@ -172,17 +200,61 @@ class LLMTransform(BaseTransform):
             )
 
         try:
-            messages = self.build_messages(code, language, state)
-            # Use dynamic token budget unless subclass overrides get_max_tokens
-            max_tok = self.get_max_tokens()
-            if max_tok == _MAX_RESPONSE_TOKENS:
-                max_tok = self.compute_token_budget(len(code), self._task_type())
-            reply = await self._client.chat(
-                messages=messages,
-                temperature=self.get_temperature(),
-                max_tokens=max_tok,
+            variants = self.generation_variants(code, language, state)
+            if len(variants) <= 1:
+                reply = await self._run_llm_request(
+                    code,
+                    language,
+                    state,
+                    guidance="",
+                    temperature=self.get_temperature(),
+                )
+                return self.parse_response(reply, code, language, state)
+
+            candidate_records: List[Dict[str, Any]] = []
+            total_variants = len(variants)
+            for index, variant in enumerate(variants, start=1):
+                label = str(variant.get("label") or f"candidate_{index}")
+                guidance = str(variant.get("guidance") or "").strip()
+                temperature = variant.get("temperature", self.get_temperature())
+                try:
+                    reply = await self._run_llm_request(
+                        code,
+                        language,
+                        state,
+                        guidance=guidance,
+                        temperature=float(temperature),
+                        label=label,
+                    )
+                    result = self.parse_response(reply, code, language, state)
+                except Exception as exc:
+                    logger.exception("%s candidate %s failed", self.name, label)
+                    result = TransformResult(
+                        success=False,
+                        output=code,
+                        confidence=0.0,
+                        description=f"{self.name} candidate '{label}' failed: {exc}",
+                        details={"error": str(exc)},
+                    )
+
+                candidate_records.append(
+                    self._build_candidate_record(
+                        index=index,
+                        total=total_variants,
+                        label=label,
+                        guidance=guidance,
+                        temperature=float(temperature),
+                        reply=None,
+                        result=result,
+                    )
+                )
+
+            return await self._select_candidate_result(
+                code,
+                language,
+                state,
+                candidate_records,
             )
-            return self.parse_response(reply, code, language, state)
         except Exception as exc:
             logger.exception("%s LLM call failed", self.name)
             return TransformResult(
@@ -192,6 +264,377 @@ class LLMTransform(BaseTransform):
                 description=f"{self.name} failed: {exc}",
                 details={"error": str(exc)},
             )
+
+    async def _run_llm_request(
+        self,
+        code: str,
+        language: str,
+        state: dict,
+        *,
+        guidance: str,
+        temperature: float,
+        label: str = "",
+    ) -> str:
+        messages = self.build_messages(code, language, state)
+        if guidance:
+            messages = self._augment_messages_with_guidance(
+                messages,
+                guidance=guidance,
+                label=label or "candidate",
+            )
+        max_tok = self.get_max_tokens()
+        if max_tok == _MAX_RESPONSE_TOKENS:
+            max_tok = self.compute_token_budget(len(code), self._task_type())
+        return await self._client.chat(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tok,
+        )
+
+    @staticmethod
+    def _augment_messages_with_guidance(
+        messages: List[Dict[str, str]],
+        *,
+        guidance: str,
+        label: str,
+    ) -> List[Dict[str, str]]:
+        augmented = [dict(message) for message in messages]
+        instruction = (
+            f"\n\nAlternative generation mode ({label}):\n"
+            f"{guidance}\n"
+        )
+        for index in range(len(augmented) - 1, -1, -1):
+            if augmented[index].get("role") == "user":
+                augmented[index]["content"] = str(augmented[index].get("content", "")) + instruction
+                return augmented
+        augmented.append({"role": "user", "content": guidance})
+        return augmented
+
+    def _build_candidate_record(
+        self,
+        *,
+        index: int,
+        total: int,
+        label: str,
+        guidance: str,
+        temperature: float,
+        reply: Optional[str],
+        result: TransformResult,
+    ) -> Dict[str, Any]:
+        score = self._score_candidate_result(result)
+        return {
+            "index": index,
+            "total": total,
+            "label": label,
+            "guidance": guidance,
+            "temperature": temperature,
+            "reply": reply,
+            "result": result,
+            "score": score,
+            "summary": self._summarize_candidate_result(
+                index=index,
+                label=label,
+                temperature=temperature,
+                score=score,
+                result=result,
+            ),
+        }
+
+    def _score_candidate_result(self, result: TransformResult) -> float:
+        score = max(0.0, min(1.0, float(result.confidence or 0.0)))
+        if not result.success:
+            return max(0.0, min(1.0, score * 0.2))
+
+        details = result.details or {}
+        validation = details.get("validation", {})
+        if isinstance(validation, dict):
+            if validation.get("accepted") is True:
+                score += 0.15
+            issues = validation.get("issues", [])
+            if isinstance(issues, list):
+                score -= min(0.24, len(issues) * 0.06)
+            readability_delta = validation.get("readability_delta")
+            if isinstance(readability_delta, (int, float)):
+                score += max(-0.15, min(0.18, float(readability_delta) * 0.015))
+            evidence = validation.get("evidence", {})
+            if isinstance(evidence, dict):
+                retained_count = evidence.get("retained_count")
+                missing_count = evidence.get("missing_count")
+                if isinstance(retained_count, int):
+                    score += min(0.12, retained_count * 0.03)
+                if isinstance(missing_count, int):
+                    score -= min(0.15, missing_count * 0.04)
+            semantic = validation.get("semantic", {})
+            if isinstance(semantic, dict) and semantic.get("available"):
+                reasons = semantic.get("reasons", [])
+                if isinstance(reasons, list) and reasons:
+                    score -= min(0.24, len(reasons) * 0.08)
+                else:
+                    score += 0.04
+            if validation.get("noop") is True:
+                score -= 0.15
+
+        if details.get("fully_unwrapped") is True:
+            score += 0.05
+        elif details.get("fully_unwrapped") is False:
+            score -= 0.02
+
+        uncertainties = details.get("remaining_uncertainties")
+        if isinstance(uncertainties, list):
+            score -= min(0.08, len(uncertainties) * 0.015)
+
+        return max(0.0, min(1.0, round(score, 4)))
+
+    def _summarize_candidate_result(
+        self,
+        *,
+        index: int,
+        label: str,
+        temperature: float,
+        score: float,
+        result: TransformResult,
+    ) -> Dict[str, Any]:
+        details = result.details or {}
+        validation = details.get("validation", {})
+        summary: Dict[str, Any] = {
+            "candidate": index,
+            "label": label,
+            "temperature": round(float(temperature), 3),
+            "success": bool(result.success),
+            "confidence": round(float(result.confidence or 0.0), 3),
+            "score": score,
+            "description": str(result.description or "")[:240],
+        }
+        if isinstance(validation, dict):
+            summary["accepted"] = bool(validation.get("accepted"))
+            summary["issues"] = list(validation.get("issues", []))[:8]
+            readability_delta = validation.get("readability_delta")
+            if isinstance(readability_delta, (int, float)):
+                summary["readability_delta"] = round(float(readability_delta), 2)
+            evidence = validation.get("evidence", {})
+            if isinstance(evidence, dict):
+                retained_count = evidence.get("retained_count")
+                missing_count = evidence.get("missing_count")
+                if isinstance(retained_count, int):
+                    summary["retained_evidence"] = retained_count
+                if isinstance(missing_count, int):
+                    summary["missing_evidence"] = missing_count
+            semantic = validation.get("semantic", {})
+            if isinstance(semantic, dict) and semantic.get("available"):
+                summary["semantic_issues"] = list(semantic.get("reasons", []))[:6]
+        decoded = details.get("decoded_artifacts") or details.get("hidden_payloads") or []
+        if isinstance(decoded, list) and decoded:
+            summary["artifacts"] = [str(item)[:120] for item in decoded[:4]]
+        renames = details.get("renames") or details.get("suggestions")
+        if isinstance(renames, dict) and renames:
+            summary["rename_count"] = len(renames)
+        elif isinstance(renames, list) and renames:
+            summary["rename_count"] = len(renames)
+        excerpt_limit = int(getattr(settings, "LLM_CRITIC_MAX_CODE_CHARS", 1800) or 1800)
+        summary["code_excerpt"] = self.truncate_code(result.output, max_chars=max(600, excerpt_limit))
+        return summary
+
+    async def _select_candidate_result(
+        self,
+        code: str,
+        language: str,
+        state: dict,
+        candidate_records: List[Dict[str, Any]],
+    ) -> TransformResult:
+        viable = [
+            record
+            for record in candidate_records
+            if bool(record["result"].success)
+        ]
+        critic_summary: Optional[Dict[str, Any]] = None
+        if len(viable) >= 2 and self.critic_enabled(code, language, state):
+            critic_summary = await self._critic_rerank(
+                code,
+                language,
+                state,
+                viable,
+            )
+
+        selected_pool = viable or candidate_records
+        if critic_summary and viable:
+            chosen_index = critic_summary.get("choice")
+            score_map = critic_summary.get("score_map", {})
+            for record in viable:
+                critic_score = score_map.get(record["index"])
+                final_score = record["score"]
+                if isinstance(critic_score, (int, float)):
+                    final_score = final_score * 0.6 + float(critic_score) * 0.4
+                if chosen_index == record["index"]:
+                    final_score += 0.08
+                record["final_score"] = round(final_score, 4)
+            selected_pool = viable
+        else:
+            for record in selected_pool:
+                record["final_score"] = record["score"]
+
+        selected = max(
+            selected_pool,
+            key=lambda record: (
+                float(record.get("final_score", record["score"])),
+                float(record["score"]),
+                -int(record["index"]),
+            ),
+        )
+        result: TransformResult = selected["result"]
+        details = dict(result.details or {})
+        selection = {
+            "mode": "generator_critic_rerank" if len(candidate_records) > 1 else "single_shot",
+            "candidate_count": len(candidate_records),
+            "successful_candidates": len(viable),
+            "selected_candidate": selected["index"],
+            "selected_label": selected["label"],
+            "selected_score": round(float(selected.get("final_score", selected["score"])), 4),
+            "critic_used": bool(critic_summary),
+        }
+        if critic_summary:
+            selection["critic_reason"] = str(critic_summary.get("reason", ""))[:280]
+        details["selection"] = selection
+        details["candidates"] = [
+            {
+                key: value
+                for key, value in record["summary"].items()
+                if key != "code_excerpt"
+            }
+            for record in candidate_records
+        ]
+        if critic_summary:
+            details["critic"] = {
+                "choice": critic_summary.get("choice"),
+                "reason": critic_summary.get("reason", ""),
+                "scores": critic_summary.get("scores", []),
+            }
+        result.details = details
+        if len(candidate_records) > 1:
+            result.description = (
+                f"{result.description.rstrip()} "
+                f"Selected from {len(candidate_records)} LLM candidate(s)"
+                + (" using critic reranking." if critic_summary else " using deterministic reranking.")
+            ).strip()
+        return result
+
+    async def _critic_rerank(
+        self,
+        code: str,
+        language: str,
+        state: dict,
+        candidate_records: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if self._client is None or len(candidate_records) < 2:
+            return None
+
+        context = self.build_state_context(state, code=code, compact=True)
+        original_limit = int(getattr(settings, "LLM_CRITIC_MAX_CODE_CHARS", 1800) or 1800)
+        original_excerpt = self.truncate_code(code, max_chars=max(600, original_limit))
+
+        rendered_candidates: List[str] = []
+        for record in candidate_records[:3]:
+            summary = record["summary"]
+            rendered_candidates.append(
+                "\n".join(
+                    [
+                        f"Candidate {record['index']} ({record['label']})",
+                        f"Heuristic score: {summary.get('score', 0.0)}",
+                        f"Transform confidence: {summary.get('confidence', 0.0)}",
+                        f"Validation accepted: {summary.get('accepted', record['result'].success)}",
+                        "Validation issues: "
+                        + ", ".join(summary.get("issues", []) or ["none"]),
+                        f"Readability delta: {summary.get('readability_delta', 'n/a')}",
+                        f"Retained evidence: {summary.get('retained_evidence', 'n/a')}",
+                        f"Missing evidence: {summary.get('missing_evidence', 'n/a')}",
+                        f"Description: {summary.get('description', '')}",
+                        "Artifacts: " + " | ".join(summary.get("artifacts", []) or ["none"]),
+                        "Code excerpt:\n```"
+                        + str(summary.get("code_excerpt", "")).strip()
+                        + "\n```",
+                    ]
+                )
+            )
+
+        prompt = (
+            "You are reviewing multiple AI-generated deobfuscation candidates. "
+            "Choose the best final candidate.\n\n"
+            "Priority order:\n"
+            "1. Preserve behavior, exports, and entrypoint semantics.\n"
+            "2. Keep recovered evidence, payload indicators, and critical APIs.\n"
+            "3. Improve readability and naming only when supported by the code.\n\n"
+            f"Task-specific guidance: {self.critic_priority_instructions()}\n\n"
+            f"Declared language: {language or state.get('language', 'unknown')}\n"
+            f"State context:\n{context}\n\n"
+            f"Original excerpt:\n```\n{original_excerpt}\n```\n\n"
+            + "\n\n".join(rendered_candidates)
+            + "\n\nRespond with ONLY a JSON object:\n"
+            "{\n"
+            '  "choice": 1,\n'
+            '  "reason": "one concise explanation",\n'
+            '  "candidate_scores": [\n'
+            '    {"candidate": 1, "behavior_preservation": 0.0, "evidence_retention": 0.0, "readability": 0.0, "overall": 0.0}\n'
+            "  ]\n"
+            "}"
+        )
+
+        try:
+            reply = await self._client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=self.compute_token_budget(
+                    len(prompt),
+                    "critic",
+                    ceiling=1024,
+                ),
+            )
+            parsed = self.extract_json(reply)
+        except Exception:
+            logger.exception("%s critic rerank failed", self.name)
+            return None
+
+        if not isinstance(parsed, dict):
+            return None
+
+        choice = parsed.get("choice")
+        try:
+            chosen_index = int(choice)
+        except (TypeError, ValueError):
+            chosen_index = 0
+        valid_indexes = {record["index"] for record in candidate_records}
+        if chosen_index not in valid_indexes:
+            chosen_index = 0
+
+        scores: List[Dict[str, Any]] = []
+        score_map: Dict[int, float] = {}
+        for item in parsed.get("candidate_scores", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                candidate_index = int(item.get("candidate"))
+            except (TypeError, ValueError):
+                continue
+            if candidate_index not in valid_indexes:
+                continue
+            overall = item.get("overall")
+            if isinstance(overall, (int, float)):
+                clamped_overall = max(0.0, min(1.0, float(overall)))
+                score_map[candidate_index] = clamped_overall
+            scores.append(
+                {
+                    "candidate": candidate_index,
+                    "behavior_preservation": item.get("behavior_preservation"),
+                    "evidence_retention": item.get("evidence_retention"),
+                    "readability": item.get("readability"),
+                    "overall": score_map.get(candidate_index, item.get("overall")),
+                }
+            )
+
+        return {
+            "choice": chosen_index,
+            "reason": str(parsed.get("reason", "")).strip(),
+            "scores": scores,
+            "score_map": score_map,
+        }
 
     # ------------------------------------------------------------------
     #  Helpers available to subclasses
@@ -681,6 +1124,7 @@ class LLMTransform(BaseTransform):
         """Run lightweight structural validation on a candidate rewrite."""
         issues: List[str] = []
         workspace_validation: Optional[Dict[str, Any]] = None
+        semantic: Optional[Dict[str, Any]] = None
         if not candidate or not candidate.strip():
             return {
                 "accepted": False,
@@ -688,6 +1132,7 @@ class LLMTransform(BaseTransform):
                 "delimiter_balance_ok": False,
                 "syntax_ok": False,
                 "workspace_validation": None,
+                "semantic": None,
             }
 
         lang = (language or "").lower()
@@ -731,6 +1176,18 @@ class LLMTransform(BaseTransform):
             if not workspace_validation["accepted"]:
                 accepted = False
                 issues.extend(workspace_validation["issues"])
+        else:
+            semantic = semantic_validation_summary(
+                language=lang,
+                before=original,
+                after=candidate,
+                size_ratio=(len(candidate.strip()) / max(len(original.strip()), 1)),
+            )
+            if semantic.get("available") and semantic.get("reasons"):
+                accepted = False
+                for reason in semantic.get("reasons", []):
+                    if reason not in issues:
+                        issues.append(str(reason))
 
         return {
             "accepted": accepted,
@@ -738,6 +1195,7 @@ class LLMTransform(BaseTransform):
             "delimiter_balance_ok": delimiter_balance_ok,
             "syntax_ok": syntax_ok,
             "workspace_validation": workspace_validation,
+            "semantic": semantic,
         }
 
     @classmethod

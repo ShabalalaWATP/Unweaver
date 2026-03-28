@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
+from app.core.config import settings
 from app.models.schemas import (
     AnalysisState,
     Finding,
@@ -3067,22 +3068,66 @@ class Planner:
             suspicious_files = workspace_context.get("suspicious_files", [])
             entry_points = workspace_context.get("entry_points", [])
             remaining_frontier = workspace_context.get("remaining_frontier_paths", [])
+            remaining_supported_count = int(
+                workspace_context.get("remaining_supported_file_count") or 0
+            )
+            supported_file_count = int(workspace_context.get("supported_file_count") or 0)
             workspace_attempts = action_queue.total_attempts("deobfuscate_workspace_files")
+            workspace_batch_size = max(
+                1,
+                int(getattr(settings, "MAX_WORKSPACE_TARGET_FILES", 28) or 28),
+            )
+            workspace_attempt_budget = max(
+                4,
+                min(
+                    int(getattr(settings, "MAX_WORKSPACE_ACTION_ATTEMPTS", 0) or 0) or 4,
+                    (
+                        (supported_file_count + workspace_batch_size - 1) // workspace_batch_size + 8
+                    )
+                    if supported_file_count
+                    else int(getattr(settings, "MAX_WORKSPACE_ACTION_ATTEMPTS", 0) or 0) or 4,
+                ),
+            )
+            coverage_pending = (
+                bool(remaining_frontier)
+                or
+                remaining_supported_count > 0
+                or (
+                    supported_file_count > 0
+                    and int(workspace_context.get("processed_supported_file_count") or 0) < supported_file_count
+                )
+            )
             should_run_workspace_pass = (
                 workspace_attempts == 0
-                or (remaining_frontier and workspace_attempts < 3)
+                or (coverage_pending and workspace_attempts < workspace_attempt_budget)
             )
-            if should_run_workspace_pass and (prioritized_files or suspicious_files or entry_points):
+            if should_run_workspace_pass and (
+                prioritized_files or suspicious_files or entry_points or supported_file_count
+            ):
                 recommendations.append(PlannedAction(
                     action_name="deobfuscate_workspace_files",
-                    confidence=0.84 if workspace_attempts == 0 else 0.8,
+                    confidence=(
+                        0.84
+                        if workspace_attempts == 0
+                        else 0.81
+                        if remaining_frontier
+                        else 0.78
+                    ),
                     reason=(
                         "Run deterministic per-file deobfuscation against prioritized "
                         "workspace hotspots instead of only whole-bundle passes."
                         if workspace_attempts == 0 else
                         "Continue workspace hotspot expansion against remaining high-priority files."
+                        if remaining_frontier else
+                        "Continue exhaustive workspace batching across remaining supported files."
                     ),
-                    priority=12.2 if workspace_attempts == 0 else 13.1 + workspace_attempts,
+                    priority=(
+                        12.2
+                        if workspace_attempts == 0
+                        else 13.0 + workspace_attempts * 0.15
+                        if remaining_frontier
+                        else 13.6 + workspace_attempts * 0.12
+                    ),
                 ))
 
         if (
@@ -3358,6 +3403,9 @@ class Planner:
         suspicious_files = workspace_context.get("suspicious_files", [])
         entry_points = workspace_context.get("entry_points", [])
         remaining_frontier = workspace_context.get("remaining_frontier_paths", [])
+        remaining_supported_count = int(
+            workspace_context.get("remaining_supported_file_count") or 0
+        )
         indexed_from_archive = bool(workspace_context.get("indexed_from_archive"))
 
         deterministic_progress = early_deterministic_progress
@@ -3388,7 +3436,7 @@ class Planner:
             + min(len(prioritized_files), 2)
             + min(len(suspicious_files), 2)
             + min(len(entry_points), 1)
-            + min(len(remaining_frontier), 2)
+            + min(max(len(remaining_frontier), 1 if remaining_supported_count > 0 else 0), 2)
         )
         hard_js_evidence = (
             evidence_score
@@ -3469,6 +3517,7 @@ class Planner:
                     and iteration >= 3
                     and (
                         remaining_frontier
+                        or remaining_supported_count > 0
                         or action_queue.success_count("deobfuscate_workspace_files") >= 1
                     )
                     and (
@@ -3559,6 +3608,7 @@ class Planner:
                     and (
                         layered_signal_score >= 2
                         or remaining_frontier
+                        or remaining_supported_count > 0
                     )
                     and (
                         decode_successes >= 1
@@ -3911,7 +3961,6 @@ class PreflightValidator:
 
     # Actions that shouldn't run back-to-back (no point re-running immediately).
     _CONFLICT_PAIRS: List[Tuple[str, str]] = [
-        ("deobfuscate_workspace_files", "deobfuscate_workspace_files"),
         ("decode_base64", "decode_base64"),
         ("decode_hex", "decode_hex"),
         ("constant_fold", "constant_fold"),
@@ -4147,9 +4196,10 @@ class StateReconciler:
             "llm_multilayer_unwrap",
             "decode_python_serialization",
         }
+        coverage_advanced = bool((result.details or {}).get("coverage_advanced"))
         if improvement > 0.01:
             sm.reset_stall()
-        elif result.success and action_name in _DECODE_ACTIONS:
+        elif result.success and (action_name in _DECODE_ACTIONS or coverage_advanced):
             # Successful decode but low improvement — don't penalise,
             # the decoded content likely has more layers to peel.
             pass
@@ -5226,6 +5276,24 @@ class Orchestrator:
             logger.exception("Findings generation failed")
             findings = []
 
+        confidence_profile = self._build_confidence_presentation(self._state_manager)
+        result_kind = self._classify_result_kind(
+            stop_reason=stop_reason,
+            was_stopped=was_stopped,
+            fatal_error=fatal_error,
+            confidence_profile=confidence_profile,
+        )
+        self._state_manager.set_final_result_metadata(
+            stop_reason=stop_reason,
+            result_kind=result_kind,
+            best_effort=result_kind != "completed_recovery",
+            raw_confidence=confidence_profile["raw_confidence"],
+            coverage_adjusted_confidence=confidence_profile["display_confidence"],
+            coverage_adjustment_factor=confidence_profile["adjustment_factor"],
+            confidence_scope_note=confidence_profile["scope_note"],
+            fatal_error=fatal_error,
+        )
+
         # Build summary.
         self._state_manager.set_summary(
             self._build_summary(findings, all_iocs, iterations_run, stop_reason)
@@ -5256,7 +5324,7 @@ class Orchestrator:
             strings=list(self._state_manager.state.strings),
             transform_history=list(self._state_manager.state.transform_history),
             state=self._state_manager.state.model_copy(deep=True),
-            confidence=self._state_manager.overall_confidence,
+            confidence=confidence_profile["display_confidence"],
             stop_reason=stop_reason,
             elapsed_seconds=elapsed,
             was_stopped=was_stopped,
@@ -5266,6 +5334,130 @@ class Orchestrator:
     # ------------------------------------------------------------------
     #  Internal helpers
     # ------------------------------------------------------------------
+
+    def _build_confidence_presentation(
+        self,
+        state_manager: StateManager,
+    ) -> Dict[str, Any]:
+        raw_confidence = max(0.0, min(1.0, state_manager.overall_confidence))
+        language = (state_manager.state.language or self.language or "").lower().strip()
+        context = (
+            state_manager.state.workspace_context
+            if isinstance(state_manager.state.workspace_context, dict)
+            else {}
+        )
+
+        if language != "workspace":
+            return {
+                "raw_confidence": raw_confidence,
+                "display_confidence": raw_confidence,
+                "adjustment_factor": 1.0,
+                "scope_note": "Confidence reflects the current recovered output for this sample.",
+            }
+
+        def _coerce_ratio(value: Any) -> float:
+            if isinstance(value, (int, float)):
+                return max(0.0, min(1.0, float(value)))
+            return 0.0
+
+        targeted_ratio = _coerce_ratio(context.get("targeted_supported_ratio"))
+        bundled_ratio = _coerce_ratio(
+            context.get("supported_bundle_coverage_ratio") or context.get("bundle_coverage_ratio")
+        )
+        frontier_ratio = _coerce_ratio(context.get("analysis_frontier_completion_ratio"))
+        supported_file_count = int(context.get("supported_file_count") or 0)
+        targeted_file_count = int(context.get("targeted_file_count") or 0)
+        remaining_frontier_count = len(context.get("remaining_frontier_paths", []) or [])
+        remaining_supported_count = int(context.get("remaining_supported_file_count") or 0)
+
+        if supported_file_count <= 0:
+            return {
+                "raw_confidence": raw_confidence,
+                "display_confidence": raw_confidence,
+                "adjustment_factor": 1.0,
+                "scope_note": str(
+                    context.get("coverage_scope_note")
+                    or "Confidence reflects the active workspace pass only."
+                ),
+            }
+
+        adjustment_factor = max(
+            0.0,
+            min(
+                1.0,
+                targeted_ratio * 0.65
+                + bundled_ratio * 0.25
+                + frontier_ratio * 0.10,
+            ),
+        )
+        display_confidence = max(
+            0.0,
+            min(1.0, raw_confidence * adjustment_factor),
+        )
+        scope_note = str(
+            context.get("coverage_scope_note")
+            or "Confidence is adjusted for supported-file workspace coverage."
+        ).strip()
+        extras: List[str] = []
+        if targeted_file_count and supported_file_count:
+            extras.append(f"Supported files targeted: {targeted_file_count}/{supported_file_count}.")
+        if remaining_supported_count:
+            extras.append(f"Remaining supported files: {remaining_supported_count}.")
+        if remaining_frontier_count:
+            extras.append(f"Remaining ranked hotspots: {remaining_frontier_count}.")
+        if extras:
+            scope_note = f"{scope_note} {' '.join(extras)}".strip()
+
+        return {
+            "raw_confidence": raw_confidence,
+            "display_confidence": display_confidence,
+            "adjustment_factor": adjustment_factor,
+            "scope_note": scope_note,
+        }
+
+    def _classify_result_kind(
+        self,
+        *,
+        stop_reason: str,
+        was_stopped: bool,
+        fatal_error: Optional[str],
+        confidence_profile: Dict[str, Any],
+    ) -> str:
+        if fatal_error:
+            return "failed_best_effort"
+        if was_stopped:
+            return "stopped_best_effort"
+
+        context = (
+            self._state_manager.state.workspace_context
+            if self._state_manager is not None
+            and isinstance(self._state_manager.state.workspace_context, dict)
+            else {}
+        )
+        supported_file_count = int(context.get("supported_file_count") or 0)
+        targeted_file_count = int(context.get("targeted_file_count") or 0)
+        remaining_frontier_count = len(context.get("remaining_frontier_paths", []) or [])
+        remaining_supported_count = int(context.get("remaining_supported_file_count") or 0)
+        partial_stop_markers = (
+            "maximum iterations",
+            "consecutive failures",
+            "analysis stalled",
+            "no further approved actions",
+            "queue exhausted",
+            "retry mode",
+        )
+        stop_reason_lower = stop_reason.lower().strip()
+        if any(marker in stop_reason_lower for marker in partial_stop_markers):
+            return "partial_recovery"
+        if remaining_supported_count:
+            return "partial_recovery"
+        if supported_file_count and targeted_file_count < supported_file_count:
+            return "partial_recovery"
+        if remaining_frontier_count:
+            return "partial_recovery"
+        if float(confidence_profile.get("adjustment_factor") or 1.0) < 0.999:
+            return "partial_recovery"
+        return "completed_recovery"
 
     def _compute_new_confidence(
         self,

@@ -242,13 +242,43 @@ class StateManager:
     def set_summary(self, summary: str) -> None:
         self.state.analysis_summary = summary
 
+    def set_final_result_metadata(
+        self,
+        *,
+        stop_reason: str,
+        result_kind: str,
+        best_effort: bool,
+        raw_confidence: float,
+        coverage_adjusted_confidence: Optional[float] = None,
+        coverage_adjustment_factor: Optional[float] = None,
+        confidence_scope_note: str = "",
+        fatal_error: Optional[str] = None,
+    ) -> None:
+        iteration_state = self.state.iteration_state
+        iteration_state["stop_reason"] = stop_reason
+        iteration_state["result_kind"] = result_kind
+        iteration_state["best_effort"] = bool(best_effort)
+        iteration_state["raw_confidence"] = max(0.0, min(1.0, float(raw_confidence)))
+        iteration_state["coverage_adjusted_confidence"] = (
+            max(0.0, min(1.0, float(coverage_adjusted_confidence)))
+            if coverage_adjusted_confidence is not None
+            else None
+        )
+        iteration_state["coverage_adjustment_factor"] = (
+            max(0.0, min(1.0, float(coverage_adjustment_factor)))
+            if coverage_adjustment_factor is not None
+            else None
+        )
+        iteration_state["confidence_scope_note"] = confidence_scope_note or ""
+        iteration_state["fatal_error"] = fatal_error
+
     def merge_workspace_context(self, context: Dict[str, Any]) -> None:
         """Merge structured workspace metadata into analysis state."""
         if not context:
             return
         merged = dict(self.state.workspace_context)
         for key, value in context.items():
-            if value in (None, "", [], {}):
+            if value is None:
                 continue
             merged[key] = value
         self.state.workspace_context = merged

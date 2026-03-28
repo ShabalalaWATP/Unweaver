@@ -157,6 +157,18 @@ class TestActionQueue:
         # 4th should be rejected
         assert q.enqueue("repeat_action", confidence=0.9) is False
 
+    def test_workspace_action_uses_extended_attempt_cap(self):
+        q = ActionQueue()
+        q._max_global_attempts = 3
+
+        for _ in range(5):
+            assert q.enqueue("deobfuscate_workspace_files", confidence=0.8) is True
+            q.dequeue()
+            q.mark_succeeded("deobfuscate_workspace_files")
+
+        assert q.total_attempts("deobfuscate_workspace_files") == 5
+        assert q.enqueue("deobfuscate_workspace_files", confidence=0.8) is True
+
     def test_auto_approve_threshold(self):
         """High-confidence deterministic actions are auto-approved."""
         q = ActionQueue(auto_approve_threshold=0.85)
@@ -284,6 +296,28 @@ class TestStateManager:
         assert sm.is_stopped is False
         sm.mark_stopped()
         assert sm.is_stopped is True
+
+    def test_set_final_result_metadata(self):
+        sm = StateManager("test", "code", language="workspace")
+
+        sm.set_final_result_metadata(
+            stop_reason="Queue exhausted",
+            result_kind="partial_recovery",
+            best_effort=True,
+            raw_confidence=0.82,
+            coverage_adjusted_confidence=0.41,
+            coverage_adjustment_factor=0.5,
+            confidence_scope_note="Coverage adjusted for supported files.",
+            fatal_error=None,
+        )
+
+        assert sm.state.iteration_state["stop_reason"] == "Queue exhausted"
+        assert sm.state.iteration_state["result_kind"] == "partial_recovery"
+        assert sm.state.iteration_state["best_effort"] is True
+        assert sm.state.iteration_state["raw_confidence"] == 0.82
+        assert sm.state.iteration_state["coverage_adjusted_confidence"] == 0.41
+        assert sm.state.iteration_state["coverage_adjustment_factor"] == 0.5
+        assert sm.state.iteration_state["confidence_scope_note"] == "Coverage adjusted for supported files."
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -503,6 +537,59 @@ class TestPlannerWorkspaceBundles:
                     {"path": "src/main.js", "score": 8.0},
                 ],
                 "remaining_frontier_paths": ["src/extra.js"],
+            }
+        )
+        q = ActionQueue()
+        q.enqueue("deobfuscate_workspace_files", confidence=0.8)
+        q.dequeue()
+        q.mark_succeeded("deobfuscate_workspace_files")
+        planner = Planner(
+            available_actions={
+                "profile_workspace",
+                "fingerprint_obfuscation",
+                "deobfuscate_workspace_files",
+            }
+        )
+
+        actions = planner.plan(sm, q)
+        names = [item.action_name for item in actions]
+
+        assert "deobfuscate_workspace_files" in names
+
+    def test_schedules_follow_up_workspace_wave_when_supported_files_remain(self):
+        code = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 2\n"
+            "omitted_files: 12\n"
+            "languages: javascript=2\n"
+            "entry_points: src/main.js\n"
+            "suspicious_files: src/decode.js\n"
+            "manifest_files: package.json\n"
+            "root_dirs: src\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="src/main.js" language="javascript" priority="entrypoint" size=42>>>\n'
+            "const payload = atob('aGVsbG8=');\n"
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="src/decode.js" language="javascript" priority="suspicious" size=60>>>\n'
+            "const msg = String.fromCharCode(72, 105);\n"
+            "<<<END FILE>>>\n"
+        )
+        sm = StateManager("bundle-supported-follow-up", code, language="workspace")
+        sm.advance_iteration()
+        sm.advance_iteration()
+        sm.merge_workspace_context(
+            {
+                "entry_points": ["src/main.js"],
+                "suspicious_files": ["src/decode.js"],
+                "prioritized_files": [
+                    {"path": "src/decode.js", "score": 9.5},
+                    {"path": "src/main.js", "score": 8.0},
+                ],
+                "supported_file_count": 14,
+                "processed_supported_file_count": 2,
+                "remaining_supported_file_count": 12,
+                "remaining_frontier_paths": [],
             }
         )
         q = ActionQueue()
@@ -836,6 +923,9 @@ class TestOrchestratorStopRequests:
         assert result.iterations == 0
         assert "Stop requested by user" in result.stop_reason
         assert result.state.iteration_state["stopped"] is True
+        assert result.state.iteration_state["stop_reason"] == result.stop_reason
+        assert result.state.iteration_state["result_kind"] == "stopped_best_effort"
+        assert result.state.iteration_state["best_effort"] is True
 
     @pytest.mark.asyncio
     async def test_run_bootstraps_preprocessing_before_iterations(self):
@@ -878,6 +968,9 @@ class TestOrchestratorStopRequests:
         assert result.fatal_error == "RuntimeError: boom"
         assert result.state.parse_status == "failed"
         assert result.state.iteration_state["fatal_error"] == "RuntimeError: boom"
+        assert result.state.iteration_state["stop_reason"] == result.stop_reason
+        assert result.state.iteration_state["result_kind"] == "failed_best_effort"
+        assert result.state.iteration_state["best_effort"] is True
         assert result.was_stopped is False
 
 

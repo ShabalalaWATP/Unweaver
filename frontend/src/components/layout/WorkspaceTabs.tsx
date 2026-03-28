@@ -139,7 +139,7 @@ export default function WorkspaceTabs({ sample, analysisState, activeTab: active
       case 'original':
         return <OriginalTab sample={sample} />;
       case 'recovered':
-        return <RecoveredTab sample={sample} highlightText={codeHighlight} />;
+        return <RecoveredTab sample={sample} analysisState={analysisState} highlightText={codeHighlight} />;
       case 'diff':
         return <DiffTab sample={sample} />;
       case 'strings':

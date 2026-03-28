@@ -41,10 +41,11 @@ class Settings(BaseSettings):
     MAX_WORKSPACE_TARGET_FILES: int = 28
     MAX_WORKSPACE_BUNDLE_ADDITIONS: int = 24
     MAX_WORKSPACE_LLM_FOCUS_FILES: int = 8
+    MAX_WORKSPACE_ACTION_ATTEMPTS: int = 128
 
     # ── Iterative analysis loop ─────────────────────────────────────────
     MAX_ITERATIONS: int = 36
-    MAX_WORKSPACE_ITERATIONS: int = 44
+    MAX_WORKSPACE_ITERATIONS: int = 128
     AUTO_APPROVE_THRESHOLD: float = 0.85
     MIN_CONFIDENCE_THRESHOLD: float = 0.3
     STALL_THRESHOLD: int = 3  # consecutive iterations without progress
@@ -59,6 +60,10 @@ class Settings(BaseSettings):
 
     # ── LLM defaults (can be overridden per-provider in DB) ─────────────
     DEFAULT_LLM_MAX_TOKENS: int = 4096
+    LLM_GENERATOR_CRITIC_ENABLED: bool = True
+    LLM_DEOBFUSCATE_CANDIDATES: int = 2
+    LLM_MULTILAYER_CANDIDATES: int = 2
+    LLM_CRITIC_MAX_CODE_CHARS: int = 1800
 
     # ── Embedded JS tooling bootstrap ────────────────────────────────────
     JS_TOOLING_AUTO_INSTALL: bool = True

@@ -52,6 +52,88 @@ from app.services.transforms.source_preprocessor import normalize_source_anomali
 logger = logging.getLogger(__name__)
 
 
+def _confidence_presentation_for_state(
+    state_manager: StateManager,
+    *,
+    fallback_language: str = "",
+) -> Dict[str, Any]:
+    raw_confidence = max(0.0, min(1.0, state_manager.overall_confidence))
+    language = (state_manager.state.language or fallback_language or "").lower().strip()
+    context = (
+        state_manager.state.workspace_context
+        if isinstance(state_manager.state.workspace_context, dict)
+        else {}
+    )
+
+    if language != "workspace":
+        return {
+            "raw_confidence": raw_confidence,
+            "display_confidence": raw_confidence,
+            "adjustment_factor": 1.0,
+            "scope_note": "Confidence reflects the current recovered output for this sample.",
+        }
+
+    def _coerce_ratio(value: Any) -> float:
+        if isinstance(value, (int, float)):
+            return max(0.0, min(1.0, float(value)))
+        return 0.0
+
+    targeted_ratio = _coerce_ratio(context.get("targeted_supported_ratio"))
+    bundled_ratio = _coerce_ratio(
+        context.get("supported_bundle_coverage_ratio") or context.get("bundle_coverage_ratio")
+    )
+    frontier_ratio = _coerce_ratio(context.get("analysis_frontier_completion_ratio"))
+    supported_file_count = int(context.get("supported_file_count") or 0)
+    targeted_file_count = int(context.get("targeted_file_count") or 0)
+    remaining_frontier_count = len(context.get("remaining_frontier_paths", []) or [])
+    remaining_supported_count = int(context.get("remaining_supported_file_count") or 0)
+
+    if supported_file_count <= 0:
+        return {
+            "raw_confidence": raw_confidence,
+            "display_confidence": raw_confidence,
+            "adjustment_factor": 1.0,
+            "scope_note": str(
+                context.get("coverage_scope_note")
+                or "Confidence reflects the active workspace pass only."
+            ),
+        }
+
+    adjustment_factor = max(
+        0.0,
+        min(
+            1.0,
+            targeted_ratio * 0.65
+            + bundled_ratio * 0.25
+            + frontier_ratio * 0.10,
+        ),
+    )
+    display_confidence = max(
+        0.0,
+        min(1.0, raw_confidence * adjustment_factor),
+    )
+    scope_note = str(
+        context.get("coverage_scope_note")
+        or "Confidence is adjusted for supported-file workspace coverage."
+    ).strip()
+    extras: List[str] = []
+    if targeted_file_count and supported_file_count:
+        extras.append(f"Supported files targeted: {targeted_file_count}/{supported_file_count}.")
+    if remaining_supported_count:
+        extras.append(f"Remaining supported files: {remaining_supported_count}.")
+    if remaining_frontier_count:
+        extras.append(f"Remaining ranked hotspots: {remaining_frontier_count}.")
+    if extras:
+        scope_note = f"{scope_note} {' '.join(extras)}".strip()
+
+    return {
+        "raw_confidence": raw_confidence,
+        "display_confidence": display_confidence,
+        "adjustment_factor": adjustment_factor,
+        "scope_note": scope_note,
+    }
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Inline deterministic transforms
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1265,7 +1347,9 @@ class StopDecision:
         7. Otherwise: continue.
         """
         iteration = state_manager.current_iteration
-        confidence = state_manager.overall_confidence
+        confidence_profile = _confidence_presentation_for_state(state_manager)
+        raw_confidence = float(confidence_profile.get("raw_confidence") or 0.0)
+        confidence = float(confidence_profile.get("display_confidence") or raw_confidence)
         stall = state_manager.stall_counter
         pending_high_confidence = action_queue.peek()
         residual = _residual_obfuscation_markers(
@@ -1298,12 +1382,12 @@ class StopDecision:
             )
 
         # 2. Confidence regression after meaningful progress.
-        if iteration > 3 and confidence < self.min_confidence:
+        if iteration > 3 and raw_confidence < self.min_confidence:
             history = state_manager.confidence_history
             if len(history) > 3 and max(history) > self.min_confidence:
                 return StopVerdict(
                     StopAction.BACKTRACK,
-                    f"Confidence dropped to {confidence:.2f}, below minimum "
+                    f"Confidence dropped to {raw_confidence:.2f}, below minimum "
                     f"{self.min_confidence:.2f}. Backtracking.",
                 )
 
@@ -1448,12 +1532,14 @@ class StopDecision:
         code = state_manager.current_code
         # Truncate for the LLM prompt — we only need a representative sample.
         excerpt = code[:3000] if len(code) > 3000 else code
-        confidence = state_manager.overall_confidence
+        confidence_profile = _confidence_presentation_for_state(state_manager)
+        raw_confidence = float(confidence_profile.get("raw_confidence") or 0.0)
+        confidence = float(confidence_profile.get("display_confidence") or raw_confidence)
         iteration = state_manager.current_iteration
 
         prompt = (
             "You are an expert malware analyst reviewing partially deobfuscated code.\n"
-            f"Iteration: {iteration}, Confidence: {confidence:.2f}\n"
+            f"Iteration: {iteration}, Displayed confidence: {confidence:.2f}, Raw confidence: {raw_confidence:.2f}\n"
             f"Code excerpt ({len(code)} chars total):\n```\n{excerpt}\n```\n\n"
             "Answer with ONLY 'STOP' or 'CONTINUE' followed by a one-sentence reason.\n"
             "STOP if the code is already mostly readable and further transforms are "
@@ -4173,11 +4259,14 @@ class StateReconciler:
             and result.details.get("skipped")
             or (not result.success and "error" not in result.details)
         )
+        coverage_advanced = bool((result.details or {}).get("coverage_advanced"))
         if result.success:
             action_queue.mark_succeeded(action_name)
             stop_decision.record_success()
         elif is_skipped:
             action_queue.mark_skipped(action_name)
+            if coverage_advanced:
+                stop_decision.record_success()
         else:
             action_queue.mark_failed(action_name)
             stop_decision.record_failure()
@@ -4196,10 +4285,9 @@ class StateReconciler:
             "llm_multilayer_unwrap",
             "decode_python_serialization",
         }
-        coverage_advanced = bool((result.details or {}).get("coverage_advanced"))
         if improvement > 0.01:
             sm.reset_stall()
-        elif result.success and (action_name in _DECODE_ACTIONS or coverage_advanced):
+        elif action_name in _DECODE_ACTIONS or coverage_advanced:
             # Successful decode but low improvement — don't penalise,
             # the decoded content likely has more layers to peel.
             pass
@@ -5265,6 +5353,12 @@ class Orchestrator:
                 self._state_manager.set_parse_status("failed")
                 self._state_manager.state.iteration_state["fatal_error"] = fatal_error
 
+        # ── Final candidate adjudication (best-effort, JS/workspace) ──
+        try:
+            await self._run_shadow_llm_adjudication()
+        except Exception:
+            logger.exception("Shadow LLM adjudication failed")
+
         # ── Final findings generation ────────────────────────────────
         try:
             findings = self._findings_gen.generate(
@@ -5339,81 +5433,490 @@ class Orchestrator:
         self,
         state_manager: StateManager,
     ) -> Dict[str, Any]:
-        raw_confidence = max(0.0, min(1.0, state_manager.overall_confidence))
-        language = (state_manager.state.language or self.language or "").lower().strip()
-        context = (
-            state_manager.state.workspace_context
-            if isinstance(state_manager.state.workspace_context, dict)
-            else {}
+        return _confidence_presentation_for_state(
+            state_manager,
+            fallback_language=self.language or "",
         )
 
+    def _shadow_recovery_target_language(self) -> str:
+        if self._state_manager is None:
+            return (self.language or "").lower().strip()
+        return str(self._state_manager.state.language or self.language or "").lower().strip()
+
+    def _shadow_recovery_is_eligible(self) -> Tuple[bool, str]:
+        if self.llm_client is None:
+            return False, "no_llm_client"
+        if not bool(getattr(settings, "LLM_SHADOW_RECOVERY_ENABLED", True)):
+            return False, "feature_disabled"
+        if self._state_manager is None:
+            return False, "state_unavailable"
+
+        language = self._shadow_recovery_target_language()
+        code = self.original_code or ""
+        if not code.strip():
+            return False, "empty_original_code"
+        if len(code) > int(getattr(settings, "LLM_SHADOW_RECOVERY_MAX_CODE_CHARS", 120_000) or 120_000):
+            return False, "code_too_large"
+
+        js_languages = {"javascript", "js", "jsx", "typescript", "ts", "tsx"}
+        if language in js_languages:
+            return True, ""
         if language != "workspace":
-            return {
-                "raw_confidence": raw_confidence,
-                "display_confidence": raw_confidence,
-                "adjustment_factor": 1.0,
-                "scope_note": "Confidence reflects the current recovered output for this sample.",
-            }
+            return False, "language_not_supported"
 
-        def _coerce_ratio(value: Any) -> float:
-            if isinstance(value, (int, float)):
-                return max(0.0, min(1.0, float(value)))
-            return 0.0
+        files = parse_workspace_bundle(code)
+        max_files = int(getattr(settings, "LLM_SHADOW_RECOVERY_MAX_WORKSPACE_FILES", 48) or 48)
+        if files and len(files) > max_files:
+            return False, "workspace_too_large"
 
-        targeted_ratio = _coerce_ratio(context.get("targeted_supported_ratio"))
-        bundled_ratio = _coerce_ratio(
-            context.get("supported_bundle_coverage_ratio") or context.get("bundle_coverage_ratio")
-        )
-        frontier_ratio = _coerce_ratio(context.get("analysis_frontier_completion_ratio"))
-        supported_file_count = int(context.get("supported_file_count") or 0)
-        targeted_file_count = int(context.get("targeted_file_count") or 0)
-        remaining_frontier_count = len(context.get("remaining_frontier_paths", []) or [])
-        remaining_supported_count = int(context.get("remaining_supported_file_count") or 0)
+        context = self._state_manager.state.workspace_context or {}
+        supported_languages = {
+            str(item).strip().lower()
+            for item in context.get("supported_languages", [])
+            if str(item).strip()
+        }
+        if supported_languages and not supported_languages.intersection(js_languages):
+            return False, "workspace_has_no_supported_js"
+        return True, ""
 
-        if supported_file_count <= 0:
-            return {
-                "raw_confidence": raw_confidence,
-                "display_confidence": raw_confidence,
-                "adjustment_factor": 1.0,
-                "scope_note": str(
-                    context.get("coverage_scope_note")
-                    or "Confidence reflects the active workspace pass only."
-                ),
-            }
+    def _build_shadow_llm_state(self, language: str) -> Dict[str, Any]:
+        workspace_context = extract_workspace_context(self.original_code) or {}
+        if self.analysis_metadata.get("content_kind") == "archive_bundle":
+            workspace_context["source_mode"] = "archive_bundle"
+            if self.analysis_metadata.get("stored_file_path"):
+                workspace_context["archive_source_available"] = True
 
-        adjustment_factor = max(
-            0.0,
-            min(
-                1.0,
-                targeted_ratio * 0.65
-                + bundled_ratio * 0.25
-                + frontier_ratio * 0.10,
-            ),
-        )
-        display_confidence = max(
-            0.0,
-            min(1.0, raw_confidence * adjustment_factor),
-        )
-        scope_note = str(
-            context.get("coverage_scope_note")
-            or "Confidence is adjusted for supported-file workspace coverage."
-        ).strip()
-        extras: List[str] = []
-        if targeted_file_count and supported_file_count:
-            extras.append(f"Supported files targeted: {targeted_file_count}/{supported_file_count}.")
-        if remaining_supported_count:
-            extras.append(f"Remaining supported files: {remaining_supported_count}.")
-        if remaining_frontier_count:
-            extras.append(f"Remaining ranked hotspots: {remaining_frontier_count}.")
-        if extras:
-            scope_note = f"{scope_note} {' '.join(extras)}".strip()
+        sample_metadata = {}
+        if self._state_manager is not None:
+            raw_metadata = self._state_manager.state.iteration_state.get("sample_metadata", {})
+            if isinstance(raw_metadata, dict):
+                sample_metadata = {
+                    str(key): value
+                    for key, value in raw_metadata.items()
+                    if value not in (None, "", [], {})
+                }
 
         return {
-            "raw_confidence": raw_confidence,
-            "display_confidence": display_confidence,
-            "adjustment_factor": adjustment_factor,
-            "scope_note": scope_note,
+            "language": language,
+            "workspace_context": workspace_context,
+            "iteration_state": {
+                "sample_metadata": sample_metadata,
+            } if sample_metadata else {},
+            "strings": [],
+            "imports": [],
+            "functions": [],
+            "suspicious_apis": [],
+            "detected_techniques": [],
+            "recovered_literals": [],
+            "llm_suggestions": [],
         }
+
+    def _pipeline_candidate_provenance(self) -> Dict[str, Any]:
+        if self._state_manager is None:
+            return {}
+        history = list(self._state_manager.state.transform_history)
+        return {
+            "kind": "primary_pipeline",
+            "transform_count": len(history),
+            "recent_actions": [item.action for item in history[-8:]],
+            "recent_descriptions": [
+                str(item.outputs.get("description", ""))[:160]
+                for item in history[-4:]
+                if isinstance(item.outputs, dict) and item.outputs.get("description")
+            ],
+        }
+
+    def _llm_candidate_provenance(self, result: TransformResult) -> Dict[str, Any]:
+        details = result.details or {}
+        selection = details.get("selection", {}) if isinstance(details, dict) else {}
+        provenance = {
+            "kind": "llm_only_shadow",
+            "transform": "LLMDeobfuscator",
+            "confidence": round(float(result.confidence or 0.0), 4),
+        }
+        if isinstance(selection, dict) and selection:
+            provenance["mode"] = str(selection.get("mode", "single_shot"))
+            provenance["candidate_count"] = int(selection.get("candidate_count") or 1)
+            provenance["selected_label"] = str(selection.get("selected_label", "default"))
+            provenance["critic_used"] = bool(selection.get("critic_used"))
+        return provenance
+
+    def _evaluate_final_candidate(
+        self,
+        *,
+        source: str,
+        candidate_code: str,
+        language: str,
+        base_confidence: float,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        from app.services.transforms.llm_base import LLMTransform
+
+        state_payload = (
+            self._state_manager.state.model_dump()
+            if self._state_manager is not None
+            else {}
+        )
+        candidate_details = details if isinstance(details, dict) else {}
+        artifacts = []
+        for key in ("decoded_artifacts", "remaining_uncertainties"):
+            values = candidate_details.get(key, [])
+            if isinstance(values, list):
+                artifacts.extend(str(item) for item in values if str(item).strip())
+
+        validation = candidate_details.get("validation")
+        if not isinstance(validation, dict):
+            validation = LLMTransform.assess_candidate_rewrite(
+                self.original_code,
+                candidate_code,
+                language,
+                state_payload,
+                artifacts=artifacts,
+                allow_noop=(source == "pipeline"),
+                min_readability_delta=-4.0,
+                require_evidence_retention=True,
+            )
+
+        evidence = validation.get("evidence", {}) if isinstance(validation, dict) else {}
+        retained_count = int(evidence.get("retained_count") or 0) if isinstance(evidence, dict) else 0
+        anchor_count = len(evidence.get("anchors", []) or []) if isinstance(evidence, dict) else 0
+        retention_ratio = (
+            round(retained_count / max(anchor_count, 1), 4)
+            if anchor_count
+            else 1.0
+        )
+        readability_delta = float(validation.get("readability_delta") or 0.0)
+        readability_score = max(0.0, min(1.0, (readability_delta + 4.0) / 12.0))
+
+        residual_before = _residual_obfuscation_markers(
+            self.original_code,
+            language,
+            self._state_manager.state if self._state_manager is not None else None,
+        )
+        residual_after = _residual_obfuscation_markers(
+            candidate_code,
+            language,
+            self._state_manager.state if self._state_manager is not None else None,
+        )
+        before_score = float(residual_before.get("score") or 0.0)
+        after_score = float(residual_after.get("score") or 0.0)
+        if before_score <= 0.05:
+            residual_gain_score = 0.5
+        else:
+            residual_gain_score = max(
+                0.0,
+                min(1.0, (before_score - after_score + 0.2) / (before_score + 0.2)),
+            )
+
+        accepted = bool(validation.get("accepted"))
+        issues = list(validation.get("issues", []) or []) if isinstance(validation, dict) else []
+        noop = bool(validation.get("noop")) if isinstance(validation, dict) else False
+        score = (
+            0.25 * max(0.0, min(1.0, float(base_confidence or 0.0)))
+            + 0.25 * (1.0 if accepted else 0.0)
+            + 0.15 * retention_ratio
+            + 0.15 * readability_score
+            + 0.15 * residual_gain_score
+            + 0.05 * (0.0 if noop else 1.0)
+        )
+        score -= min(0.24, len(issues) * 0.04)
+        score = max(0.0, min(1.0, round(score, 4)))
+
+        return {
+            "source": source,
+            "accepted": accepted,
+            "score": score,
+            "confidence": round(float(base_confidence or 0.0), 4),
+            "issues": issues[:10],
+            "noop": noop,
+            "retention_ratio": retention_ratio,
+            "readability_delta": round(readability_delta, 2),
+            "residual_score_before": round(before_score, 3),
+            "residual_score_after": round(after_score, 3),
+            "residual_gain_score": round(residual_gain_score, 3),
+            "validation": validation,
+        }
+
+    async def _adjudicate_shadow_candidates(
+        self,
+        *,
+        language: str,
+        pipeline_code: str,
+        pipeline_eval: Dict[str, Any],
+        llm_code: str,
+        llm_eval: Dict[str, Any],
+        llm_result: TransformResult,
+    ) -> Optional[Dict[str, Any]]:
+        if self.llm_client is None:
+            return None
+
+        from app.services.transforms.llm_base import LLMTransform
+
+        pipeline_provenance = self._pipeline_candidate_provenance()
+        llm_provenance = self._llm_candidate_provenance(llm_result)
+        original_excerpt = LLMTransform.truncate_code(self.original_code, max_chars=1600)
+        pipeline_excerpt = LLMTransform.truncate_code(pipeline_code, max_chars=1600)
+        llm_excerpt = LLMTransform.truncate_code(llm_code, max_chars=1600)
+
+        prompt = (
+            "You are adjudicating two deobfuscated recovery candidates for the same original code.\n\n"
+            "Selection priorities:\n"
+            "1. Preserve behavior, imports/exports, entrypoints, and workspace/file structure.\n"
+            "2. Preserve recovered evidence, payload indicators, and meaningful strings.\n"
+            "3. Prefer the candidate that removes more real obfuscation while staying faithful.\n"
+            "4. Only use readability as a tie-breaker.\n\n"
+            f"Declared language: {language}\n\n"
+            f"Original excerpt:\n```\n{original_excerpt}\n```\n\n"
+            f"Candidate pipeline provenance: {json.dumps(pipeline_provenance, ensure_ascii=True)}\n"
+            f"Candidate pipeline metrics: {json.dumps(pipeline_eval, ensure_ascii=True)}\n"
+            f"Candidate pipeline excerpt:\n```\n{pipeline_excerpt}\n```\n\n"
+            f"Candidate llm_only provenance: {json.dumps(llm_provenance, ensure_ascii=True)}\n"
+            f"Candidate llm_only metrics: {json.dumps(llm_eval, ensure_ascii=True)}\n"
+            f"Candidate llm_only excerpt:\n```\n{llm_excerpt}\n```\n\n"
+            "Respond with ONLY JSON:\n"
+            "{\n"
+            '  "choice": "pipeline",\n'
+            '  "reason": "one concise explanation",\n'
+            '  "scores": {"pipeline": 0.0, "llm_only": 0.0}\n'
+            "}"
+        )
+        try:
+            reply = await self.llm_client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=768,
+            )
+        except Exception:
+            logger.exception("Shadow LLM adjudicator failed")
+            return None
+
+        parsed = LLMTransform.extract_json(reply)
+        if not isinstance(parsed, dict):
+            return None
+
+        choice = str(parsed.get("choice", "")).strip().lower()
+        if choice not in {"pipeline", "llm_only"}:
+            choice = ""
+        raw_scores = parsed.get("scores", {})
+        score_map: Dict[str, float] = {}
+        if isinstance(raw_scores, dict):
+            for key in ("pipeline", "llm_only"):
+                value = raw_scores.get(key)
+                if isinstance(value, (int, float)):
+                    score_map[key] = max(0.0, min(1.0, float(value)))
+        return {
+            "choice": choice,
+            "reason": str(parsed.get("reason", "")).strip()[:280],
+            "scores": score_map,
+        }
+
+    def _select_shadow_candidate(
+        self,
+        *,
+        pipeline_eval: Dict[str, Any],
+        llm_eval: Dict[str, Any],
+        adjudication: Optional[Dict[str, Any]],
+    ) -> Tuple[str, str]:
+        min_gain = float(getattr(settings, "LLM_SHADOW_RECOVERY_MIN_SCORE_GAIN", 0.04) or 0.04)
+        max_deficit = float(getattr(settings, "LLM_SHADOW_RECOVERY_MAX_SCORE_DEFICIT", 0.08) or 0.08)
+        pipeline_score = float(pipeline_eval.get("score") or 0.0)
+        llm_score = float(llm_eval.get("score") or 0.0)
+
+        if not llm_eval.get("accepted"):
+            return "pipeline", "llm_only_candidate_not_accepted"
+        if llm_score >= pipeline_score + min_gain:
+            return "llm_only", "llm_only_score_gain"
+        if adjudication:
+            choice = str(adjudication.get("choice", "")).strip().lower()
+            if choice == "llm_only" and llm_score + max_deficit >= pipeline_score:
+                return "llm_only", "adjudicator_preferred_llm_only"
+            if choice == "pipeline" and pipeline_score + max_deficit >= llm_score:
+                return "pipeline", "adjudicator_preferred_pipeline"
+        return "pipeline", "pipeline_heuristic_preferred"
+
+    def _apply_shadow_selection(
+        self,
+        *,
+        llm_result: TransformResult,
+        llm_eval: Dict[str, Any],
+    ) -> None:
+        if self._state_manager is None:
+            return
+
+        details = llm_result.details or {}
+        confidence_before = self._state_manager.overall_confidence
+        readability_before = (
+            self._state_manager.readability_history[-1]
+            if self._state_manager.readability_history
+            else 0.0
+        )
+        self._state_manager.current_code = llm_result.output
+
+        decoded_artifacts = [
+            str(item)[:500]
+            for item in details.get("decoded_artifacts", [])[:20]
+            if str(item).strip()
+        ]
+        if decoded_artifacts:
+            self._state_manager.add_recovered_literals(decoded_artifacts)
+            self._state_manager.add_strings(
+                [
+                    StringEntry(
+                        value=item,
+                        encoding="llm_recovered",
+                        context="llm_shadow_recovery",
+                    )
+                    for item in decoded_artifacts
+                ]
+            )
+
+        renames = details.get("renames", {})
+        if isinstance(renames, dict):
+            self._state_manager.state.llm_suggestions.extend(
+                f"Shadow LLM rename '{old}' -> '{new}'"
+                for old, new in list(renames.items())[:20]
+            )
+        uncertainties = details.get("remaining_uncertainties", [])
+        if isinstance(uncertainties, list):
+            self._state_manager.state.llm_suggestions.extend(
+                f"Shadow LLM uncertainty: {str(item)[:160]}"
+                for item in uncertainties[:8]
+            )
+
+        boosted_confidence = max(
+            confidence_before,
+            float(llm_result.confidence or 0.0),
+            float(llm_eval.get("score") or 0.0),
+        )
+        self._state_manager.update_confidence(overall=min(0.97, boosted_confidence))
+        readability_after = self._state_manager.update_readability(llm_result.output)
+        self._state_manager.record_transform(
+            TransformRecord(
+                iteration=self._state_manager.current_iteration,
+                action="llm_shadow_recovery",
+                reason="Background LLM-only recovery candidate selected after adjudication.",
+                inputs={
+                    "source": "original_code",
+                    "candidate_mode": "llm_only",
+                },
+                outputs={
+                    "description": "Selected LLM-only recovery candidate as final output.",
+                    "candidate_score": llm_eval.get("score"),
+                },
+                confidence_before=confidence_before,
+                confidence_after=min(0.97, boosted_confidence),
+                readability_before=readability_before,
+                readability_after=readability_after,
+                success=True,
+                retry_revert=False,
+            ),
+            new_code=llm_result.output,
+        )
+
+    async def _run_shadow_llm_adjudication(self) -> None:
+        if self._state_manager is None:
+            return
+
+        iteration_state = self._state_manager.state.iteration_state
+        metadata: Dict[str, Any] = {
+            "enabled": bool(getattr(settings, "LLM_SHADOW_RECOVERY_ENABLED", True)),
+            "ran": False,
+            "selected_source": "pipeline",
+            "reason": "",
+        }
+        eligible, reason = self._shadow_recovery_is_eligible()
+        if not eligible:
+            metadata["skipped_reason"] = reason
+            iteration_state["candidate_adjudication"] = metadata
+            return
+
+        language = self._shadow_recovery_target_language()
+        from app.services.transforms.llm_deobfuscator import LLMDeobfuscator
+
+        shadow_state = self._build_shadow_llm_state(language)
+        deobfuscator = LLMDeobfuscator(self.llm_client)
+        metadata["ran"] = True
+        try:
+            reply = await deobfuscator._run_llm_request(
+                self.original_code,
+                language,
+                shadow_state,
+                guidance="",
+                temperature=deobfuscator.get_temperature(),
+                label="shadow_llm_only",
+            )
+            llm_result = deobfuscator.parse_response(reply, self.original_code, language, shadow_state)
+        except Exception as exc:
+            logger.exception("Shadow LLM-only candidate generation failed")
+            metadata["skipped_reason"] = f"llm_generation_failed:{type(exc).__name__}"
+            iteration_state["candidate_adjudication"] = metadata
+            return
+
+        pipeline_confidence = self._build_confidence_presentation(self._state_manager)["display_confidence"]
+        pipeline_eval = self._evaluate_final_candidate(
+            source="pipeline",
+            candidate_code=self._state_manager.current_code,
+            language=language,
+            base_confidence=pipeline_confidence,
+        )
+        llm_eval = self._evaluate_final_candidate(
+            source="llm_only",
+            candidate_code=llm_result.output if llm_result.success else self.original_code,
+            language=language,
+            base_confidence=float(llm_result.confidence or 0.0),
+            details=llm_result.details or {},
+        )
+        llm_eval["success"] = bool(llm_result.success)
+        if not llm_result.success:
+            llm_eval["accepted"] = False
+        metadata["pipeline"] = {
+            key: value
+            for key, value in pipeline_eval.items()
+            if key != "validation"
+        }
+        metadata["llm_only"] = {
+            key: value
+            for key, value in llm_eval.items()
+            if key != "validation"
+        }
+        metadata["llm_only"]["success"] = bool(llm_result.success)
+        metadata["llm_only"]["provenance"] = self._llm_candidate_provenance(llm_result)
+        metadata["pipeline"]["provenance"] = self._pipeline_candidate_provenance()
+
+        if llm_result.success and llm_result.output.strip() == self._state_manager.current_code.strip():
+            metadata["selected_source"] = "pipeline"
+            metadata["reason"] = "candidates_equivalent"
+            iteration_state["candidate_adjudication"] = metadata
+            return
+
+        adjudication: Optional[Dict[str, Any]] = None
+        if llm_result.success and llm_result.output.strip() != self._state_manager.current_code.strip():
+            adjudication = await self._adjudicate_shadow_candidates(
+                language=language,
+                pipeline_code=self._state_manager.current_code,
+                pipeline_eval=pipeline_eval,
+                llm_code=llm_result.output,
+                llm_eval=llm_eval,
+                llm_result=llm_result,
+            )
+        if adjudication:
+            metadata["adjudicator"] = adjudication
+
+        selected_source, selected_reason = self._select_shadow_candidate(
+            pipeline_eval=pipeline_eval,
+            llm_eval=llm_eval,
+            adjudication=adjudication,
+        )
+        metadata["selected_source"] = selected_source
+        metadata["reason"] = selected_reason
+
+        if selected_source == "llm_only" and llm_result.success:
+            self._apply_shadow_selection(
+                llm_result=llm_result,
+                llm_eval=llm_eval,
+            )
+
+        iteration_state["candidate_adjudication"] = metadata
 
     def _classify_result_kind(
         self,
@@ -5467,6 +5970,9 @@ class Orchestrator:
     ) -> float:
         """Compute the updated overall confidence score."""
         if not result.success:
+            details = result.details or {}
+            if details.get("skipped") or details.get("coverage_advanced"):
+                return current
             # Slight decay on failure, but never below current.
             return max(current - 0.02, 0.0)
 

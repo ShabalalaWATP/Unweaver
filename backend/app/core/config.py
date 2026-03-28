@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     LLM_DEOBFUSCATE_CANDIDATES: int = 2
     LLM_MULTILAYER_CANDIDATES: int = 2
     LLM_CRITIC_MAX_CODE_CHARS: int = 1800
+    LLM_SHADOW_RECOVERY_ENABLED: bool = True
+    LLM_SHADOW_RECOVERY_MAX_CODE_CHARS: int = 120_000
+    LLM_SHADOW_RECOVERY_MAX_WORKSPACE_FILES: int = 48
+    LLM_SHADOW_RECOVERY_MIN_SCORE_GAIN: float = 0.04
+    LLM_SHADOW_RECOVERY_MAX_SCORE_DEFICIT: float = 0.08
+
+    # ── Automated benchmark corpus / scoring ───────────────────────────
+    BENCHMARK_AUTO_RUN_ON_STARTUP: bool = True
+    BENCHMARK_AUTO_RUN_ON_PROVIDER_TEST: bool = True
+    BENCHMARK_MIN_RERUN_HOURS: int = 24
+    BENCHMARK_MAX_CASES: int = 4
+    BENCHMARK_MAX_ITERATIONS: int = 10
+    BENCHMARK_MAX_WORKSPACE_ITERATIONS: int = 12
 
     # ── Embedded JS tooling bootstrap ────────────────────────────────────
     JS_TOOLING_AUTO_INSTALL: bool = True

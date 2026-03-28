@@ -29,8 +29,15 @@ from app.core.crypto import decrypt_value, encrypt_value
 from app.core.database import get_db
 from app.models.db_models import ProviderConfig
 from app.models.schemas import (
+    ProviderBenchmarkRunResponse,
+    ProviderBenchmarkScheduleResponse,
     ProviderSettingsCreate,
     ProviderSettingsResponse,
+)
+from app.services.benchmarks.runner import (
+    get_latest_benchmark_run,
+    schedule_provider_benchmark,
+    serialize_benchmark_run,
 )
 from app.services.llm.client import LLMClient, _MAX_TOKENS_MAP
 
@@ -229,12 +236,72 @@ async def test_provider(
     )
 
     success, message = await client.test_connection()
+    benchmark_scheduled = False
+    if success and bool(getattr(settings, "BENCHMARK_AUTO_RUN_ON_PROVIDER_TEST", True)):
+        benchmark_scheduled = await schedule_provider_benchmark(
+            provider_id,
+            reason="provider_test_success",
+            force=False,
+        )
 
     return {
         "provider_id": provider_id,
         "success": success,
         "message": message,
+        "benchmark_scheduled": benchmark_scheduled,
     }
+
+
+@router.post(
+    "/providers/{provider_id}/benchmark/run",
+    response_model=ProviderBenchmarkScheduleResponse,
+)
+async def run_provider_benchmark(
+    provider_id: str,
+    force: bool = False,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    provider = await db.get(ProviderConfig, provider_id)
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Provider {provider_id} not found",
+        )
+
+    scheduled = await schedule_provider_benchmark(
+        provider_id,
+        reason="manual_run",
+        force=force,
+    )
+    return {
+        "provider_id": provider_id,
+        "scheduled": scheduled,
+        "reason": "manual_run",
+    }
+
+
+@router.get(
+    "/providers/{provider_id}/benchmark/latest",
+    response_model=ProviderBenchmarkRunResponse,
+)
+async def latest_provider_benchmark(
+    provider_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    provider = await db.get(ProviderConfig, provider_id)
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Provider {provider_id} not found",
+        )
+
+    run = await get_latest_benchmark_run(provider_id, db_session=db)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No benchmark run found for provider {provider_id}",
+        )
+    return serialize_benchmark_run(run)
 
 
 # ── POST /api/providers/{id}/upload-cert ────────────────────────────

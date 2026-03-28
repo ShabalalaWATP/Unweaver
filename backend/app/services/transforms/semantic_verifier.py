@@ -78,6 +78,18 @@ def semantic_validation_summary(
     details: Dict[str, Any] = {}
 
     if available:
+        before_module_kind = str(before_signature.get("module_kind") or "")
+        after_module_kind = str(after_signature.get("module_kind") or "")
+        if (
+            before_module_kind
+            and before_module_kind != "script"
+            and after_module_kind
+            and before_module_kind != after_module_kind
+        ):
+            reasons.append("module_kind_changed")
+            details["module_kind_before"] = before_module_kind
+            details["module_kind_after"] = after_module_kind
+
         before_exports = set(before_signature.get("exports", []))
         after_exports = set(after_signature.get("exports", []))
         missing_exports = sorted(before_exports - after_exports)
@@ -92,10 +104,24 @@ def semantic_validation_summary(
             before_imports
             and missing_imports
             and len(missing_imports) >= max(1, int(len(before_imports) * 0.6))
-            and (size_ratio or 1.0) < 0.85
+                and (size_ratio or 1.0) < 0.85
         ):
             reasons.append("dependency_surface_changed")
             details["missing_imports"] = missing_imports[:12]
+
+        before_import_bindings = set(before_signature.get("import_bindings", []))
+        after_import_bindings = set(after_signature.get("import_bindings", []))
+        missing_import_bindings = sorted(before_import_bindings - after_import_bindings)
+        if before_import_bindings and missing_import_bindings:
+            missing_ratio = len(missing_import_bindings) / max(len(before_import_bindings), 1)
+            if (
+                len(missing_import_bindings) == len(before_import_bindings)
+                or missing_ratio >= 0.5
+                or before_module_kind in {"esm", "hybrid"}
+                or (size_ratio or 1.0) < 0.9
+            ):
+                reasons.append("import_binding_surface_changed")
+                details["missing_import_bindings"] = missing_import_bindings[:12]
 
         before_calls = set(before_signature.get("top_level_calls", []))
         after_calls = set(after_signature.get("top_level_calls", []))
@@ -161,6 +187,7 @@ def _javascript_semantic_signature(code: str, language: str) -> Dict[str, Any]:
         }
 
     imports: Set[str] = set()
+    import_bindings: Set[str] = set()
     exports: Set[str] = set()
     top_level_calls: Set[str] = set()
     local_symbols: Set[str] = set()
@@ -172,6 +199,7 @@ def _javascript_semantic_signature(code: str, language: str) -> Dict[str, Any]:
         _collect_javascript_semantics(
             statement,
             imports=imports,
+            import_bindings=import_bindings,
             exports=exports,
         )
         _collect_javascript_top_level_calls(
@@ -180,10 +208,21 @@ def _javascript_semantic_signature(code: str, language: str) -> Dict[str, Any]:
             local_symbols=local_symbols,
         )
 
+    module_flags = _javascript_module_signal_flags(program)
+    module_kind = "script"
+    if module_flags["esm"] and module_flags["commonjs"]:
+        module_kind = "hybrid"
+    elif module_flags["esm"]:
+        module_kind = "esm"
+    elif module_flags["commonjs"]:
+        module_kind = "commonjs"
+
     return {
         "available": True,
         "mode": "javascript_ast",
+        "module_kind": module_kind,
         "imports": _sorted_unique(imports),
+        "import_bindings": _sorted_unique(import_bindings),
         "exports": _sorted_unique(exports),
         "top_level_calls": _sorted_unique(top_level_calls),
         "local_symbols": _sorted_unique(local_symbols),
@@ -194,6 +233,7 @@ def _collect_javascript_semantics(
     node: Any,
     *,
     imports: Set[str],
+    import_bindings: Set[str],
     exports: Set[str],
 ) -> None:
     node_type = _javascript_node_type(node)
@@ -212,6 +252,7 @@ def _collect_javascript_semantics(
         source = _javascript_string_value(getattr(node, "source", None))
         if source:
             imports.add(source)
+            import_bindings.update(_javascript_import_binding_entries(node, source))
 
     if node_type == "ExportDefaultDeclaration":
         exports.add("default")
@@ -240,6 +281,17 @@ def _collect_javascript_semantics(
         if export_name:
             exports.add(export_name)
 
+    if node_type == "VariableDeclarator":
+        source = _javascript_require_source(getattr(node, "init", None))
+        if source:
+            imports.add(source)
+            import_bindings.update(
+                _javascript_require_binding_entries(
+                    getattr(node, "id", None),
+                    source,
+                )
+            )
+
     if node_type in {"CallExpression", "OptionalCallExpression", "NewExpression"}:
         callee_name = _javascript_callee_name(getattr(node, "callee", None))
         if callee_name:
@@ -253,8 +305,49 @@ def _collect_javascript_semantics(
         _collect_javascript_semantics(
             child,
             imports=imports,
+            import_bindings=import_bindings,
             exports=exports,
         )
+
+
+def _javascript_module_signal_flags(program: Any) -> Dict[str, bool]:
+    flags = {"esm": False, "commonjs": False}
+    for statement in getattr(program, "body", []) or []:
+        _collect_javascript_module_signals(statement, flags)
+    return flags
+
+
+def _collect_javascript_module_signals(node: Any, flags: Dict[str, bool]) -> None:
+    node_type = _javascript_node_type(node)
+    if not node_type:
+        return
+    if node_type in {
+        "FunctionDeclaration",
+        "FunctionExpression",
+        "ArrowFunctionExpression",
+        "ClassMethod",
+        "ObjectMethod",
+    }:
+        return
+
+    if node_type in {
+        "ImportDeclaration",
+        "ExportDefaultDeclaration",
+        "ExportNamedDeclaration",
+        "ExportAllDeclaration",
+    }:
+        flags["esm"] = True
+
+    if node_type == "AssignmentExpression":
+        if _javascript_commonjs_export_name(getattr(node, "left", None)):
+            flags["commonjs"] = True
+
+    if node_type == "VariableDeclarator":
+        if _javascript_require_source(getattr(node, "init", None)):
+            flags["commonjs"] = True
+
+    for child in _javascript_child_nodes(node):
+        _collect_javascript_module_signals(child, flags)
 
 
 def _javascript_child_nodes(node: Any) -> List[Any]:
@@ -436,6 +529,63 @@ def _javascript_declared_names(node: Any) -> List[str]:
             names.extend(_javascript_pattern_names(getattr(declaration, "id", None)))
         return names
     return []
+
+
+def _javascript_import_binding_entries(node: Any, source: str) -> List[str]:
+    entries: List[str] = []
+    specifiers = getattr(node, "specifiers", []) or []
+    for specifier in specifiers:
+        specifier_type = _javascript_node_type(specifier)
+        if specifier_type == "ImportDefaultSpecifier":
+            entries.append(f"default@{source}")
+        elif specifier_type == "ImportNamespaceSpecifier":
+            entries.append(f"namespace@{source}")
+        elif specifier_type == "ImportSpecifier":
+            imported = _javascript_name_value(getattr(specifier, "imported", None))
+            if imported:
+                entries.append(f"named:{imported}@{source}")
+            else:
+                entries.append(f"named@{source}")
+    if not entries:
+        entries.append(f"side_effect@{source}")
+    return entries
+
+
+def _javascript_require_source(node: Any) -> str:
+    node_type = _javascript_node_type(node)
+    if node_type not in {"CallExpression", "OptionalCallExpression"}:
+        return ""
+    callee_name = _javascript_callee_name(getattr(node, "callee", None)).lower()
+    if callee_name not in {"require", "module.require"}:
+        return ""
+    return _javascript_string_value(_first_argument(node))
+
+
+def _javascript_require_binding_entries(node: Any, source: str) -> List[str]:
+    node_type = _javascript_node_type(node)
+    if node_type == "Identifier":
+        return [f"default@{source}"]
+    if node_type == "ObjectPattern":
+        entries: List[str] = []
+        for prop in getattr(node, "properties", []) or []:
+            prop_type = _javascript_node_type(prop)
+            if prop_type == "RestElement":
+                entries.append(f"namespace@{source}")
+                continue
+            key_name = _javascript_property_name(
+                getattr(prop, "key", None),
+                computed=bool(getattr(prop, "computed", False)),
+            )
+            if key_name:
+                entries.append(f"named:{key_name}@{source}")
+        return entries or [f"default@{source}"]
+    if node_type == "ArrayPattern":
+        return [f"default@{source}"]
+    if node_type == "AssignmentPattern":
+        return _javascript_require_binding_entries(getattr(node, "left", None), source)
+    if node_type == "RestElement":
+        return _javascript_require_binding_entries(getattr(node, "argument", None), source)
+    return [f"default@{source}"]
 
 
 def _javascript_pattern_names(node: Any) -> List[str]:

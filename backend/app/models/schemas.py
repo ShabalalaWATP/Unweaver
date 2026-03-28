@@ -365,6 +365,34 @@ class ProviderSettingsResponse(BaseModel):
         return "*" * (len(raw) - 4) + raw[-4:]
 
 
+class ProviderBenchmarkScheduleResponse(BaseModel):
+    provider_id: str
+    scheduled: bool = False
+    reason: str = ""
+
+
+class ProviderBenchmarkRunResponse(BaseModel):
+    id: str
+    provider_id: Optional[str] = None
+    provider_name: str = ""
+    provider_model: str = ""
+    trigger_reason: str = ""
+    corpus_name: str = ""
+    corpus_version: str = ""
+    status: str = ""
+    llm_enabled: bool = False
+    case_count: int = 0
+    completed_case_count: int = 0
+    overall_score: Optional[float] = None
+    pass_rate: Optional[float] = None
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    results: List[Dict[str, Any]] = Field(default_factory=list)
+    error_text: Optional[str] = None
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    created_at: datetime
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  Analysis status (for progress polling)
 # ════════════════════════════════════════════════════════════════════════

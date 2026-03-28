@@ -309,10 +309,63 @@ class TestWorkspaceFileDeobfuscator:
         assert first.details["workspace_context"]["remaining_supported_file_count"] == 2
         assert first.details["workspace_context"]["workspace_pass_index"] == 1
 
-        assert second.success is True
+        assert second.success is False
         assert second.output == first.output
+        assert second.details["skipped"] is True
+        assert second.details["coverage_only"] is True
         assert second.details["coverage_advanced"] is True
         assert second.details["workspace_context"]["latest_targeted_file_count"] == 2
         assert second.details["workspace_context"]["targeted_file_count"] == 4
         assert second.details["workspace_context"]["remaining_supported_file_count"] == 0
         assert second.details["workspace_context"]["workspace_pass_index"] == 2
+
+    def test_prioritizes_dependency_package_before_consumer_package_in_monorepo(self):
+        bundle = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: mono.zip\n"
+            "included_files: 6\n"
+            "omitted_files: 0\n"
+            "languages: javascript=4, json=2\n"
+            "entry_points: apps/web/src/main.js\n"
+            "suspicious_files: packages/shared/src/decode.js\n"
+            "manifest_files: apps/web/package.json | packages/shared/package.json\n"
+            "root_dirs: apps | packages\n"
+            "package_roots: apps/web | packages/shared\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="apps/web/package.json" language="json" priority="manifest" size=70>>>\n'
+            '{"name":"@repo/web","dependencies":{"@repo/shared":"workspace:*"}}\n'
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="apps/web/src/main.js" language="javascript" priority="entrypoint" size=88>>>\n'
+            'import { decodeValue } from "@repo/shared";\n'
+            "console.log(decodeValue());\n"
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="apps/web/src/view.js" language="javascript" priority="normal" size=42>>>\n'
+            "export const page = 'web';\n"
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="packages/shared/package.json" language="json" priority="manifest" size=52>>>\n'
+            '{"name":"@repo/shared","main":"src/index.js"}\n'
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="packages/shared/src/index.js" language="javascript" priority="normal" size=72>>>\n'
+            "export { decodeValue } from './decode.js';\n"
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="packages/shared/src/decode.js" language="javascript" priority="suspicious" size=76>>>\n'
+            "export function decodeValue(){\n"
+            "  return String.fromCharCode(72, 105);\n"
+            "}\n"
+            "<<<END FILE>>>\n"
+        )
+
+        profile = WorkspaceProfiler().apply(bundle, "workspace", {})
+        files = parse_workspace_bundle(bundle)
+
+        with patch.object(WorkspaceFileDeobfuscator, "_MAX_TARGET_FILES", 2):
+            selected = WorkspaceFileDeobfuscator()._select_target_paths(
+                source_files=files,
+                bundled_files=files,
+                state={"workspace_context": profile.details["workspace_context"]},
+            )
+
+        assert selected[:2] == [
+            "packages/shared/src/index.js",
+            "packages/shared/src/decode.js",
+        ]

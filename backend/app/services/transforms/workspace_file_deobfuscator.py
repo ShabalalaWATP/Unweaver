@@ -392,10 +392,12 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         source_lookup = {file.path: file for file in source_files}
         path_set = set(source_lookup)
         python_modules = _build_python_module_index(source_files)
+        local_package_index = state.get("workspace_context", {}).get("local_package_index", {})
         symbol_literals = self._build_workspace_literal_index(
             files=source_files,
             path_set=path_set,
             python_modules=python_modules,
+            local_package_index=local_package_index,
         )
         rewritten_files: List[ParsedWorkspaceFile] = []
         changed_files: List[str] = []
@@ -414,6 +416,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                 path_set=path_set,
                 python_modules=python_modules,
                 symbol_literals=symbol_literals,
+                local_package_index=local_package_index,
             )
             transformed_file, summary, details, additions = self._process_file(
                 file=file,
@@ -452,6 +455,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                 path_set=path_set,
                 python_modules=python_modules,
                 symbol_literals=symbol_literals,
+                local_package_index=local_package_index,
             )
             transformed_file, summary, details, additions = self._process_file(
                 file=file,
@@ -493,7 +497,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                 symbol_literals=symbol_literals,
             )
             return TransformResult(
-                success=True,
+                success=False,
                 output=code,
                 confidence=0.0,
                 description=(
@@ -501,6 +505,8 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                     "no additional safe file-level rewrites were produced in this batch."
                 ),
                 details={
+                    "skipped": True,
+                    "coverage_only": True,
                     "coverage_advanced": bool(target_paths),
                     "targeted_files": target_paths,
                     "file_transform_summary": file_transform_summary,
@@ -688,17 +694,45 @@ class WorkspaceFileDeobfuscator(BaseTransform):
 
         package_roots = [
             str(root).strip()
-            for root in (context.get("package_roots", []) or context.get("root_dirs", []))
+            for root in (
+                context.get("package_priority_roots", [])
+                or context.get("package_roots", [])
+                or context.get("root_dirs", [])
+            )
             if str(root).strip()
         ]
+        package_priority_roots = [
+            str(root).strip()
+            for root in context.get("package_priority_roots", [])
+            if str(root).strip()
+        ]
+        package_entry_points_by_root = {
+            str(root).strip(): [
+                str(path).strip()
+                for path in paths
+                if str(path).strip()
+            ]
+            for root, paths in (context.get("package_entry_points_by_root", {}) or {}).items()
+            if str(root).strip()
+        }
+        package_hotspot_paths_by_root = {
+            str(root).strip(): [
+                str(path).strip()
+                for path in paths
+                if str(path).strip()
+            ]
+            for root, paths in (context.get("package_hotspot_paths_by_root", {}) or {}).items()
+            if str(root).strip()
+        }
         ordered_package_roots = _dedupe_preserve_order(
-            [
-                _workspace_package_root_for_path(path, package_roots)
+            package_priority_roots
+            + [
+                _workspace_package_root_for_path(path, package_roots or package_priority_roots)
                 for path in ranked_unprocessed
             ]
             + package_roots
             + [
-                _workspace_package_root_for_path(path, package_roots)
+                _workspace_package_root_for_path(path, package_roots or package_priority_roots)
                 for path in supported_paths
                 if path not in processed_paths
             ]
@@ -707,13 +741,36 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         for path in supported_paths:
             if path in processed_paths:
                 continue
-            package_root = _workspace_package_root_for_path(path, ordered_package_roots or package_roots)
+            package_root = _workspace_package_root_for_path(
+                path,
+                ordered_package_roots or package_priority_roots or package_roots,
+            )
             remaining_by_package.setdefault(package_root, []).append(path)
 
-        def _path_sort_key(path: str) -> Tuple[int, int, str, str]:
-            package_root = _workspace_package_root_for_path(path, ordered_package_roots or package_roots)
+        root_rank = {
+            root: index
+            for index, root in enumerate(ordered_package_roots)
+        }
+        package_focus_rank: Dict[str, int] = {}
+        focus_index = 0
+        for root in ordered_package_roots:
+            for path in (
+                package_entry_points_by_root.get(root, [])
+                + package_hotspot_paths_by_root.get(root, [])
+            ):
+                if path not in package_focus_rank:
+                    package_focus_rank[path] = focus_index
+                    focus_index += 1
+
+        def _path_sort_key(path: str) -> Tuple[int, int, int, int, str, str]:
+            package_root = _workspace_package_root_for_path(
+                path,
+                ordered_package_roots or package_priority_roots or package_roots,
+            )
             return (
                 0 if path in bundled_path_set else 1,
+                root_rank.get(package_root, 100_000),
+                package_focus_rank.get(path, 100_000),
                 priority_rank.get(path, 100_000),
                 package_root,
                 path,
@@ -729,8 +786,26 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             bucket.sort(key=_path_sort_key)
             package_sweep.extend(bucket)
 
+        package_seed_paths: List[str] = []
+        for root in ordered_package_roots:
+            package_seed_paths.extend(package_entry_points_by_root.get(root, []))
+            package_seed_paths.extend(package_hotspot_paths_by_root.get(root, []))
+            package_seed_paths.extend(sorted(
+                (
+                    path
+                    for path in supported_paths
+                    if path not in processed_paths
+                    and _workspace_package_root_for_path(
+                        path,
+                        ordered_package_roots or package_priority_roots or package_roots,
+                    ) == root
+                ),
+                key=_path_sort_key,
+            ))
+
         candidate_paths = _dedupe_preserve_order(
-            ranked_unprocessed
+            package_seed_paths
+            + ranked_unprocessed
             + package_sweep
         )
         if not candidate_paths and processed_paths:
@@ -904,6 +979,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         files: Sequence[ParsedWorkspaceFile],
         path_set: set[str],
         python_modules: Dict[str, str],
+        local_package_index: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Dict[str, Any]]:
         symbol_literals: Dict[str, Dict[str, Any]] = {
             file.path: extract_literal_bindings(file.text, file.language)
@@ -921,6 +997,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
                     path_set=path_set,
                     python_modules=python_modules,
                     symbol_literals=symbol_literals,
+                    local_package_index=local_package_index,
                 )
                 updated = extract_literal_bindings(
                     file.text,
@@ -942,6 +1019,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
         path_set: set[str],
         python_modules: Dict[str, str],
         symbol_literals: Dict[str, Dict[str, Any]],
+        local_package_index: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
         if file.language not in {"javascript", "typescript", "python"}:
             return {}
@@ -950,6 +1028,7 @@ class WorkspaceFileDeobfuscator(BaseTransform):
             file=file,
             path_set=path_set,
             python_modules=python_modules,
+            local_package_index=local_package_index,
         )
         imported: Dict[str, Any] = {}
         for local_name, info in binding_map.items():

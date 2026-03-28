@@ -27,6 +27,7 @@ Your task:
 2. Describe the unwrapping order from outermost to innermost layer.
 3. Attempt to decode/unwrap as many layers as you can.
 4. If you find a payload hidden inside the layers, include it.
+5. Preserve module imports, exports, and top-level side effects when presenting an unwrapped result.
 
 For hard JavaScript samples, explicitly look for:
 - javascript-obfuscator style string tables and resolver helpers
@@ -117,6 +118,7 @@ class LLMMultiLayerUnwrapper(LLMTransform):
         lang = language or state.get("language", "unknown")
         context = self.build_state_context(state, code=code)
         workspace = self.build_workspace_context(code)
+        guardrails = self.build_semantic_guardrails(code, str(lang))
 
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -126,6 +128,7 @@ class LLMMultiLayerUnwrapper(LLMTransform):
                     f"Detect and unwrap any layered obfuscation.\n\n"
                     f"Declared language: {lang}\n"
                     f"{context}\n\n"
+                    + (f"Behavioral guardrails:\n{guardrails}\n\n" if guardrails else "")
                     + (f"Workspace context:\n{workspace}\n\n" if workspace else "")
                     + (
                     f"```\n{truncated}\n```"

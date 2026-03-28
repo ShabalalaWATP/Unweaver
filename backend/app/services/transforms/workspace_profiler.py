@@ -8,6 +8,7 @@ can reason about a workspace as a set of files instead of a flat blob.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path, PurePosixPath
@@ -267,6 +268,33 @@ def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
     return ordered
 
 
+def _workspace_package_root_for_path(path: str, package_roots: Sequence[str]) -> str:
+    value = str(path).strip()
+    if not value:
+        return ""
+
+    normalized_roots = sorted(
+        (
+            str(root).strip()
+            for root in package_roots
+            if str(root).strip()
+        ),
+        key=len,
+        reverse=True,
+    )
+    for root in normalized_roots:
+        if value == root or value.startswith(f"{root}/"):
+            return root
+
+    pure = PurePosixPath(value)
+    parts = pure.parts
+    if len(parts) >= 2 and parts[0].lower() in {"apps", "packages", "services", "libs", "modules"}:
+        return "/".join(parts[:2])
+    if parts:
+        return parts[0]
+    return value
+
+
 def _build_python_module_index(files: Sequence[ParsedWorkspaceFile]) -> Dict[str, str]:
     index: Dict[str, str] = {}
     for file in files:
@@ -319,6 +347,417 @@ def _match_by_suffix(candidate: str, path_set: set[str]) -> Optional[str]:
     return None
 
 
+def _safe_json_object(text: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _relative_workspace_reference_candidates(package_root: str, raw_value: str) -> List[str]:
+    cleaned = _clean_import_target(raw_value)
+    if (
+        not cleaned
+        or cleaned.startswith("/")
+        or cleaned.startswith("#")
+        or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", cleaned)
+    ):
+        return []
+
+    relative = cleaned[2:] if cleaned.startswith("./") else cleaned
+    if not relative:
+        return []
+
+    base = PurePosixPath(package_root).joinpath(relative).as_posix() if package_root else relative
+    candidates = [base]
+    if not PurePosixPath(base).suffix:
+        for ext in _JS_TS_EXTENSIONS:
+            candidates.append(f"{base}{ext}")
+        for ext in _JS_TS_EXTENSIONS:
+            candidates.append(f"{base}/index{ext}")
+    return _dedupe_preserve_order(candidates)
+
+
+def _iter_manifest_string_values(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_manifest_string_values(nested)
+        return
+    if isinstance(value, list):
+        for nested in value:
+            yield from _iter_manifest_string_values(nested)
+
+
+def _package_entry_specs_from_manifest(manifest: Dict[str, Any]) -> List[str]:
+    specs: List[str] = []
+    for key in ("source", "module", "main", "browser"):
+        value = manifest.get(key)
+        if isinstance(value, str):
+            specs.append(value)
+
+    exports_value = manifest.get("exports")
+    specs.extend(_iter_manifest_string_values(exports_value))
+
+    bin_value = manifest.get("bin")
+    if isinstance(bin_value, str):
+        specs.append(bin_value)
+    elif isinstance(bin_value, dict):
+        specs.extend(
+            str(item)
+            for item in bin_value.values()
+            if isinstance(item, str)
+        )
+
+    return _dedupe_preserve_order(specs)
+
+
+def _resolve_package_entry_paths(
+    *,
+    package_root: str,
+    manifest: Dict[str, Any],
+    path_set: set[str],
+    supported_paths: Sequence[str],
+) -> List[str]:
+    resolved: List[str] = []
+
+    for spec in _package_entry_specs_from_manifest(manifest):
+        for candidate in _relative_workspace_reference_candidates(package_root, spec):
+            matched = _match_by_suffix(candidate, path_set)
+            if matched:
+                resolved.append(matched)
+
+    if resolved:
+        return _dedupe_preserve_order(resolved)
+
+    fallback_specs = (
+        "src/index.ts",
+        "src/index.tsx",
+        "src/index.js",
+        "src/index.jsx",
+        "index.ts",
+        "index.tsx",
+        "index.js",
+        "index.jsx",
+        "lib/index.js",
+        "dist/index.js",
+    )
+    for spec in fallback_specs:
+        for candidate in _relative_workspace_reference_candidates(package_root, spec):
+            matched = _match_by_suffix(candidate, path_set)
+            if matched:
+                resolved.append(matched)
+
+    if resolved:
+        return _dedupe_preserve_order(resolved)
+
+    package_prefix = f"{package_root}/" if package_root else ""
+    return [
+        path
+        for path in supported_paths
+        if (not package_prefix or path.startswith(package_prefix))
+    ][:3]
+
+
+def _resolve_package_name_import(
+    *,
+    raw_import: str,
+    path_set: set[str],
+    local_package_index: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+    cleaned = _clean_import_target(raw_import)
+    if not cleaned:
+        return None
+
+    direct = local_package_index.get(cleaned)
+    if isinstance(direct, dict):
+        entry_points = [
+            str(path).strip()
+            for path in direct.get("entry_points", [])
+            if str(path).strip()
+        ]
+        for entry_path in entry_points:
+            matched = _match_by_suffix(entry_path, path_set)
+            if matched:
+                return matched
+
+    for package_name, info in local_package_index.items():
+        if cleaned == package_name or not cleaned.startswith(f"{package_name}/"):
+            continue
+        package_root = str(info.get("root", "")).strip()
+        if not package_root:
+            continue
+        subpath = cleaned[len(package_name) + 1 :]
+        for candidate in _relative_workspace_reference_candidates(package_root, subpath):
+            matched = _match_by_suffix(candidate, path_set)
+            if matched:
+                return matched
+        for candidate in _relative_workspace_reference_candidates(package_root, f"src/{subpath}"):
+            matched = _match_by_suffix(candidate, path_set)
+            if matched:
+                return matched
+
+    return None
+
+
+def _order_package_roots(
+    *,
+    package_infos: Dict[str, Dict[str, Any]],
+    root_hints: Sequence[str],
+) -> List[str]:
+    if not package_infos:
+        return []
+
+    package_scores = {
+        root: float(info.get("priority_score") or 0.0)
+        for root, info in package_infos.items()
+    }
+    dependency_edges = {
+        root: [
+            dependency_root
+            for dependency_root in info.get("local_dependency_roots", [])
+            if dependency_root in package_infos and dependency_root != root
+        ]
+        for root, info in package_infos.items()
+    }
+    ordered_roots = _dedupe_preserve_order(
+        list(root_hints)
+        + sorted(
+            package_infos,
+            key=lambda root: (-package_scores.get(root, 0.0), root),
+        )
+    )
+    visited: set[str] = set()
+    active: set[str] = set()
+    result: List[str] = []
+
+    def visit(root: str) -> None:
+        if root in visited or root not in package_infos:
+            return
+        if root in active:
+            return
+        active.add(root)
+        for dependency_root in sorted(
+            dependency_edges.get(root, []),
+            key=lambda item: (-package_scores.get(item, 0.0), item),
+        ):
+            visit(dependency_root)
+        active.remove(root)
+        visited.add(root)
+        result.append(root)
+
+    for root in ordered_roots:
+        visit(root)
+    return result
+
+
+def _extract_workspace_packages(
+    *,
+    files: Sequence[ParsedWorkspaceFile],
+    package_roots: Sequence[str],
+    supported_paths: Sequence[str],
+    entry_points: Sequence[str],
+    suspicious_files: Sequence[str],
+    prioritized_files: Sequence[Dict[str, Any]],
+    path_set: set[str],
+) -> Dict[str, Any]:
+    prioritized_score_by_path = {
+        str(item.get("path", "")).strip(): float(item.get("score") or 0.0)
+        for item in prioritized_files
+        if isinstance(item, dict) and str(item.get("path", "")).strip()
+    }
+    prioritized_roots = _dedupe_preserve_order(
+        _workspace_package_root_for_path(path, package_roots)
+        for path in (
+            list(entry_points)
+            + list(suspicious_files)
+            + list(prioritized_score_by_path)
+        )
+        if str(path).strip()
+    )
+
+    package_infos: Dict[str, Dict[str, Any]] = {}
+    package_name_index: Dict[str, Dict[str, Any]] = {}
+
+    for file in files:
+        if PurePosixPath(file.path).name.lower() != "package.json":
+            continue
+        manifest = _safe_json_object(file.text)
+        if not manifest:
+            continue
+
+        manifest_root = PurePosixPath(file.path).parent.as_posix()
+        manifest_root = "" if manifest_root == "." else manifest_root
+        package_root = (
+            _workspace_package_root_for_path(manifest_root, package_roots)
+            if manifest_root
+            else ""
+        )
+        supported_in_package = [
+            path
+            for path in supported_paths
+            if (
+                (not package_root)
+                or path == package_root
+                or path.startswith(f"{package_root}/")
+            )
+        ]
+        if not supported_in_package and manifest.get("workspaces"):
+            continue
+
+        package_name = str(manifest.get("name") or "").strip()
+        package_entry_points = _resolve_package_entry_paths(
+            package_root=package_root,
+            manifest=manifest,
+            path_set=path_set,
+            supported_paths=supported_in_package,
+        )
+        package_hotspots = _dedupe_preserve_order(
+            package_entry_points
+            + [
+                path
+                for path in list(entry_points) + list(suspicious_files) + list(prioritized_score_by_path)
+                if _workspace_package_root_for_path(path, package_roots) == package_root
+            ]
+            + supported_in_package[:6]
+        )[:8]
+        package_infos[package_root] = {
+            "root": package_root,
+            "name": package_name or package_root,
+            "manifest_path": file.path,
+            "entry_points": package_entry_points,
+            "hotspot_paths": package_hotspots,
+            "supported_file_count": len(supported_in_package),
+            "suspicious_file_count": sum(
+                1
+                for path in suspicious_files
+                if _workspace_package_root_for_path(path, package_roots) == package_root
+            ),
+            "entrypoint_file_count": sum(
+                1
+                for path in entry_points
+                if _workspace_package_root_for_path(path, package_roots) == package_root
+            ),
+            "top_file_score": round(
+                sum(
+                    prioritized_score_by_path.get(path, 0.0)
+                    for path in package_hotspots[:3]
+                ),
+                2,
+            ),
+            "manifest": manifest,
+        }
+        if package_name:
+            package_name_index[package_name] = {
+                "root": package_root,
+                "manifest_path": file.path,
+                "entry_points": package_entry_points,
+            }
+
+    if not package_infos:
+        return {
+            "workspace_packages": [],
+            "package_dependency_edges": [],
+            "package_priority_roots": [],
+            "package_dependency_hotspots": [],
+            "package_entry_points_by_root": {},
+            "package_hotspot_paths_by_root": {},
+            "local_package_index": {},
+        }
+
+    package_edges: List[Dict[str, Any]] = []
+    dependent_counts: Counter[str] = Counter()
+    for package_root, info in package_infos.items():
+        manifest = info.get("manifest", {})
+        local_dependency_names = _dedupe_preserve_order(
+            dependency_name
+            for section_name in (
+                "dependencies",
+                "devDependencies",
+                "peerDependencies",
+                "optionalDependencies",
+            )
+            for dependency_name in (
+                (manifest.get(section_name) or {}).keys()
+                if isinstance(manifest.get(section_name), dict)
+                else []
+            )
+            if dependency_name in package_name_index
+            and package_name_index[dependency_name]["root"] != package_root
+        )
+        local_dependency_roots = [
+            str(package_name_index[dependency_name]["root"]).strip()
+            for dependency_name in local_dependency_names
+        ]
+        for dependency_name, dependency_root in zip(local_dependency_names, local_dependency_roots):
+            package_edges.append(
+                {
+                    "source_root": package_root,
+                    "source_name": info.get("name", package_root),
+                    "target_root": dependency_root,
+                    "target_name": dependency_name,
+                    "kind": "workspace_local",
+                }
+            )
+            dependent_counts[dependency_root] += 1
+        info["local_dependency_names"] = local_dependency_names
+        info["local_dependency_roots"] = _dedupe_preserve_order(local_dependency_roots)
+
+    for package_root, info in package_infos.items():
+        dependent_count = int(dependent_counts.get(package_root, 0))
+        local_dependency_count = len(info.get("local_dependency_roots", []))
+        priority_score = (
+            dependent_count * 3.1
+            + float(info.get("suspicious_file_count") or 0) * 2.2
+            + float(info.get("entrypoint_file_count") or 0) * 1.8
+            + min(float(info.get("top_file_score") or 0.0) * 0.2, 5.0)
+            + min(float(info.get("supported_file_count") or 0) * 0.18, 1.8)
+        )
+        info["dependent_count"] = dependent_count
+        info["local_dependency_count"] = local_dependency_count
+        info["priority_score"] = round(priority_score, 2)
+
+    ordered_package_roots = _order_package_roots(
+        package_infos=package_infos,
+        root_hints=prioritized_roots + list(package_roots),
+    )
+    workspace_packages = [
+        {
+            key: value
+            for key, value in info.items()
+            if key != "manifest"
+        }
+        for root in ordered_package_roots
+        for info in [package_infos[root]]
+    ]
+
+    return {
+        "workspace_packages": workspace_packages[:24],
+        "package_dependency_edges": package_edges[:96],
+        "package_priority_roots": ordered_package_roots[:24],
+        "package_dependency_hotspots": [
+            root
+            for root in ordered_package_roots
+            if int(package_infos[root].get("dependent_count") or 0)
+            or int(package_infos[root].get("suspicious_file_count") or 0)
+        ][:16],
+        "package_entry_points_by_root": {
+            root: list(package_infos[root].get("entry_points", []))[:8]
+            for root in ordered_package_roots
+            if package_infos[root].get("entry_points")
+        },
+        "package_hotspot_paths_by_root": {
+            root: list(package_infos[root].get("hotspot_paths", []))[:8]
+            for root in ordered_package_roots
+            if package_infos[root].get("hotspot_paths")
+        },
+        "local_package_index": package_name_index,
+    }
+
+
 def _resolve_python_import(
     *,
     source_path: str,
@@ -364,6 +803,7 @@ def _resolve_import_target(
     language: str,
     path_set: set[str],
     python_modules: Dict[str, str],
+    local_package_index: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[str]:
     cleaned = _clean_import_target(raw_import)
     if not cleaned:
@@ -373,6 +813,14 @@ def _resolve_import_target(
     if lang in {"javascript", "typescript"}:
         for candidate in _candidate_js_paths(source_path, cleaned):
             matched = _match_by_suffix(candidate, path_set)
+            if matched:
+                return matched
+        if local_package_index:
+            matched = _resolve_package_name_import(
+                raw_import=cleaned,
+                path_set=path_set,
+                local_package_index=local_package_index,
+            )
             if matched:
                 return matched
         return None
@@ -498,6 +946,7 @@ def _extract_import_metadata(
     file: ParsedWorkspaceFile,
     path_set: set[str],
     python_modules: Dict[str, str],
+    local_package_index: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     imports: List[str] = []
     import_edges: List[Dict[str, Any]] = []
@@ -521,6 +970,7 @@ def _extract_import_metadata(
             language=file.language,
             path_set=path_set,
             python_modules=python_modules,
+            local_package_index=local_package_index,
         )
         key = (cleaned, resolved, binding_name, source_symbol, kind)
         if key not in seen_import_keys:
@@ -802,6 +1252,12 @@ class WorkspaceProfiler(BaseTransform):
         path_set = {file.path for file in files}
         bundled_path_set = {file.path for file in bundled_files}
         python_modules = _build_python_module_index(files)
+        supported_paths = [
+            file.path
+            for file in files
+            if file.language in WORKSPACE_DEOBFUSCATION_LANGUAGES
+        ]
+        package_roots = list(context.get("package_roots", []) or context.get("root_dirs", []))
         imports: List[str] = []
         import_edges: List[Dict[str, Any]] = []
         functions: List[str] = []
@@ -821,22 +1277,6 @@ class WorkspaceProfiler(BaseTransform):
 
         for file in files:
             evidence_references.append(file.path)
-            file_imports, file_import_edges, binding_map = _extract_import_metadata(
-                file=file,
-                path_set=path_set,
-                python_modules=python_modules,
-            )
-            imports.extend(file_imports)
-            import_edges.extend(file_import_edges)
-            for edge in file_import_edges:
-                if edge["kind"] == "local" and edge.get("resolved"):
-                    dependency_key = (file.path, str(edge["resolved"]))
-                    if dependency_key in counted_local_dependencies:
-                        continue
-                    counted_local_dependencies.add(dependency_key)
-                    local_outbound[file.path] += 1
-                    local_inbound[str(edge["resolved"])] += 1
-
             defined_symbols = _extract_defined_symbols(file)
             exported_symbols = _extract_exported_symbols(file)
             defined_symbols_by_file[file.path] = defined_symbols
@@ -853,20 +1293,6 @@ class WorkspaceProfiler(BaseTransform):
             obfuscation_hits, _ = _count_pattern_hits(_OBFUSCATION_SIGNAL_PATTERNS, file.text)
             if obfuscation_hits:
                 obfuscation_signal_counts[file.path] += obfuscation_hits
-
-            file_call_edges = _extract_cross_file_call_edges(
-                file=file,
-                binding_map=binding_map,
-            )
-            cross_file_call_edges.extend(file_call_edges)
-            for edge in file_call_edges:
-                source = str(edge.get("source", "")).strip()
-                target = str(edge.get("target", "")).strip()
-                count = int(edge.get("count", 1) or 1)
-                if source:
-                    call_outbound[source] += count
-                if target:
-                    call_inbound[target] += count
 
         root_dirs = list(context.get("root_dirs", []))
         entry_points = list(context.get("entry_points", []))
@@ -898,6 +1324,86 @@ class WorkspaceProfiler(BaseTransform):
             ),
             key=lambda item: (-float(item["score"]), item["path"]),
         )[:32]
+        package_summary = _extract_workspace_packages(
+            files=files,
+            package_roots=package_roots,
+            supported_paths=supported_paths,
+            entry_points=entry_points,
+            suspicious_files=suspicious_files,
+            prioritized_files=prioritized_files,
+            path_set=path_set,
+        )
+        local_package_index = package_summary["local_package_index"]
+
+        imports.clear()
+        import_edges.clear()
+        local_inbound.clear()
+        local_outbound.clear()
+        call_inbound.clear()
+        call_outbound.clear()
+        cross_file_call_edges.clear()
+        counted_local_dependencies.clear()
+
+        for file in files:
+            file_imports, file_import_edges, binding_map = _extract_import_metadata(
+                file=file,
+                path_set=path_set,
+                python_modules=python_modules,
+                local_package_index=local_package_index,
+            )
+            imports.extend(file_imports)
+            import_edges.extend(file_import_edges)
+            for edge in file_import_edges:
+                if edge["kind"] == "local" and edge.get("resolved"):
+                    dependency_key = (file.path, str(edge["resolved"]))
+                    if dependency_key in counted_local_dependencies:
+                        continue
+                    counted_local_dependencies.add(dependency_key)
+                    local_outbound[file.path] += 1
+                    local_inbound[str(edge["resolved"])] += 1
+
+            file_call_edges = _extract_cross_file_call_edges(
+                file=file,
+                binding_map=binding_map,
+            )
+            cross_file_call_edges.extend(file_call_edges)
+            for edge in file_call_edges:
+                source = str(edge.get("source", "")).strip()
+                target = str(edge.get("target", "")).strip()
+                count = int(edge.get("count", 1) or 1)
+                if source:
+                    call_outbound[source] += count
+                if target:
+                    call_inbound[target] += count
+
+        prioritized_files = sorted(
+            (
+                _summarise_priority(
+                    file,
+                    entry_points=set(entry_points),
+                    suspicious_files=set(suspicious_files),
+                    outbound_local=local_outbound[file.path],
+                    inbound_local=local_inbound[file.path],
+                    outbound_calls=call_outbound[file.path],
+                    inbound_calls=call_inbound[file.path],
+                    suspicious_api_hits=suspicious_api_counts[file.path],
+                    obfuscation_hits=obfuscation_signal_counts[file.path],
+                    function_count=function_counts[file.path],
+                    exported_symbol_count=len(exported_symbols_by_file.get(file.path, [])),
+                )
+                for file in files
+            ),
+            key=lambda item: (-float(item["score"]), item["path"]),
+        )[:32]
+        package_summary = _extract_workspace_packages(
+            files=files,
+            package_roots=package_roots,
+            supported_paths=supported_paths,
+            entry_points=entry_points,
+            suspicious_files=suspicious_files,
+            prioritized_files=prioritized_files,
+            path_set=path_set,
+        )
 
         dependency_hotspots = [
             item["path"]
@@ -958,6 +1464,10 @@ class WorkspaceProfiler(BaseTransform):
             detected_techniques.append("cross_file_call_graph")
         if dependency_hotspots or symbol_hotspots:
             detected_techniques.append("workspace_hotspots_ranked")
+        if package_summary["workspace_packages"]:
+            detected_techniques.append("package_manifest_profiled")
+        if package_summary["package_dependency_edges"]:
+            detected_techniques.append("monorepo_package_graph")
 
         summary_parts = [
             f"Workspace codebase with {len(files)} indexed file(s)",
@@ -965,6 +1475,14 @@ class WorkspaceProfiler(BaseTransform):
             f"{len(suspicious_files)} suspicious file(s)",
             f"{len(local_edges)} local dependency edge(s)",
         ]
+        if package_summary["workspace_packages"]:
+            summary_parts.append(
+                f"{len(package_summary['workspace_packages'])} workspace package(s)"
+            )
+        if package_summary["package_dependency_edges"]:
+            summary_parts.append(
+                f"{len(package_summary['package_dependency_edges'])} package dependency edge(s)"
+            )
         if archive_files:
             summary_parts.append(f"{len(bundled_files)} file(s) currently bundled")
         if cross_file_call_edges:
@@ -986,12 +1504,6 @@ class WorkspaceProfiler(BaseTransform):
             for item in prioritized_files[:32]
             if str(item.get("language", "")).strip() in WORKSPACE_DEOBFUSCATION_LANGUAGES
         )
-        supported_paths = [
-            file.path
-            for file in files
-            if file.language in WORKSPACE_DEOBFUSCATION_LANGUAGES
-        ]
-        package_roots = list(context.get("package_roots", []) or context.get("root_dirs", []))
         remaining_supported_preview = _dedupe_preserve_order(
             [
                 item["path"]
@@ -1055,11 +1567,21 @@ class WorkspaceProfiler(BaseTransform):
             "external_dependency_count": len(external_edges),
             "cross_file_call_count": len(cross_file_call_edges),
             "package_roots": context.get("package_roots", []),
+            "workspace_packages": package_summary["workspace_packages"],
+            "package_dependency_edges": package_summary["package_dependency_edges"],
+            "package_priority_roots": package_summary["package_priority_roots"],
+            "package_dependency_hotspots": package_summary["package_dependency_hotspots"],
+            "package_entry_points_by_root": package_summary["package_entry_points_by_root"],
+            "package_hotspot_paths_by_root": package_summary["package_hotspot_paths_by_root"],
+            "local_package_index": package_summary["local_package_index"],
             "processed_supported_file_count": 0,
             "remaining_supported_file_count": len(supported_paths),
             "remaining_supported_paths_preview": remaining_supported_preview,
             "processed_package_count": 0,
-            "remaining_package_roots": package_roots[:12],
+            "remaining_package_roots": (
+                package_summary["package_priority_roots"][:12]
+                or package_roots[:12]
+            ),
             "workspace_pass_index": 0,
             "workspace_pass_count_estimate": workspace_pass_count_estimate,
             "unbundled_hotspots": expansion_candidates[:12],
@@ -1071,6 +1593,8 @@ class WorkspaceProfiler(BaseTransform):
                 "cross_file_calls": len(cross_file_call_edges),
                 "execution_paths": len(execution_paths),
                 "bundle_expansion_candidates": len(expansion_candidates),
+                "workspace_packages": len(package_summary["workspace_packages"]),
+                "package_dependency_edges": len(package_summary["package_dependency_edges"]),
                 "hotspots": _dedupe_preserve_order(dependency_hotspots + symbol_hotspots)[:8],
             },
         }

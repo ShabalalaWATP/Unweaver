@@ -12,6 +12,7 @@ These tests verify that:
 from __future__ import annotations
 
 import base64
+import json
 import marshal
 import shutil
 
@@ -37,6 +38,7 @@ from app.services.analysis.orchestrator import (
 )
 from app.services.analysis.state_manager import StateManager
 from app.services.transforms.base import TransformResult
+from tests.test_llm_transforms import FakeLLMClient
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -856,6 +858,50 @@ class TestPlannerLLMGating:
 
 
 class TestStopDecisionResiduals:
+    def test_workspace_sufficiency_uses_coverage_adjusted_confidence(self):
+        code = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: repo.zip\n"
+            "included_files: 1\n"
+            "omitted_files: 0\n"
+            "languages: javascript=1\n"
+            "entry_points: src/main.js\n"
+            "suspicious_files: none\n"
+            "manifest_files: none\n"
+            "root_dirs: src\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="src/main.js" language="javascript" priority="entrypoint" size=19>>>\n'
+            "console.log('ok');\n"
+            "<<<END FILE>>>\n"
+        )
+        sm = StateManager("stop-workspace-coverage", code, language="workspace")
+        sm.advance_iteration()
+        sm.update_confidence(overall=0.95)
+        sm.merge_workspace_context(
+            {
+                "supported_file_count": 10,
+                "targeted_file_count": 1,
+                "remaining_supported_file_count": 9,
+                "supported_bundle_coverage_ratio": 0.1,
+                "targeted_supported_ratio": 0.1,
+                "analysis_frontier_completion_ratio": 0.0,
+                "remaining_frontier_paths": ["src/other.js"],
+            }
+        )
+        q = ActionQueue()
+        q.enqueue("extract_strings", confidence=0.4)
+        decision = StopDecision(sufficiency_threshold=0.85)
+
+        verdict = decision.evaluate(
+            sm,
+            q,
+            last_transform_success=True,
+            improvement_score=0.0,
+        )
+
+        assert verdict.action == StopAction.CONTINUE
+        assert "sufficiently deobfuscated" not in verdict.reason.lower()
+
     def test_does_not_stop_when_high_confidence_but_residual_markers_remain(self):
         sm = StateManager(
             "stop-residual",
@@ -1518,3 +1564,81 @@ class TestOrchestratorDecoderCoverage:
         actions = [item.action for item in result.transform_history]
         assert "python_decode" in actions
         assert 'print("hi")' in result.deobfuscated_code
+
+    @pytest.mark.asyncio
+    async def test_shadow_llm_only_candidate_can_replace_final_output(self):
+        code = "console.log(atob('aGk='));"
+        client = FakeLLMClient(
+            [
+                json.dumps(
+                    {
+                        "cleaned_code": 'const message = "hi";\nconsole.log(message);\n',
+                        "decoded_artifacts": ["hi"],
+                        "remaining_uncertainties": [],
+                        "confidence": 0.86,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "choice": "llm_only",
+                        "reason": "The LLM-only candidate resolves runtime decoding while preserving behavior.",
+                        "scores": {
+                            "pipeline": 0.31,
+                            "llm_only": 0.83,
+                        },
+                    }
+                ),
+            ]
+        )
+
+        result = await Orchestrator(
+            sample_id="shadow-llm-js",
+            original_code=code,
+            language="javascript",
+            llm_client=client,
+        ).run(max_iterations=0)
+
+        adjudication = result.state.iteration_state["candidate_adjudication"]
+
+        assert 'const message = "hi";' in result.deobfuscated_code
+        assert adjudication["selected_source"] == "llm_only"
+        assert adjudication["llm_only"]["success"] is True
+        assert result.transform_history[-1].action == "llm_shadow_recovery"
+        assert "hi" in [item.value for item in result.strings]
+
+    @pytest.mark.asyncio
+    async def test_shadow_llm_only_candidate_is_rejected_when_structurally_unsafe(self):
+        code = (
+            "import { decode } from './codec';\n"
+            "export function run() {\n"
+            "  return decode(atob('aGk='));\n"
+            "}\n\n"
+            "run();\n"
+        )
+        client = FakeLLMClient(
+            [
+                json.dumps(
+                    {
+                        "cleaned_code": "function run() {\n  return 'hi';\n}\n\nrun();\n",
+                        "decoded_artifacts": ["hi"],
+                        "remaining_uncertainties": [],
+                        "confidence": 0.74,
+                    }
+                )
+            ]
+        )
+
+        result = await Orchestrator(
+            sample_id="shadow-llm-unsafe",
+            original_code=code,
+            language="javascript",
+            llm_client=client,
+        ).run(max_iterations=0)
+
+        adjudication = result.state.iteration_state["candidate_adjudication"]
+
+        assert result.deobfuscated_code == code
+        assert adjudication["selected_source"] == "pipeline"
+        assert adjudication["llm_only"]["success"] is False
+        assert adjudication["llm_only"]["accepted"] is False
+        assert all(item.action != "llm_shadow_recovery" for item in result.transform_history)

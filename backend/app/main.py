@@ -23,6 +23,7 @@ from app.api.samples import router as samples_router
 from app.api.websocket import router as websocket_router
 from app.core.config import settings
 from app.core.database import init_db
+from app.services.benchmarks.runner import schedule_startup_benchmarks
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("Ensuring upload directory exists at %s", settings.UPLOAD_DIR)
     settings.ensure_upload_dir()
+
+    await schedule_startup_benchmarks()
 
     logger.info("Unweaver API ready.")
     yield

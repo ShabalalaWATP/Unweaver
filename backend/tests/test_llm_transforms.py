@@ -169,6 +169,24 @@ class TestLLMRenamer:
 
 
 class TestLLMDeobfuscator:
+    def test_build_messages_include_semantic_guardrails_for_js_modules(self):
+        messages = LLMDeobfuscator().build_messages(
+            (
+                "import { decode } from './codec';\n"
+                "export function run() {\n"
+                "  return decode();\n"
+                "}\n\n"
+                "run();\n"
+            ),
+            "javascript",
+            {"language": "javascript"},
+        )
+
+        assert "Behavioral guardrails:" in messages[1]["content"]
+        assert "module kind=esm" in messages[1]["content"]
+        assert "named:decode@./codec" in messages[1]["content"]
+        assert "exports=run" in messages[1]["content"]
+
     def test_apply_async_reranks_multiple_candidates_with_critic(self):
         client = FakeLLMClient(
             [
@@ -244,6 +262,28 @@ class TestLLMDeobfuscator:
         assert validation["accepted"] is False
         assert "entrypoint_call_surface_removed" in validation["issues"]
         assert validation["semantic"]["available"] is True
+
+    def test_validate_candidate_code_rejects_javascript_import_binding_regression(self):
+        validation = LLMDeobfuscator.validate_candidate_code(
+            (
+                "import { decode } from './codec';\n"
+                "export function run() {\n"
+                "  return decode();\n"
+                "}\n"
+            ),
+            (
+                "import './codec';\n"
+                "export function run() {\n"
+                "  return true;\n"
+                "}\n"
+            ),
+            "javascript",
+        )
+
+        assert validation["accepted"] is False
+        assert "import_binding_surface_changed" in validation["issues"]
+        assert validation["semantic"]["available"] is True
+        assert validation["semantic"]["missing_import_bindings"] == ["named:decode@./codec"]
 
     def test_does_not_hard_fail_when_js_tooling_is_unavailable(self):
         with patch(

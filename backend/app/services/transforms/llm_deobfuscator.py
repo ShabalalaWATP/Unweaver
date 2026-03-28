@@ -25,6 +25,8 @@ MUCH more readable version.
 
 Rules:
 - Preserve the code's behaviour exactly — do not add, remove, or alter logic.
+- Preserve module boundaries, import bindings, exports, and top-level side effects.
+- Do not replace cross-file dependencies with guessed local stubs or constants.
 - Decode encoded strings, resolve dynamic lookups, inline constants.
 - Replace meaningless variable/function names with descriptive ones based on
   what the code does (e.g. downloadUrl, decryptPayload, registryKey).
@@ -113,6 +115,7 @@ class LLMDeobfuscator(LLMTransform):
         lang = language or state.get("language", "unknown")
         context = self.build_state_context(state, code=code)
         workspace = self.build_workspace_context(code)
+        guardrails = self.build_semantic_guardrails(code, str(lang))
 
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -122,6 +125,7 @@ class LLMDeobfuscator(LLMTransform):
                     f"Deobfuscate the following code.\n\n"
                     f"Declared language: {lang}\n"
                     f"Context:\n{context}\n\n"
+                    + (f"Behavioral guardrails:\n{guardrails}\n\n" if guardrails else "")
                     + (f"Workspace context:\n{workspace}\n\n" if workspace else "")
                     + (
                     f"```\n{truncated}\n```"

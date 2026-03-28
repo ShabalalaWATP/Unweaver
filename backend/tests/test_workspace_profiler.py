@@ -83,3 +83,61 @@ class TestWorkspaceProfiler:
         assert context["supported_bundle_coverage_ratio"] == 1.0
         assert "json" in context["unsupported_languages"]
         assert "coverage is scoped" in context["coverage_scope_note"].lower()
+
+    def test_profiles_monorepo_package_graph_and_package_name_imports(self):
+        bundle = (
+            "UNWEAVER_WORKSPACE_BUNDLE v1\n"
+            "archive_name: mono.zip\n"
+            "included_files: 4\n"
+            "omitted_files: 0\n"
+            "languages: javascript=2, json=2\n"
+            "entry_points: apps/web/src/main.js\n"
+            "suspicious_files: packages/shared/src/index.js\n"
+            "manifest_files: apps/web/package.json | packages/shared/package.json\n"
+            "root_dirs: apps | packages\n"
+            "package_roots: apps/web | packages/shared\n"
+            "bundle_note: preserve markers.\n\n"
+            '<<<FILE path="apps/web/package.json" language="json" priority="manifest" size=70>>>\n'
+            '{"name":"@repo/web","dependencies":{"@repo/shared":"workspace:*"}}\n'
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="apps/web/src/main.js" language="javascript" priority="entrypoint" size=88>>>\n'
+            'import { decodeValue } from "@repo/shared";\n'
+            "console.log(decodeValue());\n"
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="packages/shared/package.json" language="json" priority="manifest" size=52>>>\n'
+            '{"name":"@repo/shared","main":"src/index.js"}\n'
+            "<<<END FILE>>>\n\n"
+            '<<<FILE path="packages/shared/src/index.js" language="javascript" priority="suspicious" size=72>>>\n'
+            "export function decodeValue(){\n"
+            '  return atob("aGk=");\n'
+            "}\n"
+            "<<<END FILE>>>\n"
+        )
+
+        result = WorkspaceProfiler().apply(bundle, "workspace", {})
+        context = result.details["workspace_context"]
+
+        assert result.success is True
+        assert "package_manifest_profiled" in result.details["detected_techniques"]
+        assert "monorepo_package_graph" in result.details["detected_techniques"]
+        assert any(
+            edge["raw"] == "@repo/shared"
+            and edge["resolved"] == "packages/shared/src/index.js"
+            and edge["kind"] == "local"
+            for edge in result.details["import_edges"]
+        )
+        assert context["package_priority_roots"][:2] == [
+            "packages/shared",
+            "apps/web",
+        ]
+        assert context["workspace_packages"][0]["root"] == "packages/shared"
+        assert context["workspace_packages"][0]["dependent_count"] == 1
+        assert context["package_dependency_edges"] == [
+            {
+                "source_root": "apps/web",
+                "source_name": "@repo/web",
+                "target_root": "packages/shared",
+                "target_name": "@repo/shared",
+                "kind": "workspace_local",
+            }
+        ]

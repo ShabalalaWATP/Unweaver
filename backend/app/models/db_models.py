@@ -242,6 +242,44 @@ class ProviderConfig(Base):
 
 
 # ════════════════════════════════════════════════════════════════════════
+#  Benchmark Runs
+# ════════════════════════════════════════════════════════════════════════
+
+class BenchmarkRun(Base):
+    __tablename__ = "benchmark_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    provider_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("provider_configs.id", ondelete="SET NULL"), nullable=True
+    )
+    provider_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    provider_model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    trigger_reason: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    corpus_name: Mapped[str] = mapped_column(String(128), nullable=False, default="js_recovery")
+    corpus_version: Mapped[str] = mapped_column(String(64), nullable=False, default="js-corpus-v1")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    llm_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    case_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_case_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    overall_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pass_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    summary_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    results_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    provider: Mapped[ProviderConfig | None] = relationship("ProviderConfig")
+
+    def __repr__(self) -> str:
+        return (
+            f"<BenchmarkRun id={self.id!r} provider_id={self.provider_id!r} "
+            f"status={self.status!r} score={self.overall_score!r}>"
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  Iteration State (JSON snapshots of AnalysisState)
 # ════════════════════════════════════════════════════════════════════════
 

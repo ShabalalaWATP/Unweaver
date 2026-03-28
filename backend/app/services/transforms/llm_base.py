@@ -29,7 +29,10 @@ from app.services.llm.client import LLMClient
 from app.services.transforms.base import BaseTransform, TransformResult
 from app.services.transforms.js_tooling import validate_javascript_source
 from app.services.transforms.readability_scorer import compute_readability_score
-from app.services.transforms.semantic_verifier import semantic_validation_summary
+from app.services.transforms.semantic_verifier import (
+    semantic_signature,
+    semantic_validation_summary,
+)
 from app.services.transforms.source_preprocessor import normalize_source_anomalies
 
 logger = logging.getLogger(__name__)
@@ -800,6 +803,15 @@ class LLMTransform(BaseTransform):
                 "Functions: " + " | ".join(str(item)[:100] for item in functions[:10])
             )
 
+        if code:
+            semantic_guardrails = LLMTransform.build_semantic_guardrails(
+                code,
+                str(language or ""),
+                compact=compact,
+            )
+            if semantic_guardrails:
+                parts.append(semantic_guardrails)
+
         workspace_context = state.get("workspace_context", {})
         if isinstance(workspace_context, dict):
             indexed_file_count = workspace_context.get("indexed_file_count")
@@ -931,6 +943,63 @@ class LLMTransform(BaseTransform):
     def build_workspace_context(code: str) -> Optional[str]:
         """Return a workspace summary when the input is a bundled codebase."""
         return workspace_context_prompt(code)
+
+    @staticmethod
+    def build_semantic_guardrails(
+        code: str,
+        language: str,
+        *,
+        compact: bool = False,
+    ) -> Optional[str]:
+        if not code or workspace_context_prompt(code):
+            return None
+
+        signature = semantic_signature(language, code)
+        if not signature.get("available"):
+            return None
+
+        max_items = 3 if compact else 6
+        fragments: List[str] = []
+
+        module_kind = str(signature.get("module_kind") or "").strip()
+        if module_kind and module_kind != "script":
+            fragments.append(f"module kind={module_kind}")
+
+        import_bindings = [
+            str(item)
+            for item in signature.get("import_bindings", [])[:max_items]
+            if str(item).strip()
+        ]
+        exports = [
+            str(item)
+            for item in signature.get("exports", [])[:max_items]
+            if str(item).strip()
+        ]
+        top_level_calls = [
+            str(item)
+            for item in signature.get("top_level_calls", [])[:max_items]
+            if str(item).strip()
+        ]
+
+        if import_bindings:
+            fragments.append("import bindings=" + " | ".join(import_bindings))
+        elif signature.get("imports"):
+            imports = [
+                str(item)
+                for item in signature.get("imports", [])[:max_items]
+                if str(item).strip()
+            ]
+            if imports:
+                fragments.append("imports=" + " | ".join(imports))
+
+        if exports:
+            fragments.append("exports=" + " | ".join(exports))
+        if top_level_calls:
+            fragments.append("top-level calls=" + " | ".join(top_level_calls))
+
+        if not fragments:
+            return None
+        return "Preserve module and entrypoint surface: " + "; ".join(fragments)
 
     @staticmethod
     def _build_workspace_focus_excerpt(

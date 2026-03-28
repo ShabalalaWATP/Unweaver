@@ -16,6 +16,7 @@ import json
 import shutil
 import zipfile
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -24,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.samples import _build_workspace_search_space, _normalise_chat_source_tags
 from app.core.config import settings
 from tests.dotnet_test_utils import build_test_dotnet_assembly
-from app.models.db_models import IterationState, Sample
+from app.models.db_models import BenchmarkRun, IterationState, Sample
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -713,6 +714,77 @@ class TestProviderEndpoints:
 
         resp2 = await client.post("/api/providers", json=payload)
         assert resp2.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_test_provider_schedules_background_benchmark(self, client: AsyncClient):
+        created = await client.post(
+            "/api/providers",
+            json={
+                "name": "bench-provider",
+                "base_url": "http://localhost:11434",
+                "model_name": "model-bench",
+            },
+        )
+        provider_id = created.json()["id"]
+
+        with patch(
+            "app.api.providers.LLMClient.test_connection",
+            new=AsyncMock(return_value=(True, "Connection successful")),
+        ), patch(
+            "app.api.providers.schedule_provider_benchmark",
+            new=AsyncMock(return_value=True),
+        ) as schedule_mock:
+            response = await client.post(f"/api/providers/{provider_id}/test")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert payload["benchmark_scheduled"] is True
+        schedule_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_latest_provider_benchmark_returns_persisted_run(
+        self,
+        client: AsyncClient,
+        db_session: AsyncSession,
+    ):
+        created = await client.post(
+            "/api/providers",
+            json={
+                "name": "bench-provider-latest",
+                "base_url": "http://localhost:11434",
+                "model_name": "model-bench",
+            },
+        )
+        provider = created.json()
+        provider_id = provider["id"]
+
+        db_session.add(
+            BenchmarkRun(
+                provider_id=provider_id,
+                provider_name=provider["name"],
+                provider_model=provider["model_name"],
+                trigger_reason="provider_test_success",
+                corpus_name="js_recovery",
+                corpus_version="js-corpus-v1",
+                status="completed",
+                llm_enabled=True,
+                case_count=4,
+                completed_case_count=4,
+                overall_score=0.83,
+                pass_rate=0.75,
+                summary_json={"overall_score": 0.83, "failed_cases": 1},
+                results_json=[{"case_id": "js-atob-console", "overall_score": 0.94}],
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"/api/providers/{provider_id}/benchmark/latest")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "completed"
+        assert payload["summary"]["overall_score"] == 0.83
+        assert payload["results"][0]["case_id"] == "js-atob-console"
 
 
 # ════════════════════════════════════════════════════════════════════════
